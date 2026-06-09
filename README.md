@@ -24,6 +24,7 @@ dependency set pulls in crates that need it).
 ```sh
 threat-finder [OPTIONS]
 ```
+![Offseq Threat Finder SVG Ascii Animation](OffSeq_Threat_Finder.svg)
 
 | Flag | Description |
 |------|-------------|
