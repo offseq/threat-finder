@@ -1,0 +1,9 @@
+# Normalize line endings to LF in the repo
+* text=auto eol=lf
+
+*.rs   text diff=rust
+*.toml text
+*.md   text
+
+# Cargo.lock is hand-relevant for a binary crate; keep it in diffs/reviews
+Cargo.lock linguist-generated=false

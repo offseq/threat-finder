@@ -1,0 +1,22 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Note: Cargo.lock IS committed — this crate ships a binary, so a locked,
+# reproducible dependency set is intentional.
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local run output / secrets (never commit an API key or a scan report)
+/threats.json
+*.local

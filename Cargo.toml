@@ -1,0 +1,31 @@
+[package]
+name = "threat-finder"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+description = "OffSeq Threat Finder - scans running services for known vulnerabilities"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/offseq/threat-finder"
+homepage = "https://radar.offseq.com"
+keywords = ["security", "vulnerability", "cve", "scanner", "cli"]
+categories = ["command-line-utilities"]
+publish = false
+
+[[bin]]
+name = "threat-finder"
+path = "main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+dirs = "5"
+once_cell = "1"
+rayon = "1"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+zbus = "4"
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.17"
+rpassword = "7"
