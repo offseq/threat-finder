@@ -52,6 +52,7 @@ jobs:
 
   publish-crate:
     name: publish to crates.io
+    needs: [create-release, binaries]  # don't publish if any archive failed to build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

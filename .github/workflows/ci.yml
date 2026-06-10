@@ -35,3 +35,12 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+  msrv:
+    name: minimum supported Rust (1.87)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked

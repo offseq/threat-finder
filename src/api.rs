@@ -302,20 +302,6 @@ pub struct BatchOutcome {
     pub errors:  BTreeMap<String, String>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ServiceEntry {
-    pub name:    String,
-    pub version: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SystemInfo {
-    pub kernel_name:    String,
-    pub kernel_version: String,
-    pub distro_name:    String,
-    pub distro_version: String,
-}
-
 pub struct ThreatClient {
     client:         Client,
     api_key:        String,

@@ -79,7 +79,10 @@ pub struct Runtime {
 #[derive(Debug, Clone)]
 pub struct Asset {
     pub ecosystem: Ecosystem,
+    /// Display name (service/unit name, or package name).
     pub name: String,
+    /// Real owning-package name when known — the authoritative coordinate.
+    pub pkg_name: Option<String>,
     pub version: String,
     pub sources: Vec<Source>,
     pub locations: Vec<String>,
@@ -87,14 +90,23 @@ pub struct Asset {
 }
 
 impl Asset {
-    /// Normalized name used as the API search term.
-    pub fn lookup_key(&self) -> String {
-        normalize_service_name(strip_instance(&self.name)).to_string()
+    /// The canonical package name used for BOTH the coordinate (purl) and the
+    /// report key, so they never disagree. Prefers the resolved package name;
+    /// otherwise normalizes the service alias (ssh -> openssh).
+    pub fn coordinate_name(&self) -> String {
+        self.pkg_name
+            .clone()
+            .unwrap_or_else(|| normalize_service_name(strip_instance(&self.name)).to_string())
     }
 
-    /// Stable map key shared with `run_batch` results: normalized-name@version.
+    /// Name used for the `?search=` fallback (when no purl can be built).
+    pub fn lookup_key(&self) -> String {
+        self.coordinate_name()
+    }
+
+    /// Stable map key, shared between the coordinate and the results: name@version.
     pub fn report_key(&self) -> String {
-        format!("{}@{}", self.lookup_key(), self.version)
+        format!("{}@{}", self.coordinate_name(), self.version)
     }
 
     /// "package-db" if any source is authoritative, else "probe".
@@ -137,6 +149,7 @@ fn service_to_asset(s: ServiceInfo, eco: Ecosystem) -> Asset {
     Asset {
         ecosystem: eco,
         name: s.name,
+        pkg_name: s.pkg_name,
         version: s.version,
         sources: vec![src],
         locations: vec![s.exe],
@@ -163,7 +176,8 @@ impl Collector for OsPackageCollector {
             .into_iter()
             .map(|p| Asset {
                 ecosystem: eco,
-                name: p.name,
+                name: p.name.clone(),
+                pkg_name: Some(p.name), // inventory names ARE the package coordinate
                 version: p.version,
                 sources: vec![Source::PackageDb],
                 locations: Vec::new(),
@@ -272,13 +286,14 @@ fn rpm_namespace(d: &LinuxDistro) -> &'static str {
 /// for ecosystems with no reliable purl type (BSD/generic) — caller falls back.
 pub fn build_purl(a: &Asset, os: &OsType) -> Option<String> {
     let ver = pct(&a.version);
+    let name = a.coordinate_name();
     match a.ecosystem {
         Ecosystem::Deb => {
             let ns = match os {
                 OsType::Linux(d) => deb_namespace(d),
                 _ => "debian",
             };
-            let mut p = format!("pkg:deb/{ns}/{}@{ver}", pct(&a.name.to_lowercase()));
+            let mut p = format!("pkg:deb/{ns}/{}@{ver}", pct(&name.to_lowercase()));
             if let Some(c) = os_release_field("VERSION_CODENAME") {
                 p.push_str(&format!("?distro={}", pct(&c)));
             }
@@ -290,22 +305,25 @@ pub fn build_purl(a: &Asset, os: &OsType) -> Option<String> {
                 OsType::Linux(d) => rpm_namespace(d),
                 _ => "redhat",
             };
-            let mut p = format!("pkg:rpm/{ns}/{}@{ver}", pct(&a.name));
-            if let Some(rel) = os_release_field("VERSION_ID") {
-                p.push_str(&format!("?distro={ns}-{}", pct(&rel)));
+            let mut p = format!("pkg:rpm/{ns}/{}@{ver}", pct(&name));
+            // distro qualifier uses the conventional id-version (e.g. rhel-9).
+            if let (Some(id), Some(rel)) =
+                (os_release_field("ID"), os_release_field("VERSION_ID"))
+            {
+                p.push_str(&format!("?distro={}-{}", pct(&id), pct(&rel)));
             }
             Some(p)
         }
         Ecosystem::Alpine => {
-            let mut p = format!("pkg:apk/alpine/{}@{ver}", pct(&a.name.to_lowercase()));
+            let mut p = format!("pkg:apk/alpine/{}@{ver}", pct(&name.to_lowercase()));
             if let Some(vid) = os_release_field("VERSION_ID") {
                 let mm: Vec<&str> = vid.split('.').take(2).collect();
                 p.push_str(&format!("?distro=v{}", mm.join(".")));
             }
             Some(p)
         }
-        Ecosystem::Arch => Some(format!("pkg:pacman/arch/{}@{ver}", pct(&a.name.to_lowercase()))),
-        Ecosystem::Homebrew => Some(format!("pkg:brew/{}@{ver}", pct(&a.name))),
+        Ecosystem::Arch => Some(format!("pkg:pacman/arch/{}@{ver}", pct(&name.to_lowercase()))),
+        Ecosystem::Homebrew => Some(format!("pkg:brew/{}@{ver}", pct(&name))),
         _ => None, // BSD / Generic → search fallback
     }
 }
@@ -389,21 +407,33 @@ mod tests {
     use super::*;
 
     fn pkg_asset(name: &str, ver: &str) -> Asset {
-        Asset { ecosystem: Ecosystem::Deb, name: name.into(), version: ver.into(),
+        Asset { ecosystem: Ecosystem::Deb, name: name.into(), pkg_name: None, version: ver.into(),
             sources: vec![Source::PackageDb], locations: vec![], runtime: None }
     }
 
     #[test]
     fn keys_normalize() {
+        // No resolved package name → fall back to the normalized service alias.
         let a = pkg_asset("ssh", "9.6");
-        assert_eq!(a.lookup_key(), "openssh");
+        assert_eq!(a.coordinate_name(), "openssh");
         assert_eq!(a.report_key(), "openssh@9.6");
+    }
+
+    #[test]
+    fn resolved_package_name_is_the_coordinate() {
+        // A running unit "ssh" resolved to the real package "openssh-server".
+        let mut a = pkg_asset("ssh", "1:9.6p1-3");
+        a.pkg_name = Some("openssh-server".into());
+        assert_eq!(a.coordinate_name(), "openssh-server");
+        assert_eq!(a.report_key(), "openssh-server@1:9.6p1-3");
+        let purl = build_purl(&a, &OsType::Linux(LinuxDistro::Debian)).unwrap();
+        assert!(purl.starts_with("pkg:deb/debian/openssh-server@1:9.6p1-3"), "{purl}");
     }
 
     #[test]
     fn merge_preserves_runtime_and_unions_sources() {
         let running = Asset {
-            ecosystem: Ecosystem::Deb, name: "nginx".into(), version: "1.24.0".into(),
+            ecosystem: Ecosystem::Deb, name: "nginx".into(), pkg_name: None, version: "1.24.0".into(),
             sources: vec![Source::Probe], locations: vec!["/usr/sbin/nginx".into()],
             runtime: Some(Runtime { pid: Some(7), listeners: vec!["tcp 0.0.0.0:443".into()],
                 reachability: Reachability::Public, exposed: true }),
@@ -419,7 +449,7 @@ mod tests {
 
     fn linux(d: LinuxDistro) -> OsType { OsType::Linux(d) }
     fn asset_eco(eco: Ecosystem, name: &str, ver: &str) -> Asset {
-        Asset { ecosystem: eco, name: name.into(), version: ver.into(),
+        Asset { ecosystem: eco, name: name.into(), pkg_name: Some(name.into()), version: ver.into(),
             sources: vec![Source::PackageDb], locations: vec![], runtime: None }
     }
 

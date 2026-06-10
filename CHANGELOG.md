@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1]
+
+### Fixed
+- Coordinates are now built from the **real owning package name** (e.g. a running
+  `ssh` unit resolves to `openssh-server`), so the purl and the report key always
+  agree — fixing coordinate misses and dedup loss for normalized service names.
+- rpm `?distro` uses the conventional `id-version` (e.g. `rhel-9`).
+- `publish-crate` now waits for the binary builds; the Homebrew auto-bump template
+  is the single source of truth (removed the drift-prone static formula).
+
+### Added
+- MSRV (1.87) CI job.
+
+### Removed
+- Dead `ServiceEntry` / `SystemInfo` API types left over from the match migration.
+
 ## [Unreleased]
 
 ### Changed

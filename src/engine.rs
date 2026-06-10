@@ -66,6 +66,8 @@ impl Reachability {
 #[derive(Debug, Clone)]
 pub struct ServiceInfo {
     pub name:      String,
+    /// Owning package name when resolved from the package DB (the real coordinate).
+    pub pkg_name:  Option<String>,
     pub version:   String,
     pub exe:       String,
     pub pid:       Option<u32>,
@@ -446,83 +448,106 @@ pub fn atom_version(atom: &str) -> Option<String> {
 
 /// Ask the OS package database for the version that owns `exe`. Returns None when
 /// no package owns it (e.g. a base-system binary) so the caller can fall back.
-pub fn package_version(exe: &str, os: &OsType) -> Option<String> {
+/// Resolve the owning package's (name, full-version) for a binary, querying the
+/// OS package database. The package NAME is the real coordinate (e.g. a unit
+/// "ssh" resolves to "openssh-server"), so the purl is built from the true
+/// package, not the service alias.
+pub fn package_of(exe: &str, os: &OsType) -> Option<(String, String)> {
     let real = fs::canonicalize(exe).ok()?;
     let path = real.to_string_lossy().to_string();
 
     match os {
         OsType::Linux(distro) => match distro {
-            LinuxDistro::Debian | LinuxDistro::Ubuntu | LinuxDistro::Kali => dpkg_version(&path),
-            LinuxDistro::Fedora | LinuxDistro::Rhel | LinuxDistro::CentOs | LinuxDistro::OpenSuse => rpm_version(&path),
-            LinuxDistro::Arch => pacman_version(&path),
-            LinuxDistro::Alpine => apk_version(&path),
-            _ => dpkg_version(&path)
-                .or_else(|| rpm_version(&path))
-                .or_else(|| pacman_version(&path))
-                .or_else(|| apk_version(&path)),
+            LinuxDistro::Debian | LinuxDistro::Ubuntu | LinuxDistro::Kali => dpkg_of(&path),
+            LinuxDistro::Fedora | LinuxDistro::Rhel | LinuxDistro::CentOs | LinuxDistro::OpenSuse => rpm_of(&path),
+            LinuxDistro::Arch => pacman_of(&path),
+            LinuxDistro::Alpine => apk_of(&path),
+            _ => dpkg_of(&path)
+                .or_else(|| rpm_of(&path))
+                .or_else(|| pacman_of(&path))
+                .or_else(|| apk_of(&path)),
         },
-        OsType::MacOs => homebrew_version(&path),
-        OsType::FreeBsd | OsType::DragonFlyBsd => freebsd_pkg_version(&path),
-        OsType::OpenBsd => pkg_info_version(&path, false),
-        OsType::NetBsd | OsType::Illumos => pkg_info_version(&path, true),
+        OsType::MacOs => homebrew_of(&path),
+        OsType::FreeBsd | OsType::DragonFlyBsd => freebsd_of(&path),
+        OsType::OpenBsd => pkg_info_of(&path, false),
+        OsType::NetBsd | OsType::Illumos => pkg_info_of(&path, true),
         OsType::Solaris => None, // IPS resolution deferred; falls back to probe
         OsType::Unsupported(_) => None,
     }
 }
 
-pub fn dpkg_version(path: &str) -> Option<String> {
+pub fn dpkg_of(path: &str) -> Option<(String, String)> {
     // dpkg-query -S <path> -> "pkg: /path"  (or "pkg1, pkg2: /path")
     let owner = run_cmd("dpkg-query", &["-S", path])?;
     let pkg = owner.split(':').next()?.split(',').next()?.trim().to_string();
     if pkg.is_empty() {
         return None;
     }
-    let ver = run_cmd("dpkg-query", &["-W", "-f=${Version}", &pkg])?;
-    let ver = ver.trim().to_string();
-    (!ver.is_empty()).then_some(ver)
+    let ver = run_cmd("dpkg-query", &["-W", "-f=${Version}", &pkg])?.trim().to_string();
+    (!ver.is_empty()).then_some((pkg, ver))
 }
 
-pub fn rpm_version(path: &str) -> Option<String> {
-    let out = run_cmd("rpm", &["-qf", "--queryformat", "%{VERSION}\n", path])?;
-    let v = out.lines().next()?.trim().to_string();
-    if v.is_empty() || v.to_lowercase().contains("not owned") {
-        None
-    } else {
-        Some(v)
+pub fn rpm_of(path: &str) -> Option<(String, String)> {
+    let out = run_cmd("rpm", &["-qf", "--queryformat", "%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\n", path])?;
+    let line = out.lines().next()?;
+    if line.to_lowercase().contains("not owned") {
+        return None;
     }
+    let mut c = line.split('\t');
+    let name = c.next()?.trim().to_string();
+    let epoch = c.next().unwrap_or("").trim();
+    let version = c.next()?.trim();
+    let release = c.next().unwrap_or("").trim();
+    if name.is_empty() || version.is_empty() {
+        return None;
+    }
+    let mut evr = String::new();
+    if !epoch.is_empty() && epoch != "(none)" {
+        evr.push_str(epoch);
+        evr.push(':');
+    }
+    evr.push_str(version);
+    if !release.is_empty() {
+        evr.push('-');
+        evr.push_str(release);
+    }
+    Some((name, evr))
 }
 
-pub fn pacman_version(path: &str) -> Option<String> {
+pub fn pacman_of(path: &str) -> Option<(String, String)> {
     // pacman -Qo <path> -> "/usr/bin/nginx is owned by nginx 1.27.0-1"
     let out = run_cmd("pacman", &["-Qo", path])?;
     let after = out.split(" is owned by ").nth(1)?;
-    after.split_whitespace().nth(1).map(|s| s.to_string())
+    let mut it = after.split_whitespace();
+    Some((it.next()?.to_string(), it.next()?.to_string()))
 }
 
-pub fn apk_version(path: &str) -> Option<String> {
+pub fn apk_of(path: &str) -> Option<(String, String)> {
     // apk info -W <path> -> "<path> is owned by nginx-1.26.2-r0"
     let out = run_cmd("apk", &["info", "-W", path])?;
-    let atom = out.split("owned by ").nth(1)?;
-    atom_version(atom)
+    atom_split(out.split("owned by ").nth(1)?.trim())
 }
 
 pub fn homebrew_version(path: &str) -> Option<String> {
+    homebrew_of(path).map(|(_, v)| v)
+}
+
+pub fn homebrew_of(path: &str) -> Option<(String, String)> {
     // canonicalized brew binaries live at .../Cellar/<name>/<version>/...
     let idx = path.find("/Cellar/")?;
     let rest = &path[idx + "/Cellar/".len()..];
     let mut it = rest.split('/');
-    let _name = it.next()?;
+    let name = it.next()?.to_string();
     let version = it.next()?.to_string();
-    (!version.is_empty()).then_some(version)
+    (!name.is_empty() && !version.is_empty()).then_some((name, version))
 }
 
-pub fn freebsd_pkg_version(path: &str) -> Option<String> {
+pub fn freebsd_of(path: &str) -> Option<(String, String)> {
     // pkg which -q <path> -> "nginx-1.27.0"
-    let atom = run_cmd("pkg", &["which", "-q", path])?;
-    atom_version(&atom)
+    atom_split(run_cmd("pkg", &["which", "-q", path])?.trim())
 }
 
-pub fn pkg_info_version(path: &str, file_flag: bool) -> Option<String> {
+pub fn pkg_info_of(path: &str, file_flag: bool) -> Option<(String, String)> {
     // OpenBSD: pkg_info -E <path> -> "nginx-1.26.2: /usr/local/sbin/nginx"
     // NetBSD : pkg_info -Fe <path> -> "nginx-1.26.2nb1"
     let out = if file_flag {
@@ -530,23 +555,24 @@ pub fn pkg_info_version(path: &str, file_flag: bool) -> Option<String> {
     } else {
         run_cmd("pkg_info", &["-E", path])?
     };
-    let atom = out.split(':').next().unwrap_or(&out);
-    atom_version(atom)
+    let atom = out.split(':').next().unwrap_or(&out).split_whitespace().next()?;
+    atom_split(atom)
 }
 
-/// Get a version for a resolved binary: package DB first, probe as last resort.
-/// Also reports which source produced the version (a trust signal).
-pub fn version_for_binary(exe: &str, os: &OsType) -> Option<(String, VersionSource)> {
-    if let Some(v) = package_version(exe, os) {
-        return Some((v, VersionSource::PackageDb));
+/// Resolve (owning-package-name, version, source) for a binary: package DB
+/// first, then a `--version` probe (no package name) as last resort.
+pub fn version_for_binary(exe: &str, os: &OsType) -> Option<(Option<String>, String, VersionSource)> {
+    if let Some((name, version)) = package_of(exe, os) {
+        return Some((Some(name), version, VersionSource::PackageDb));
     }
-    probe_version(exe).map(|v| (v, VersionSource::Probe))
+    probe_version(exe).map(|v| (None, v, VersionSource::Probe))
 }
 
 pub fn make_service(name: &str, exe: &str, pid: Option<u32>, os: &OsType) -> Option<ServiceInfo> {
-    let (version, source) = version_for_binary(exe, os)?;
+    let (pkg_name, version, source) = version_for_binary(exe, os)?;
     Some(ServiceInfo {
         name: name.to_string(),
+        pkg_name,
         version,
         exe: exe.to_string(),
         pid,

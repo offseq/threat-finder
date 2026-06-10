@@ -3,182 +3,193 @@
 [![CI](https://github.com/offseq/threat-finder/actions/workflows/ci.yml/badge.svg)](https://github.com/offseq/threat-finder/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/threat-finder.svg)](https://crates.io/crates/threat-finder)
 [![docs.rs](https://img.shields.io/docsrs/threat-finder)](https://docs.rs/threat-finder)
-![license](https://img.shields.io/crates/l/threat-finder.svg)
+[![license](https://img.shields.io/crates/l/threat-finder.svg)](#license)
 
-A command-line tool that discovers the services running on a host, determines
-their versions, and matches them against known vulnerabilities from the
-[OffSeq](https://radar.offseq.com) threat API.
+**threat-finder** finds the vulnerable software _actually running_ on a host — not
+what a manifest claims — and tells you which findings are **network-reachable**.
+It resolves each running service (and, with `--scope all`, every installed OS
+package) to an exact [Package-URL](https://github.com/package-url/purl-spec) and
+matches it against the [OffSeq Radar](https://radar.offseq.com) catalog using
+ecosystem-native version rules, so backported/fixed builds aren't false-flagged.
 
-It works across Linux (systemd / SysV / OpenRC), macOS (launchd), the BSDs, and
-Solaris/illumos, resolving each running service to its real binary and — where
-possible — reading the version straight from the OS package database rather than
-executing the service.
+![OffSeq Threat Finder](https://static.offseq.com/threat-finder-preview.svg)
+
+```text
+Vulnerability summary (highest risk first):
+
+  openssh-server@1:8.9p1-3ubuntu0.6 — 1 finding(s)  [PUBLIC tcp 0.0.0.0:22]
+      HIGH  CVE-2024-6387  [KEV]  regreSSHion: remote code execution in OpenSSH
+  nginx@1.18.0-6ubuntu14.4 — 1 finding(s)
+      MED   CVE-2023-44487        HTTP/2 Rapid Reset
+
+2 confirmed finding(s) across 2 asset(s); 1 exposed, 1 known-exploited.
+```
 
 ## Install
 
 ```sh
-# Homebrew (macOS/Linux) — prebuilt, no toolchain needed
-brew install offseq/tap/threat-finder
-
-# Prebuilt binary via cargo-binstall (Linux/macOS, x86_64 + arm64)
-cargo binstall threat-finder
-
-# From crates.io (compiles from source)
-cargo install threat-finder
+brew install offseq/tap/threat-finder   # Homebrew (macOS/Linux), prebuilt
+cargo binstall threat-finder            # prebuilt binary, no toolchain
+cargo install threat-finder             # from source
 ```
 
-Or grab a prebuilt archive from the
-[latest release](https://github.com/offseq/threat-finder/releases/latest)
-and put `threat-finder` on your `PATH`. To build from source:
+Prebuilt archives for Linux/macOS (x86_64 + arm64) are also on the
+[releases page](https://github.com/offseq/threat-finder/releases/latest).
+Requires Rust ≥ 1.87 to build from source. Linux and macOS are supported;
+Windows is not (discovery relies on Unix facilities).
+
+## Quickstart
 
 ```sh
-cargo build --release   # -> target/release/threat-finder
+export OFFSEQ_API_KEY=...    # from https://radar.offseq.com/console
+threat-finder
 ```
 
-Requires a recent stable Rust toolchain (edition 2021, Rust ≥ 1.87). Linux and
-macOS are supported (Windows is not — discovery relies on Unix facilities).
+Scans the running services, prints a risk-ranked summary, and writes the full
+JSON report to `/tmp/threats.json`. Add `--scope all` to also scan every
+installed OS package.
 
 ## Usage
 
 ```sh
 threat-finder [OPTIONS]
 ```
-![OffSeq Threat Finder Preview](https://static.offseq.com/threat-finder-preview.svg)
 
 | Flag | Description |
 |------|-------------|
 | `-o, --output <PATH>` | Write the JSON report to `PATH` (default: prompt, or `/tmp/threats.json`) |
 | `--json` | Print the JSON report to stdout instead of a file |
-| `--scope <SCOPE>` | `running` (default — live services only) or `all` (+ every installed OS package) |
-| `--severity <LEVEL>` | Only report threats at/above a severity (`critical\|high\|medium\|low`) |
-| `--fail-on <WHAT>` | Exit `5` if matching findings exist: `any\|critical\|high\|medium\|low\|kev\|exposed` (CI gating) |
-| `--strict` | Only report confirmed matches (ask the API to omit coordinate-unconfirmed) |
+| `--scope <SCOPE>` | `running` (default) or `all` (+ every installed OS package) |
+| `--severity <LEVEL>` | Only report findings at/above `critical\|high\|medium\|low` |
+| `--strict` | Drop coordinate-unconfirmed findings (report only confirmed) |
+| `--fail-on <WHAT>` | Exit `5` if matching findings exist: `any\|critical\|high\|medium\|low\|kev\|exposed` |
 | `--sarif <PATH>` | Also write a SARIF 2.1.0 report (for code-scanning UIs) |
-| `--include <GLOB>` / `--exclude <GLOB>` | Filter scanned services by name glob (repeatable) |
+| `--include <GLOB>` / `--exclude <GLOB>` | Filter assets by name glob (repeatable) |
 | `-q, --quiet` | Suppress the banner, progress, and summary |
-| `--no-color` | Disable ANSI colors in the summary |
-| `-y, --yes` | Assume defaults, never prompt — for CI/cron |
+| `--no-color` | Disable ANSI colors |
+| `-y, --yes` | Assume defaults, never prompt (CI/cron) |
 | `--reset` | Re-enter the API key, ignoring the saved one |
 | `-h, --help` / `-V, --version` | Help / version |
 
-### Exit codes
-
-`0` success · `1` lookup/IO error · `2` no API key · `3` unsupported OS ·
-`4` rate limit/quota exhausted · `5` `--fail-on` threshold met.
-
-### API key
-
-You need an OffSeq API key (get one at <https://radar.offseq.com/console>).
-It is resolved in this order:
-
-The `OFFSEQ_API_KEY` environment variable (best for CI/cron).
-
-### Examples
-
 ```sh
-# Interactive, writes /tmp/threats.json by default
-threat-finder
-
-# CI/cron: env key, no prompts, only high+ findings, report to stdout
+# CI: only high+ findings, JSON to stdout, no prompts
 OFFSEQ_API_KEY=… threat-finder --yes --json --severity high > report.json
 
 # Fail the build only when a network-exposed service has a known-exploited CVE
 OFFSEQ_API_KEY=… threat-finder --yes --quiet --fail-on exposed
 ```
 
-## How matching works
+**Exit codes:** `0` ok · `1` lookup/IO error · `2` no API key · `3` unsupported
+OS · `4` rate limit/quota · `5` `--fail-on` threshold met.
 
-Each discovered asset is turned into a **Package-URL (purl)** carrying its *full*
-version — epoch and distro revision included — plus a `?distro=` qualifier, e.g.
-`pkg:deb/ubuntu/openssl@1.1.1f-1ubuntu2.16?distro=focal`. The whole host
-inventory is sent in batched `POST /match/batch` calls (one request per
-tier-sized chunk) and matched **server-side with ecosystem-native version rules**
-(dpkg/rpm/apk/semver). This means a backported-and-fixed build such as
-`1.18.0-6+deb11u3` is correctly **not** flagged — there is no client-side version
-guessing anymore.
+**API key** (get one from the [Radar Console](https://radar.offseq.com/console)),
+resolved in order:
 
-Results are split by the API's `confirmed` flag: confirmed matches (the target
-version is inside an affected range) are the reported findings; coordinate
-matches whose version can't be confirmed are surfaced separately as
-**unconfirmed / triage** (kept out of the count, `byCve`, and `--fail-on`). Use
-`--strict` to drop the unconfirmed set entirely. Assets with no buildable
-coordinate (currently the BSDs) fall back to a name `?search=` and are reported
-as unconfirmed.
+1. `OFFSEQ_API_KEY` environment variable (best for CI/cron).
+2. The saved key in `$XDG_CONFIG_HOME/offseq-rust/config.toml` (`0600`),
+   unless `--reset` is given.
+3. An interactive, hidden prompt on a TTY — then saved for next time.
 
-## What makes it different: network-exposure correlation
+Non-interactive (`--yes` / no TTY) with no key available exits `2`.
 
-Most scanners read package *manifests* (Trivy, Grype, osv-scanner) or probe a
-host from the *outside* (Nessus, OpenVAS). This tool inspects what is actually
-**running**, maps each service's process to the TCP sockets it is **listening**
-on (via `/proc/net` on Linux, `lsof` elsewhere), and flags whether any listener
-is reachable off-host. A vulnerable service bound to `0.0.0.0` is a very
-different risk from one bound to `127.0.0.1` — findings are ranked
-exposed-first, and `--fail-on exposed` gates CI on exactly that. No packets are
-sent; it is all local runtime state.
+## How it works
 
-Findings are also enriched with CISA **KEV** (known-exploited) flags, **EPSS**
-scores, and CVSS vectors, and sorted highest-risk-first deterministically.
+**Exact-coordinate matching.** Each asset becomes a purl carrying its _full_
+version (epoch + distro revision) and a `?distro=` qualifier, e.g.
+`pkg:deb/ubuntu/openssh-server@1:8.9p1-3ubuntu0.6?distro=jammy`. The inventory is
+matched in batched `POST /match/batch` calls (one request per tier-sized chunk)
+**server-side, with ecosystem-native version rules** (dpkg/rpm/apk/semver) — so a
+backported-and-fixed build like `1.18.0-6+deb11u3` is correctly not flagged, and
+there's no client-side version guessing. Findings are split by the API's
+`confirmed` flag: confirmed matches are reported; coordinate matches whose
+version can't be confirmed are surfaced separately as **unconfirmed / triage**
+(excluded from the count, `byCve`, and `--fail-on`; drop them with `--strict`).
 
-## Scan scope & coverage
+**Network-exposure correlation.** Manifest scanners (Trivy, Grype, osv-scanner)
+read package lists; external scanners (Nessus, OpenVAS) need a second host. This
+tool maps each running service's process to the sockets it is **listening** on
+(`/proc/net` on Linux, `lsof` elsewhere) and classifies reachability —
+`loopback` / `private` / `public`. A vulnerable service on `0.0.0.0` is a very
+different risk from one on `127.0.0.1`: findings rank exposed-first and
+`--fail-on exposed` gates CI on exactly that. No packets are sent. Findings also
+carry CISA **KEV** and **EPSS**, used in the deterministic risk ranking.
 
-By default the tool scans **running services** — the small, high-signal set whose
-exposure it can correlate. `--scope all` additionally enumerates **every
+## Scope & coverage
+
+`--scope running` (default) scans live services — the small, high-signal set
+whose exposure can be correlated. `--scope all` additionally enumerates **every
 installed OS package** (`dpkg`/`rpm`/`pacman`/`apk`/`brew`/`pkg`/`pkg_info`),
-expanding the matched surface from a handful of services to the full package
-inventory (10–50×) so far more of the Radar catalog applies. A package that also
-backs a running, exposed process keeps its exposure (assets are deduplicated and
-merged), so prioritization survives the wider inventory.
+expanding the matched surface 10–50×. A package that also backs a running,
+exposed process keeps that exposure (assets are deduplicated and merged by
+coordinate). The kernel is covered as its package (`linux-image…`) under
+`--scope all`.
 
-> Note: `--scope all` can produce hundreds–thousands of unique packages. On the
-> free tier (15 lookups/hour) this will rate-limit; bulk lookups and a local
-> cache are planned. The tool warns when the inventory exceeds the free-tier
-> budget.
-
-Internally the engine is a library crate (`find_threats`) with a `Collector`
-abstraction (running-services and os-packages today; lockfiles / containers /
-SBOM are future collectors), so the binary is a thin CLI over it.
+> `--scope all` can yield hundreds–thousands of packages. On the free tier
+> (15 lookups/hour) this will rate-limit; the tool warns when the inventory
+> exceeds the budget. Bulk lookups and a local cache are on the roadmap.
 
 ## Per-OS support
 
-| OS | Discovery | Version source |
-|----|-----------|----------------|
-| Linux (systemd) | `ListUnits` → `/proc/<pid>/exe` / `ExecStart` | dpkg / rpm / pacman / apk → probe |
-| Linux (SysV/OpenRC) | `service --status-all` / `rc-status` | package DB → probe |
-| macOS | `launchctl list` → `ps` (third-party only) | Homebrew Cellar → probe |
-| FreeBSD / DragonFly | `service -e` (running) | `pkg which` → probe |
-| OpenBSD | `rcctl ls started` | `pkg_info -E` → probe |
-| NetBSD | `/etc/rc.d` status | `pkg_info -Fe` → probe |
-| Solaris / illumos | `svcs` → `svcprop start/exec` | probe |
+| OS | Discovery | Coordinate source |
+|----|-----------|-------------------|
+| Linux (systemd) | `ListUnits` → `/proc/<pid>/exe` | dpkg / rpm / pacman / apk |
+| Linux (SysV/OpenRC) | `service --status-all` / `rc-status` | package DB |
+| macOS | `launchctl list` → `ps` (third-party only) | Homebrew |
+| FreeBSD / DragonFly | `service -e` | `pkg` |
+| OpenBSD | `rcctl ls started` | `pkg_info` |
+| NetBSD | `/etc/rc.d` status | `pkg_info` |
+| Solaris / illumos | `svcs` → `svcprop` | probe (`--version`) |
 
-On macOS, Apple system services (`com.apple.*` and SIP-protected system
-binaries) are intentionally skipped — they are covered by the OS-version system
-lookup, and probing hundreds of them is pointless and slow.
+Where no package owns a binary, the version falls back to a hardened `--version`
+probe (absolute path only, sanitized env). On macOS, Apple system services
+(`com.apple.*`, SIP-protected paths) are skipped — they're covered by the OS
+version, and probing hundreds of them is pointless.
 
 ## Output
 
-JSON with:
+JSON, with deterministic (sorted) keys and no timestamp, so reports diff cleanly:
 
-- `services` — `name@version` → array of **confirmed** findings (each with
-  `severity`, `kev`, `epss`, `cvssScore`, `references`, `confirmed`,
-  `matchedRange`, and `matchBasis` = `coordinate` / `cpe` / `search-fallback`),
-  sorted highest-risk-first.
-- `unconfirmed` — `name@version` → coordinate matches whose version couldn't be
-  confirmed (triage), kept out of the primary count.
-- `assets` — `name@version` → `{ exe, versionSource, exposed, reachability, listeners }`,
-  where `versionSource` is `package-db` (authoritative) or `probe` (heuristic) and
-  `reachability` is `loopback` / `private` / `public` (TCP **and** UDP listeners).
-- `byCve` — each CVE rolled up across every confirmed-affected asset (the "patch
-  once, fix many" remediation view).
-- `errors` — per-asset lookup failures, so a failed lookup is never silently
-  reported as "no vulnerabilities".
-- `meta` — `{ tool, version, schemaVersion }`.
+- **`services`** — `pkg@version` → confirmed findings (`cveId`, `severity`,
+  `cvssScore`, `epss`, `kev`, `confirmed`, `matchedRange`, `matchBasis`,
+  `references`), highest-risk first.
+- **`unconfirmed`** — coordinate matches whose version couldn't be confirmed (triage).
+- **`assets`** — `pkg@version` → `{ exe, versionSource, exposed, reachability, listeners }`
+  (`versionSource` = `package-db` | `probe`; `reachability` covers TCP **and** UDP).
+- **`byCve`** — each CVE rolled up across every affected asset ("patch once, fix many").
+- **`errors`** — per-asset lookup failures, so a failure never reads as "clean".
+- **`meta`** — `{ tool, version, schemaVersion }`.
 
-Keys are sorted (BTreeMap) and there is no timestamp, so reports diff cleanly
-across runs.
+A SARIF 2.1.0 report (`--sarif`) is also available for code-scanning UIs.
 
-## Tests
+## The OffSeq ecosystem
+
+| | |
+|---|---|
+| [**OffSeq**](https://offseq.com) | EU security audits, threat monitoring, CISO-as-a-Service, NIS2 compliance |
+| [**Radar**](https://radar.offseq.com) | Real-time threat intelligence — the catalog threat-finder matches against |
+| [**Radar Console**](https://radar.offseq.com/console) | Subscriptions, custom feeds, and your `OFFSEQ_API_KEY` |
+| [**Radar API**](https://radar.offseq.com/api-docs) | REST docs for the `/match` endpoint used here |
+| [**Radar Threats**](https://radar.offseq.com/threats) | Searchable CVE / malware / threat-actor database |
+| [**Radar Feeds**](https://radar.offseq.com/feeds) | Custom feeds aggregating CISA, CIRCL, ThreatFox, … |
+| [**Radar Pricing**](https://radar.offseq.com/pricing) | Free tier through Enterprise |
+| [**Breach**](https://breach.offseq.com) | Dark-web data-leak & exposed-credential monitoring |
+| [**Veil**](https://veil.offseq.com) | Client-side PNG steganography (AES-256-GCM) |
+| [**Guard**](https://offseq.com/guard/) | AI website security & compliance analyst |
+| [**Training**](https://training.offseq.com) | PECB-accredited security & privacy courses |
+
+## Development
 
 ```sh
-cargo test                 # unit tests (matching engine, helpers, CLI)
-cargo test -- --ignored    # also run the macOS live-discovery smoke test
+cargo build --release
+cargo test                 # unit tests
+cargo test -- --ignored    # + macOS live-discovery smoke test
+cargo clippy --all-targets
 ```
+
+The engine is a library crate (`find_threats`) with a `Collector` abstraction
+(running-services and os-packages today; lockfiles / containers / SBOM next), so
+the binary is a thin CLI over it.
+
+## License
+
+Dual-licensed under [MIT](LICENSE) or [Apache-2.0](LICENSE), at your option.
