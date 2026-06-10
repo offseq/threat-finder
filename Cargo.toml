@@ -16,7 +16,7 @@ exclude = [".github/", "/*.svg"]
 # `cargo binstall threat-finder` fetches the prebuilt release archives instead
 # of compiling. Matches the artifact names produced by .github/workflows/release.yml.
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/threat-finder-v{ version }-{ target }.{ archive-format }"
+pkg-url = "{ repo }/releases/download/v{ version }/threat-finder-v{ version }-{ target }.tar.gz"
 pkg-fmt = "tgz"
 bin-dir = "{ bin }{ binary-ext }"
 
