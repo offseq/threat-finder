@@ -7,10 +7,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const BASE_URL: &str = "https://radar.offseq.com/api/v1";
+/// Public site root, i.e. `BASE_URL` with the `/api/v1` API path trimmed off.
+/// Used to build per-finding Radar detail URLs (`{SITE_URL}/threat/<slug>`).
+/// A unit test pins this to the value actually derived from `BASE_URL`, so the
+/// two can't silently drift if `BASE_URL` ever changes.
+const SITE_URL: &str = "https://radar.offseq.com";
 
 const MAX_RETRIES: u32 = 4;
 const BASE_BACKOFF_MS: u64 = 300;
+/// Clamp for the *computed* fallback backoff when no `Retry-After` header is sent.
 const MAX_RETRY_AFTER_SECS: u64 = 30;
+/// Ceiling for an *explicit* server `Retry-After`; a longer cool-down is honored
+/// up to this, beyond which we surface `RateLimitExceeded` rather than sleep.
+const MAX_EXPLICIT_RETRY_AFTER_SECS: u64 = 300;
 const MAX_PAGES: u32 = 50;
 const USER_AGENT: &str = concat!("threat-finder/", env!("CARGO_PKG_VERSION"));
 
@@ -169,6 +178,19 @@ pub struct ThreatEntry {
     /// How the API matched: coordinate | cpe | coordinate-unconfirmed | search-fallback.
     #[serde(rename = "matchBasis")]
     pub match_basis:           String,
+    /// Link to the finding's Radar page (`{SITE_URL}/threat/<slug>`), when a slug
+    /// is known. Turns each finding into something an operator can open and read.
+    #[serde(rename = "radarUrl", skip_serializing_if = "Option::is_none")]
+    pub radar_url:             Option<String>,
+    /// Concrete fixed version(s) — turns "vulnerable" into "upgrade to X".
+    #[serde(rename = "fixedVersions", default, skip_serializing_if = "Vec::is_empty")]
+    pub fixed_versions:        Vec<String>,
+    /// Human-readable remediation guidance, when the server provides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediation:           Option<String>,
+    /// Associated CWE identifiers (e.g. `CWE-77`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cwes:                  Vec<String>,
 }
 
 impl ThreatEntry {
@@ -369,9 +391,25 @@ impl ThreatClient {
                     .unwrap_or(false);
                 let retry_after = parse_header(response.headers(), "Retry-After");
                 if !monthly_exhausted && attempt < MAX_RETRIES {
-                    let wait = retry_after
-                        .unwrap_or(1u64 << attempt.min(10))
-                        .clamp(1, MAX_RETRY_AFTER_SECS);
+                    // An explicit server `Retry-After` is authoritative: honor it up
+                    // to a higher ceiling (so a real cool-down isn't hammered). The
+                    // 30s clamp applies ONLY to the computed exponential fallback.
+                    let wait = match retry_after {
+                        Some(secs) => {
+                            if secs > MAX_EXPLICIT_RETRY_AFTER_SECS {
+                                // Cool-down longer than we're willing to block on —
+                                // surface it rather than silently sleeping.
+                                let message = response.json::<Value>().ok()
+                                    .and_then(|b| error_message(&b))
+                                    .unwrap_or_else(|| format!(
+                                        "Rate limited; server asked to retry after {secs}s."
+                                    ));
+                                return Err(ThreatError::RateLimitExceeded(message));
+                            }
+                            secs.max(1)
+                        }
+                        None => (1u64 << attempt.min(10)).clamp(1, MAX_RETRY_AFTER_SECS),
+                    };
                     std::thread::sleep(Duration::from_secs(wait));
                     attempt += 1;
                     continue;
@@ -696,6 +734,14 @@ pub struct MatchHit {
     #[serde(rename = "patchAvailable", default)] pub patch_available: Option<Value>,
     #[serde(default)] pub confirmed: bool,
     #[serde(default)] pub references: Vec<Value>,
+    /// Radar slug — drives the per-finding detail URL. Absent on older servers.
+    #[serde(default)] pub slug: Option<String>,
+    /// Concrete fixed version(s) for remediation output.
+    #[serde(rename = "fixedVersions", default)] pub fixed_versions: Vec<String>,
+    /// Free-text remediation guidance.
+    #[serde(default)] pub remediation: Option<String>,
+    /// Associated CWE identifiers.
+    #[serde(default)] pub cwes: Vec<String>,
 }
 
 impl MatchHit {
@@ -747,6 +793,7 @@ fn refs_to_strings(refs: &[Value]) -> Vec<String> {
 pub fn match_to_entry(m: MatchHit) -> ThreatEntry {
     let kev = m.kev || truthy(m.known_exploits_in_wild.as_ref());
     let epss = m.epss();
+    let radar_url = m.slug.map(|s| format!("{SITE_URL}/threat/{s}"));
     ThreatEntry {
         cve_id: m.cve_id,
         title: m.title,
@@ -755,13 +802,19 @@ pub fn match_to_entry(m: MatchHit) -> ThreatEntry {
         cvss_vector: None,
         epss,
         kev,
-        published_date: m.published_date,
+        // Normalize to a date-only string so the match and search paths emit ONE
+        // `publishedDate` shape (the search path already runs through clean_date).
+        published_date: m.published_date.as_deref().map(|s| clean_date(Some(&Value::String(s.to_string())))),
         affected_versions: None,
         patch_available: m.patch_available,
         references: refs_to_strings(&m.references),
         confirmed: m.confirmed,
         matched_range: m.matched_range,
         match_basis: m.match_basis.unwrap_or_else(|| "coordinate".to_string()),
+        radar_url,
+        fixed_versions: m.fixed_versions,
+        remediation: m.remediation,
+        cwes: m.cwes,
     }
 }
 
@@ -771,6 +824,9 @@ pub fn search_to_entry(t: &Value) -> ThreatEntry {
         .and_then(|v| v.as_str()).map(|s| s.to_string());
     let references = t.get("references").and_then(|r| r.as_array())
         .map(|arr| refs_to_strings(arr)).unwrap_or_default();
+    let radar_url = t.get("slug").and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("{SITE_URL}/threat/{s}"));
     ThreatEntry {
         cve_id,
         title: t.get("title").and_then(|v| v.as_str()).map(|s| s.to_string()),
@@ -786,7 +842,19 @@ pub fn search_to_entry(t: &Value) -> ThreatEntry {
         confirmed: false,
         matched_range: None,
         match_basis: "search-fallback".to_string(),
+        radar_url,
+        fixed_versions: str_vec_from_value(t.get("fixedVersions")),
+        remediation: t.get("remediation").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        cwes: str_vec_from_value(t.get("cwes")),
     }
+}
+
+/// Collect a JSON array of strings into a `Vec<String>`, ignoring non-string
+/// elements; returns empty for null/absent/non-array.
+fn str_vec_from_value(v: Option<&Value>) -> Vec<String> {
+    v.and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default()
 }
 
 fn threat_id(threat: &Value) -> String {
@@ -907,11 +975,13 @@ mod tests {
         assert_eq!(hit.match_basis.as_deref(), Some("coordinate"));
         assert_eq!(hit.matched_range.as_deref(), Some("<4.17.21"));
 
-        // And the conversion surfaces publishedDate / patchAvailable (BUG 3).
+        // And the conversion surfaces publishedDate / patchAvailable. The match
+        // path now normalizes the date the same way the search path does, so the
+        // JSON `publishedDate` has ONE shape ("YYYY-MM-DD", not the raw ISO ts).
         let e = match_to_entry(hit);
         assert_eq!(e.epss, Some(0.42));
         assert!(e.kev);
-        assert_eq!(e.published_date.as_deref(), Some("2024-01-01T00:00:00.000Z"));
+        assert_eq!(e.published_date.as_deref(), Some("2024-01-01"));
         assert_eq!(e.patch_available, Some(json!(true)));
     }
 
@@ -966,5 +1036,80 @@ mod tests {
         let e2 = search_to_entry(&t2);
         assert_eq!(e2.epss, None);
         assert!(!e2.kev);
+    }
+
+    #[test]
+    fn slug_becomes_radar_url_on_match_path() {
+        // SITE_URL must equal BASE_URL with the "/api/v1" API path trimmed off.
+        assert_eq!(SITE_URL, "https://radar.offseq.com");
+        assert_eq!(
+            BASE_URL.strip_suffix("/api/v1").unwrap_or(BASE_URL),
+            SITE_URL,
+            "SITE_URL must track BASE_URL"
+        );
+        let raw = json!({
+            "cveId": "CVE-2021-23337", "slug": "lodash-command-injection-abc123",
+            "matchBasis": "coordinate", "confirmed": true
+        });
+        let hit: MatchHit = serde_json::from_value(raw).unwrap();
+        assert_eq!(hit.slug.as_deref(), Some("lodash-command-injection-abc123"));
+        let e = match_to_entry(hit);
+        assert_eq!(
+            e.radar_url.as_deref(),
+            Some("https://radar.offseq.com/threat/lodash-command-injection-abc123")
+        );
+        // Serializes under the `radarUrl` key.
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["radarUrl"], json!("https://radar.offseq.com/threat/lodash-command-injection-abc123"));
+    }
+
+    #[test]
+    fn absent_slug_yields_no_radar_url() {
+        let raw = json!({ "cveId": "CVE-2024-7", "matchBasis": "coordinate" });
+        let hit: MatchHit = serde_json::from_value(raw).unwrap();
+        let e = match_to_entry(hit);
+        assert!(e.radar_url.is_none());
+        // Skipped from JSON when None.
+        let v = serde_json::to_value(&e).unwrap();
+        assert!(v.get("radarUrl").is_none());
+    }
+
+    #[test]
+    fn remediation_fields_decode_and_surface() {
+        let raw = json!({
+            "cveId": "CVE-2021-23337", "severity": "high", "matchBasis": "coordinate",
+            "slug": "lodash-x", "confirmed": true,
+            "fixedVersions": ["4.17.21"],
+            "remediation": "Upgrade to lodash 4.17.21 or later.",
+            "cwes": ["CWE-77"],
+            "references": ["https://nvd.nist.gov/vuln/detail/CVE-2021-23337"]
+        });
+        let hit: MatchHit = serde_json::from_value(raw).unwrap();
+        assert_eq!(hit.fixed_versions, vec!["4.17.21".to_string()]);
+        assert_eq!(hit.cwes, vec!["CWE-77".to_string()]);
+        let e = match_to_entry(hit);
+        assert_eq!(e.fixed_versions, vec!["4.17.21".to_string()]);
+        assert_eq!(e.remediation.as_deref(), Some("Upgrade to lodash 4.17.21 or later."));
+        assert_eq!(e.cwes, vec!["CWE-77".to_string()]);
+        // `references` is now populated (server projects it).
+        assert_eq!(e.references, vec!["https://nvd.nist.gov/vuln/detail/CVE-2021-23337".to_string()]);
+        // Empty / absent remediation fields stay out of the JSON.
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["fixedVersions"], json!(["4.17.21"]));
+        assert_eq!(v["cwes"], json!(["CWE-77"]));
+    }
+
+    #[test]
+    fn search_path_reads_slug_and_remediation() {
+        let t = json!({
+            "cveId": "CVE-2024-8", "slug": "openssl-heartbleed",
+            "fixedVersions": ["1.0.1g"], "cwes": ["CWE-125"],
+            "remediation": "Upgrade OpenSSL."
+        });
+        let e = search_to_entry(&t);
+        assert_eq!(e.radar_url.as_deref(), Some("https://radar.offseq.com/threat/openssl-heartbleed"));
+        assert_eq!(e.fixed_versions, vec!["1.0.1g".to_string()]);
+        assert_eq!(e.cwes, vec!["CWE-125".to_string()]);
+        assert_eq!(e.remediation.as_deref(), Some("Upgrade OpenSSL."));
     }
 }

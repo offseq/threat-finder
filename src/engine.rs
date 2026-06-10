@@ -268,7 +268,16 @@ pub fn list_systemd_units(conn: &Connection) -> Vec<UnitEntry> {
         }
     };
 
-    let units: Vec<SystemdUnit> = proxy.call("ListUnits", &()).unwrap_or_default();
+    // A typed-decode error here used to be swallowed (`unwrap_or_default()`),
+    // turning a pure-systemd host into a silent "clean" scan. Log it and return
+    // an explicit empty list so the failure is visible rather than masked.
+    let units: Vec<SystemdUnit> = match proxy.call("ListUnits", &()) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("[!] systemd ListUnits failed ({e}); no services discovered via systemd.");
+            return vec![];
+        }
+    };
 
     units.into_iter()
         .filter(|u| u.3 == "active" && u.0.ends_with(".service"))
@@ -480,14 +489,23 @@ pub fn dpkg_of(path: &str) -> Option<(String, String)> {
     // dpkg-query -S <path> -> "pkg: /path" (or "pkg1, pkg2: /path"), possibly
     // preceded by "diversion by <pkg> from: /path" lines for diverted files.
     let owner = run_cmd("dpkg-query", &["-S", path])?;
-    let pkg = owner.lines()
-        .find(|l| !l.starts_with("diversion by ") && !l.starts_with("local diversion ") && l.contains(": "))
-        .and_then(|l| l.split(':').next())
-        .and_then(|names| names.split(',').next())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())?;
+    let pkg = dpkg_owner_name(&owner)?;
     let ver = run_cmd("dpkg-query", &["-W", "-f=${Version}", &pkg])?.trim().to_string();
     (!ver.is_empty()).then_some((pkg, ver))
+}
+
+/// Extract the owning package name from `dpkg-query -S` output. The field
+/// separator before the path is `": "`, so we split on the LAST one — names can
+/// carry a multiarch suffix (`libssl3:amd64: /path`) that a naive `split(':')`
+/// would truncate. Diversion lines are skipped; the first comma-listed name wins.
+fn dpkg_owner_name(out: &str) -> Option<String> {
+    out.lines()
+        .filter(|l| !l.starts_with("diversion by ") && !l.starts_with("local diversion "))
+        .find_map(|l| l.rsplit_once(": "))
+        .map(|(names, _path)| names)
+        .and_then(|names| names.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 pub fn rpm_of(path: &str) -> Option<(String, String)> {
@@ -1481,6 +1499,28 @@ mod inventory_tests {
             vec![("nginx".into(), "1.26.2".into()), ("bash".into(), "5.2.15nb1".into())]);
         // name with an embedded numeric segment splits at the LAST version run
         assert_eq!(parse_pkg_info_list("gtk-3-3.24.0 toolkit\n"), vec![("gtk-3".into(), "3.24.0".into())]);
+    }
+
+    #[test]
+    fn dpkg_owner_name_handles_multiarch_and_diversions() {
+        // Plain owner line.
+        assert_eq!(dpkg_owner_name("nginx: /usr/sbin/nginx").as_deref(), Some("nginx"));
+        // Multiarch name carries a `:arch` suffix; split on the LAST ": " so the
+        // architecture qualifier is NOT mistaken for the field separator.
+        assert_eq!(
+            dpkg_owner_name("libssl3:amd64: /usr/lib/x86_64-linux-gnu/libssl.so.3").as_deref(),
+            Some("libssl3:amd64")
+        );
+        // Multiple owners: the first comma-listed package wins.
+        assert_eq!(
+            dpkg_owner_name("pkg-a, pkg-b: /shared/path").as_deref(),
+            Some("pkg-a")
+        );
+        // Diversion preamble lines are skipped in favor of the real owner.
+        let out = "diversion by libc6 from: /lib/x.so\n\
+                   diversion by libc6 to: /lib/x.so.usr-is-merged\n\
+                   libc6:amd64: /lib/x.so\n";
+        assert_eq!(dpkg_owner_name(out).as_deref(), Some("libc6:amd64"));
     }
 
     #[test]

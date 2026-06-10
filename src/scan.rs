@@ -332,6 +332,19 @@ fn to_match_query(a: &Asset, os: &OsType) -> Option<MatchQuery> {
     build_purl(a, os).map(MatchQuery::purl)
 }
 
+/// Collapse duplicate `cveId`s within one asset's already risk-sorted bucket,
+/// keeping the FIRST (highest-risk) instance. The same CVE can legitimately come
+/// back twice for one coordinate — two affected-range rows, or a coordinate+cpe
+/// double match — which otherwise inflates `total_vulns()`, the "N findings"
+/// line, the summary, and SARIF. Entries with no `cveId` are always kept.
+fn dedup_by_cve(entries: &mut Vec<ThreatEntry>) {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    entries.retain(|e| match e.cve_id.as_deref() {
+        Some(id) => seen.insert(id.to_string()),
+        None => true,
+    });
+}
+
 /// Match a host inventory against Radar by exact coordinate (purl) in batched
 /// POSTs, falling back to `?search=` for assets with no buildable coordinate.
 /// Confirmed matches go to `results`; coordinate-unconfirmed to `unconfirmed`.
@@ -400,6 +413,7 @@ pub fn run_scan(
 
     for v in results.values_mut().chain(unconfirmed.values_mut()) {
         v.sort_by_key(|e| std::cmp::Reverse(e.risk_key()));
+        dedup_by_cve(v);
     }
 
     Ok(BatchOutcome { results, unconfirmed, errors })
@@ -492,5 +506,45 @@ mod tests {
     fn pct_encoding() {
         assert_eq!(pct("a+b@c d"), "a%2Bb%40c%20d");
         assert_eq!(pct("1.2.3-4ubuntu5"), "1.2.3-4ubuntu5");
+    }
+
+    #[test]
+    fn dedup_keeps_highest_risk_per_cve() {
+        use crate::api::match_to_entry;
+        use serde_json::json;
+        // Two rows for the same CVE on one coordinate (e.g. two affected ranges):
+        // a low-severity, non-KEV instance and a high-severity KEV instance, plus
+        // a distinct CVE. The bucket is risk-sorted then deduped.
+        let mk = |cve: &str, sev: &str, kev: bool, range: &str| {
+            match_to_entry(serde_json::from_value(json!({
+                "cveId": cve, "severity": sev, "kev": kev,
+                "matchBasis": "coordinate", "matchedRange": range, "confirmed": true
+            })).unwrap())
+        };
+        let mut v = vec![
+            mk("CVE-2024-1", "low", false, "<1.0"),
+            mk("CVE-2024-1", "critical", true, "<2.0"),
+            mk("CVE-2024-2", "medium", false, "<3.0"),
+        ];
+        v.sort_by_key(|e| std::cmp::Reverse(e.risk_key()));
+        dedup_by_cve(&mut v);
+        assert_eq!(v.len(), 2, "duplicate CVE collapsed");
+        let kept = v.iter().find(|e| e.cve_id.as_deref() == Some("CVE-2024-1")).unwrap();
+        // The surviving instance is the highest-risk one (KEV / critical).
+        assert!(kept.kev);
+        assert_eq!(kept.severity.as_deref(), Some("critical"));
+        assert_eq!(kept.matched_range.as_deref(), Some("<2.0"));
+    }
+
+    #[test]
+    fn dedup_keeps_entries_without_cve_id() {
+        use crate::api::match_to_entry;
+        use serde_json::json;
+        let mut v = vec![
+            match_to_entry(serde_json::from_value(json!({ "matchBasis": "coordinate" })).unwrap()),
+            match_to_entry(serde_json::from_value(json!({ "matchBasis": "coordinate" })).unwrap()),
+        ];
+        dedup_by_cve(&mut v);
+        assert_eq!(v.len(), 2, "id-less entries are never collapsed");
     }
 }

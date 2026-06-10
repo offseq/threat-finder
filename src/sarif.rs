@@ -25,7 +25,9 @@ fn push_entry(rules: &mut BTreeMap<String, Value>, results: &mut Vec<Value>, ass
             "name": id,
             "shortDescription": { "text": t.title.clone().unwrap_or_else(|| id.clone()) },
         });
-        if let Some(url) = t.references.first() {
+        // Prefer the Radar detail page (curated, with remediation) over a raw
+        // reference URL for the rule's helpUri.
+        if let Some(url) = t.radar_url.as_ref().or_else(|| t.references.first()) {
             rule["helpUri"] = json!(url);
         }
         rule
@@ -41,25 +43,46 @@ fn push_entry(rules: &mut BTreeMap<String, Value>, results: &mut Vec<Value>, ass
         }
     }
 
-    results.push(json!({
+    // Fold remediation into the result message so SARIF consumers see how to fix,
+    // not just that something is wrong.
+    let mut text = format!(
+        "{asset} is affected by {id} ({})",
+        t.severity.clone().unwrap_or_else(|| "unknown".to_string())
+    );
+    if !t.fixed_versions.is_empty() {
+        text.push_str(&format!(". Fixed in {}", t.fixed_versions.join(", ")));
+    }
+    if let Some(rem) = &t.remediation {
+        text.push_str(&format!(". {rem}"));
+    }
+
+    let mut props = json!({
+        "kev": t.kev,
+        "epss": t.epss,
+        "confirmed": t.confirmed,
+        "matchBasis": t.match_basis,
+    });
+    if !t.cwes.is_empty() {
+        props["cwe"] = json!(t.cwes);
+    }
+    if !t.fixed_versions.is_empty() {
+        props["fixedVersions"] = json!(t.fixed_versions);
+    }
+
+    let mut result = json!({
         "ruleId": id,
         "level": level(t.severity.as_deref()),
-        "message": {
-            "text": format!(
-                "{asset} is affected by {id} ({})",
-                t.severity.clone().unwrap_or_else(|| "unknown".to_string())
-            )
-        },
+        "message": { "text": text },
         "locations": [{
             "logicalLocations": [{ "fullyQualifiedName": asset, "kind": "module" }]
         }],
-        "properties": {
-            "kev": t.kev,
-            "epss": t.epss,
-            "confirmed": t.confirmed,
-            "matchBasis": t.match_basis,
-        }
-    }));
+        "properties": props,
+    });
+    if let Some(rem) = &t.remediation {
+        // A `fixes`-adjacent hint that SARIF viewers can surface as guidance.
+        result["fixes"] = json!([{ "description": { "text": rem } }]);
+    }
+    results.push(result);
 }
 
 /// Render a full SARIF 2.1.0 document for the report.

@@ -247,7 +247,20 @@ fn print_summary(results: &BatchResults, color: bool) {
             let cve = t.cve_id.as_deref().unwrap_or("(no id)");
             let kev = if t.kev { format!(" {}", paint("[KEV]", "1;31", color)) } else { String::new() };
             let title: String = t.title.as_deref().unwrap_or("").chars().take(72).collect();
-            println!("      {}  {cve}{kev}  {title}", sev_label(t.severity.as_deref(), color));
+            // Concrete fix versions turn "vulnerable" into "upgrade to X".
+            let fix = if t.fixed_versions.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", paint(&format!("→ fix: {}", t.fixed_versions.join(", ")), "32", color))
+            };
+            println!("      {}  {cve}{kev}  {title}{fix}", sev_label(t.severity.as_deref(), color));
+            if let Some(url) = &t.radar_url {
+                println!("            {}", paint(url, "4;34", color));
+            }
+            if let Some(rem) = &t.remediation {
+                let hint: String = rem.chars().take(96).collect();
+                println!("            {}", paint(&hint, "2", color));
+            }
         }
         if threats.len() > 5 {
             println!("      … and {} more", threats.len() - 5);

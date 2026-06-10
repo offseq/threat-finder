@@ -4,6 +4,41 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3]
+
+### Added
+- **Radar detail link per finding.** Every finding now carries a `radarUrl`
+  (`https://radar.offseq.com/threat/<slug>`) built from the server-provided
+  `slug`. It appears in the JSON report, is appended to each finding line in the
+  terminal summary, and is used as the SARIF rule `helpUri` (preferred over a raw
+  reference URL) so an operator can open the curated write-up directly.
+- **Actionable remediation.** Findings now surface `fixedVersions`, `remediation`,
+  and `cwes` from the match API. The summary shows `→ fix: <versions>` and a short
+  remediation hint; SARIF folds the fix/remediation into the result message, adds
+  a `fixes` entry, and exposes `cwe` / `fixedVersions` in result `properties`.
+  Turns a bare "vulnerable" into "upgrade to X".
+- `references` is now populated on match hits (the server began projecting it).
+
+### Fixed
+- **Per-asset CVE double-count.** The same `cveId` could appear twice for one
+  coordinate (two affected-range rows, or a coordinate+cpe double match),
+  inflating the finding count, the summary, and SARIF. Each asset bucket is now
+  deduplicated by `cveId` after risk-sorting, keeping the highest-risk instance.
+- **`publishedDate` format consistency.** The match path stored the raw ISO
+  timestamp (`2024-01-01T00:00:00.000Z`) while the search path emitted a date
+  (`2024-01-01`). Both now emit the date-only form, so the field has one shape.
+- **Long `Retry-After` cool-downs honored.** An explicit server `Retry-After`
+  (e.g. `3600`) was clamped to 30s and then hammered. Explicit values are now
+  honored up to a 300s ceiling; beyond that the client surfaces
+  `RateLimitExceeded` instead of silently sleeping. The 30s clamp still applies
+  only to the computed exponential fallback when no header is present.
+- **systemd `ListUnits` errors no longer silently empty.** A typed-decode failure
+  used to become an empty unit list, making a pure-systemd host scan as "clean."
+  The error is now logged to stderr and an empty list is returned explicitly.
+- **dpkg multiarch package names.** `dpkg-query -S` output is now split on the
+  last `": "` field separator, so a multiarch name (`libssl3:amd64: /path`) is
+  preserved instead of being truncated at the architecture colon.
+
 ## [0.1.2]
 
 ### Fixed
