@@ -27,6 +27,7 @@ use zbus::zvariant::OwnedValue;
 
 mod auth;
 mod find_threats;
+mod sarif;
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 enum Severity {
@@ -85,6 +86,18 @@ struct Cli {
     #[arg(long, value_enum, value_name = "WHAT")]
     fail_on: Option<FailOn>,
 
+    /// Also write a SARIF 2.1.0 report to this path (for code-scanning UIs)
+    #[arg(long, value_name = "PATH")]
+    sarif: Option<PathBuf>,
+
+    /// Only scan services whose name matches this glob (repeatable)
+    #[arg(long, value_name = "GLOB")]
+    include: Vec<String>,
+
+    /// Skip services whose name matches this glob (repeatable)
+    #[arg(long, value_name = "GLOB")]
+    exclude: Vec<String>,
+
     /// Reduce output: no banner or progress indicators
     #[arg(short, long)]
     quiet: bool,
@@ -130,6 +143,26 @@ impl VersionSource {
     }
 }
 
+/// How reachable a listening socket is. Ordered least → most exposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Reachability {
+    None,
+    Loopback,
+    Private,
+    Public,
+}
+
+impl Reachability {
+    fn as_str(self) -> &'static str {
+        match self {
+            Reachability::None => "none",
+            Reachability::Loopback => "loopback",
+            Reachability::Private => "private",
+            Reachability::Public => "public",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ServiceInfo {
     pub name:      String,
@@ -138,6 +171,7 @@ pub struct ServiceInfo {
     pub pid:       Option<u32>,
     pub source:    VersionSource,
     pub listeners: Vec<String>,
+    pub reach:     Reachability,
     pub exposed:   bool,
 }
 
@@ -394,14 +428,7 @@ fn resolve_exe(conn: &Connection, obj_path: &str, unit_name: &str) -> Option<(St
         }
     }
 
-    let one_shots = [
-        "systemd-journal-flush", "systemd-tmpfiles-setup",
-        "systemd-tmpfiles-setup-dev", "systemd-tmpfiles-setup-dev-early",
-        "systemd-udev-trigger", "systemd-update-utmp", "systemd-user-sessions",
-        "systemd-remount-fs", "systemd-random-seed", "systemd-binfmt",
-        "systemd-modules-load", "systemd-sysctl",
-    ];
-    if one_shots.contains(&unit_name) {
+    if SYSTEMD_ONE_SHOTS.contains(&unit_name) {
         return None;
     }
 
@@ -501,6 +528,15 @@ fn prompt_output_path() -> String {
 //      (run_timed enforces this — absolute, real files only).
 //   2. Prefer the package database over executing the daemon for its version;
 //      probing the binary is a last resort.
+
+// systemd oneshot units that should never be treated as a running daemon.
+const SYSTEMD_ONE_SHOTS: &[&str] = &[
+    "systemd-journal-flush", "systemd-tmpfiles-setup",
+    "systemd-tmpfiles-setup-dev", "systemd-tmpfiles-setup-dev-early",
+    "systemd-udev-trigger", "systemd-update-utmp", "systemd-user-sessions",
+    "systemd-remount-fs", "systemd-random-seed", "systemd-binfmt",
+    "systemd-modules-load", "systemd-sysctl",
+];
 
 const SAFE_PATH_DIRS: &[&str] = &[
     "/usr/local/sbin", "/usr/local/bin",
@@ -662,6 +698,7 @@ fn make_service(name: &str, exe: &str, pid: Option<u32>, os: &OsType) -> Option<
         pid,
         source,
         listeners: Vec::new(),
+        reach: Reachability::None,
         exposed: false,
     })
 }
@@ -689,18 +726,38 @@ fn listening_endpoints(pid: u32) -> Vec<String> {
     eps
 }
 
+/// Listening endpoints via `lsof` (macOS/BSD/Solaris). Uses field output (`-Fn`)
+/// so the address is a clean `n`-prefixed line — the human format suffixes each
+/// row with "(LISTEN)", which the old `.last()` parser picked up instead of the
+/// address, leaving exposure silently dead on every non-Linux platform.
 fn lsof_listeners(pid: u32) -> Vec<String> {
-    let out = run_cmd("lsof", &["-nP", "-p", &pid.to_string(), "-iTCP", "-sTCP:LISTEN"])
-        .unwrap_or_default();
-    out.lines().skip(1)
-        .filter_map(|l| l.split_whitespace().last())
-        .map(|n| n.trim_end_matches("(LISTEN)").trim().to_string())
-        .filter(|s| s.contains(':'))
+    let mut out = Vec::new();
+    for ep in lsof_names(pid, &["-iTCP", "-sTCP:LISTEN"]) {
+        out.push(format!("tcp {ep}"));
+    }
+    for ep in lsof_names(pid, &["-iUDP"]) {
+        out.push(format!("udp {ep}"));
+    }
+    out
+}
+
+fn lsof_names(pid: u32, filter: &[&str]) -> Vec<String> {
+    let pid = pid.to_string();
+    let mut args = vec!["-nP", "-p", &pid];
+    args.extend_from_slice(filter);
+    args.push("-Fn");
+    run_cmd("lsof", &args)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.strip_prefix('n'))
+        .map(|s| s.trim().to_string())
+        // A bound listener has a local address; connected sockets contain "->".
+        .filter(|s| s.contains(':') && !s.contains("->"))
         .collect()
 }
 
-fn linux_listeners(pid: u32) -> Vec<String> {
-    let mut inodes: std::collections::HashSet<String> = std::collections::HashSet::new();
+fn proc_socket_inodes(pid: u32) -> std::collections::HashSet<String> {
+    let mut inodes = std::collections::HashSet::new();
     if let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) {
         for fd in fds.flatten() {
             if let Ok(link) = fs::read_link(fd.path()) {
@@ -713,20 +770,43 @@ fn linux_listeners(pid: u32) -> Vec<String> {
             }
         }
     }
+    inodes
+}
+
+fn linux_listeners(pid: u32) -> Vec<String> {
+    let inodes = proc_socket_inodes(pid);
     if inodes.is_empty() {
         return Vec::new();
     }
     let mut out = Vec::new();
+
+    // TCP: state 0A = LISTEN.
     for (path, v6) in [("/proc/net/tcp", false), ("/proc/net/tcp6", true)] {
         let Ok(content) = fs::read_to_string(path) else { continue };
         for line in content.lines().skip(1) {
             let cols: Vec<&str> = line.split_whitespace().collect();
             if cols.len() < 10 || cols[3] != "0A" {
-                continue; // 0A = TCP_LISTEN
+                continue;
             }
             if inodes.contains(cols[9]) {
                 if let Some(ep) = parse_proc_addr(cols[1], v6) {
-                    out.push(ep);
+                    out.push(format!("tcp {ep}"));
+                }
+            }
+        }
+    }
+
+    // UDP: a bound listener has no remote peer (remote port == 0).
+    for (path, v6) in [("/proc/net/udp", false), ("/proc/net/udp6", true)] {
+        let Ok(content) = fs::read_to_string(path) else { continue };
+        for line in content.lines().skip(1) {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 10 || !cols[2].ends_with(":0000") {
+                continue;
+            }
+            if inodes.contains(cols[9]) {
+                if let Some(ep) = parse_proc_addr(cols[1], v6) {
+                    out.push(format!("udp {ep}"));
                 }
             }
         }
@@ -734,7 +814,7 @@ fn linux_listeners(pid: u32) -> Vec<String> {
     out
 }
 
-/// Parse a /proc/net/tcp{,6} hex "addr:port" (little-endian) into "ip:port".
+/// Parse a /proc/net hex "addr:port" (little-endian) into "ip:port".
 fn parse_proc_addr(s: &str, v6: bool) -> Option<String> {
     let (addr, port) = s.split_once(':')?;
     let port = u16::from_str_radix(port, 16).ok()?;
@@ -757,23 +837,59 @@ fn parse_proc_addr(s: &str, v6: bool) -> Option<String> {
     }
 }
 
-/// True if a listener endpoint is reachable from off-host (not loopback-bound).
-fn endpoint_is_exposed(ep: &str) -> bool {
+/// Bare host of an endpoint (drops a `tcp `/`udp ` prefix, port, and brackets).
+fn endpoint_host(ep: &str) -> &str {
+    let ep = ep.strip_prefix("tcp ").or_else(|| ep.strip_prefix("udp ")).unwrap_or(ep);
     let host = ep.rsplit_once(':').map(|(h, _)| h).unwrap_or(ep);
-    let host = host.trim_matches(|c| c == '[' || c == ']');
+    host.trim_matches(|c| c == '[' || c == ']')
+}
+
+/// Classify how reachable a listener is: loopback, private (LAN/CGNAT/ULA), or
+/// public (routable / wildcard). Sharpens the "internet-exposed" signal.
+fn endpoint_reachability(ep: &str) -> Reachability {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    let host = endpoint_host(ep);
     match host {
-        "127.0.0.1" | "::1" | "localhost" => false,
-        "0.0.0.0" | "::" | "*" => true,
-        h => !h.starts_with("127."),
+        "0.0.0.0" | "::" | "*" => Reachability::Public,
+        "127.0.0.1" | "::1" | "localhost" => Reachability::Loopback,
+        h => {
+            if let Ok(v4) = h.parse::<Ipv4Addr>() {
+                let o = v4.octets();
+                if v4.is_loopback() {
+                    Reachability::Loopback
+                } else if v4.is_private()
+                    || v4.is_link_local()
+                    || (o[0] == 100 && (o[1] & 0xc0) == 64) // CGNAT 100.64.0.0/10
+                {
+                    Reachability::Private
+                } else {
+                    Reachability::Public
+                }
+            } else if let Ok(v6) = h.parse::<Ipv6Addr>() {
+                let seg0 = v6.segments()[0];
+                if v6.is_loopback() {
+                    Reachability::Loopback
+                } else if (seg0 & 0xfe00) == 0xfc00      // ULA fc00::/7
+                    || (seg0 & 0xffc0) == 0xfe80          // link-local fe80::/10
+                {
+                    Reachability::Private
+                } else {
+                    Reachability::Public
+                }
+            } else {
+                Reachability::Public // unknown host string: assume worst
+            }
+        }
     }
 }
 
-/// Fill in listening endpoints + exposure for services that resolved to a PID.
+/// Fill in listening endpoints + reachability for services that resolved to a PID.
 fn enrich_exposure(services: &mut [ServiceInfo]) {
     for s in services.iter_mut() {
         if let Some(pid) = s.pid {
             let eps = listening_endpoints(pid);
-            s.exposed = eps.iter().any(|e| endpoint_is_exposed(e));
+            s.reach = eps.iter().map(|e| endpoint_reachability(e)).max().unwrap_or(Reachability::None);
+            s.exposed = s.reach >= Reachability::Private;
             s.listeners = eps;
         }
     }
@@ -839,15 +955,11 @@ fn run_timed(exe: &str, flag: &str, timeout: Duration) -> Option<(bool, String, 
 // Extract a clean version token from raw `--version` output.
 
 fn extract_version(text: &str) -> Option<String> {
-    let bad = [
-        "invalid",
-        "unknown option",
-        "usage:",
-        "error:",
-        "must be",
-        "superuser",
-        "permission",
+    const BAD: &[&str] = &[
+        "invalid", "unknown option", "usage:", "error:",
+        "must be", "superuser", "permission",
     ];
+    let bad = BAD;
 
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty()).take(10) {
         let lower = line.to_lowercase();
@@ -927,20 +1039,26 @@ fn scan_sysvinit(os: &OsType) -> Vec<ServiceInfo> {
         }
     };
 
-    let running: Vec<String> = output.lines()
+    parse_sysvinit_running(&output)
+        .into_par_iter()
+        .filter_map(|name| service_from_name(&name, os))
+        .collect()
+}
+
+/// Parse running service names from `service --status-all` / `rc-status --all`.
+fn parse_sysvinit_running(output: &str) -> Vec<String> {
+    output.lines()
         .filter_map(|line| {
             let t = line.trim();
             if t.starts_with("[ + ]") {
                 Some(t.trim_start_matches("[ + ]").trim().to_string())
             } else if t.contains('[') && t.contains("started") {
                 Some(t[..t.find('[').unwrap()].trim().to_string())
-            } else { None }
+            } else {
+                None
+            }
         })
         .filter(|s| !s.is_empty())
-        .collect();
-
-    running.into_par_iter()
-        .filter_map(|name| service_from_name(&name, os))
         .collect()
 }
 
@@ -971,24 +1089,8 @@ fn scan_launchctl(os: &OsType) -> Vec<ServiceInfo> {
     // resolved a binary, so the macOS list was always empty).
     let output = run_cmd("launchctl", &["list"]).unwrap_or_default();
 
-    let running: Vec<(String, String)> = output.lines().skip(1)
-        .filter_map(|line| {
-            let mut cols = line.split('\t');
-            let pid = cols.next()?.trim().to_string();
-            let _status = cols.next()?;
-            let label = cols.next()?.trim().to_string();
-            if pid == "-" || label.is_empty() || pid.parse::<u32>().is_err() {
-                return None;
-            }
-            // Skip Apple system services up front (saves a `ps` per daemon).
-            if label.starts_with("com.apple.") {
-                return None;
-            }
-            Some((label, pid))
-        })
-        .collect();
-
-    running.into_par_iter()
+    parse_launchctl_running(&output)
+        .into_par_iter()
         .filter_map(|(label, pid)| {
             let exe = run_cmd("ps", &["-p", &pid, "-o", "comm="])
                 .map(|s| s.trim().to_string())
@@ -1001,6 +1103,26 @@ fn scan_launchctl(os: &OsType) -> Vec<ServiceInfo> {
                 .or_else(|| friendly_label(&label))
                 .unwrap_or_else(|| binary_basename(&exe));
             make_service(&name, &exe, pid.parse::<u32>().ok(), os)
+        })
+        .collect()
+}
+
+/// Parse running (label, pid) pairs from `launchctl list`, skipping non-running
+/// entries (PID "-") and Apple system services.
+fn parse_launchctl_running(output: &str) -> Vec<(String, String)> {
+    output.lines().skip(1)
+        .filter_map(|line| {
+            let mut cols = line.split('\t');
+            let pid = cols.next()?.trim().to_string();
+            let _status = cols.next()?;
+            let label = cols.next()?.trim().to_string();
+            if pid == "-" || label.is_empty() || pid.parse::<u32>().is_err() {
+                return None;
+            }
+            if label.starts_with("com.apple.") {
+                return None;
+            }
+            Some((label, pid))
         })
         .collect()
 }
@@ -1085,6 +1207,18 @@ fn scan_netbsd(os: &OsType) -> Vec<ServiceInfo> {
         .collect()
 }
 
+/// Parse online FMRIs from `svcs -H -o state,fmri`.
+fn parse_svcs_online(output: &str) -> Vec<String> {
+    output.lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let state = it.next()?;
+            let fmri = it.next()?;
+            (state == "online").then(|| fmri.to_string())
+        })
+        .collect()
+}
+
 fn scan_smf(os: &OsType) -> Vec<ServiceInfo> {
     // svcs -H -o state,fmri  (machine-readable, no header)
     let output = run_cmd("svcs", &["-H", "-o", "state,fmri"]).unwrap_or_default();
@@ -1092,16 +1226,8 @@ fn scan_smf(os: &OsType) -> Vec<ServiceInfo> {
         eprintln!("[!] `svcs` returned nothing; SMF may be unavailable");
     }
 
-    let online: Vec<String> = output.lines()
-        .filter_map(|l| {
-            let mut it = l.split_whitespace();
-            let state = it.next()?;
-            let fmri = it.next()?;
-            (state == "online").then(|| fmri.to_string())
-        })
-        .collect();
-
-    online.into_par_iter()
+    parse_svcs_online(&output)
+        .into_par_iter()
         .filter_map(|fmri| {
             // svcprop start/exec gives the start method command line.
             let exec = run_cmd("svcprop", &["-p", "start/exec", &fmri])
@@ -1164,15 +1290,53 @@ fn spinner(msg: &str, quiet: bool) -> Option<ProgressBar> {
     Some(pb)
 }
 
-fn sev_rank(sev: Option<&str>) -> u8 {
-    match sev.map(|s| s.to_ascii_lowercase()).as_deref() {
-        Some("critical") => 4,
-        Some("high")     => 3,
-        Some("medium")   => 2,
-        Some("low")      => 1,
-        _                => 0,
+/// Minimal case-insensitive glob: `*` matches any run of characters.
+fn glob_match(pattern: &str, s: &str) -> bool {
+    let pattern = pattern.to_lowercase();
+    let s = s.to_lowercase();
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return s == pattern; // no wildcard → exact
+    }
+    let mut idx = 0;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            if !s[idx..].starts_with(part) {
+                return false;
+            }
+            idx += part.len();
+        } else if i == parts.len() - 1 {
+            return s[idx..].ends_with(part);
+        } else {
+            match s[idx..].find(part) {
+                Some(p) => idx += p + part.len(),
+                None => return false,
+            }
+        }
+    }
+    true
+}
+
+fn name_allowed(name: &str, include: &[String], exclude: &[String]) -> bool {
+    if exclude.iter().any(|p| glob_match(p, name)) {
+        return false;
+    }
+    include.is_empty() || include.iter().any(|p| glob_match(p, name))
+}
+
+fn reachability_rank(r: &str) -> u8 {
+    match r {
+        "public" => 3,
+        "private" => 2,
+        "loopback" => 1,
+        _ => 0,
     }
 }
+
+use find_threats::severity_rank as sev_rank;
 
 fn severity_floor(s: Option<Severity>) -> u8 {
     match s {
@@ -1213,8 +1377,11 @@ fn print_summary(results: &BatchResults, color: bool) {
     println!("\n{}", paint("Vulnerability summary (highest risk first):", "1", color));
     for (key, exposed, threats) in &rows {
         let badge = if *exposed {
-            let eps = results.assets.get(*key).map(|a| a.listeners.join(", ")).unwrap_or_default();
-            format!("  {}", paint(&format!("[EXPOSED {eps}]"), "1;31", color))
+            let asset = results.assets.get(*key);
+            let reach = asset.map(|a| a.reachability.as_str()).unwrap_or("private");
+            let eps = asset.map(|a| a.listeners.join(", ")).unwrap_or_default();
+            let code = if reach == "public" { "1;31" } else { "1;33" };
+            format!("  {}", paint(&format!("[{} {eps}]", reach.to_uppercase()), code, color))
         } else {
             String::new()
         };
@@ -1227,6 +1394,26 @@ fn print_summary(results: &BatchResults, color: bool) {
         }
         if threats.len() > 5 {
             println!("      … and {} more", threats.len() - 5);
+        }
+    }
+
+    // CVEs that hit more than one service — the highest-leverage fixes.
+    let mut shared: Vec<(&String, &find_threats::CveGroup)> = results.by_cve.iter()
+        .filter(|(_, g)| g.assets.len() > 1)
+        .collect();
+    if !shared.is_empty() {
+        shared.sort_by(|a, b| {
+            (b.1.kev, sev_rank(b.1.severity.as_deref()), b.1.assets.len())
+                .cmp(&(a.1.kev, sev_rank(a.1.severity.as_deref()), a.1.assets.len()))
+                .then(a.0.cmp(b.0))
+        });
+        println!("\n{}", paint("Top shared CVEs (one fix, many services):", "1", color));
+        for (cve, g) in shared.iter().take(5) {
+            let kev = if g.kev { format!(" {}", paint("[KEV]", "1;31", color)) } else { String::new() };
+            println!(
+                "  {}  {}{kev}  affects {} services",
+                sev_label(g.severity.as_deref(), color), cve, g.assets.len()
+            );
         }
     }
 
@@ -1319,6 +1506,9 @@ fn main() -> ExitCode {
         }
     }
 
+    if !cli.include.is_empty() || !cli.exclude.is_empty() {
+        services.retain(|s| name_allowed(&s.name, &cli.include, &cli.exclude));
+    }
     services.sort_by(|a, b| a.name.cmp(&b.name));
 
     let exposure_pb = spinner("Correlating network exposure…", cli.quiet);
@@ -1396,20 +1586,30 @@ fn main() -> ExitCode {
             version: svc.version.clone(),
             version_source: svc.source.as_str().to_string(),
             exposed: false,
+            reachability: Reachability::None.as_str().to_string(),
             listeners: Vec::new(),
         });
         a.exposed |= svc.exposed;
+        if svc.reach.as_str() != a.reachability {
+            // Keep the most-exposed classification across merged services.
+            if reachability_rank(svc.reach.as_str()) > reachability_rank(&a.reachability) {
+                a.reachability = svc.reach.as_str().to_string();
+            }
+        }
         for l in &svc.listeners {
             if !a.listeners.contains(l) { a.listeners.push(l.clone()); }
         }
     }
 
-    let final_results = BatchResults {
+    let mut final_results = BatchResults {
+        meta: find_threats::Meta::default(),
         services: batch.results,
+        by_cve: std::collections::BTreeMap::new(),
         assets,
         system:   system_results,
         errors:   batch.errors,
     };
+    final_results.compute_cve_groups();
 
     let output_json = match serde_json::to_string_pretty(&final_results) {
         Ok(j) => j,
@@ -1418,6 +1618,15 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
+    if let Some(ref sarif_path) = cli.sarif {
+        if let Err(e) = fs::write(sarif_path, sarif::to_sarif(&final_results)) {
+            eprintln!("[!] Couldn't write SARIF to '{}': {e}", sarif_path.display());
+            return ExitCode::from(1);
+        } else if !cli.quiet {
+            println!("SARIF report written to {}", sarif_path.display());
+        }
+    }
 
     if to_stdout {
         println!("{output_json}");
@@ -1547,8 +1756,16 @@ mod tests {
             assert!(s.exe.starts_with('/'), "exe should be absolute: {}", s.exe);
             assert!(!s.version.is_empty(), "version should be non-empty for {}", s.name);
         }
-        // Exercise the exposure-correlation (lsof) path end to end.
+        // Exercise the exposure-correlation (lsof) path end to end. A typical
+        // macOS host runs at least one listener (e.g. rapportd, mDNSResponder),
+        // so we expect the lsof parser to return at least one endpoint overall.
         enrich_exposure(&mut found);
+        let total_listeners: usize = found.iter().map(|s| s.listeners.len()).sum();
+        assert!(
+            total_listeners > 0,
+            "lsof exposure parsing returned no listeners across any service — \
+             the lsof field-output parser is likely broken again"
+        );
         for s in &found {
             for ep in &s.listeners {
                 assert!(ep.contains(':'), "listener endpoint should be host:port: {ep}");
@@ -1557,12 +1774,17 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_exposure_classification() {
-        assert!(endpoint_is_exposed("0.0.0.0:443"));
-        assert!(endpoint_is_exposed("[::]:443"));
-        assert!(endpoint_is_exposed("192.168.1.5:22"));
-        assert!(!endpoint_is_exposed("127.0.0.1:8080"));
-        assert!(!endpoint_is_exposed("[::1]:631"));
+    fn reachability_classification() {
+        use Reachability::*;
+        assert_eq!(endpoint_reachability("tcp 0.0.0.0:443"), Public);
+        assert_eq!(endpoint_reachability("[::]:443"), Public);
+        assert_eq!(endpoint_reachability("203.0.113.5:22"), Public);
+        assert_eq!(endpoint_reachability("192.168.1.5:22"), Private);
+        assert_eq!(endpoint_reachability("10.0.0.9:5432"), Private);
+        assert_eq!(endpoint_reachability("udp 100.64.0.1:53"), Private); // CGNAT
+        assert_eq!(endpoint_reachability("127.0.0.1:8080"), Loopback);
+        assert_eq!(endpoint_reachability("[::1]:631"), Loopback);
+        assert!(Public > Private && Private > Loopback && Loopback > None);
     }
 
     #[test]
@@ -1571,5 +1793,72 @@ mod tests {
         assert_eq!(parse_proc_addr("0100007F:1F90", false).as_deref(), Some("127.0.0.1:8080"));
         // 0.0.0.0:443
         assert_eq!(parse_proc_addr("00000000:01BB", false).as_deref(), Some("0.0.0.0:443"));
+    }
+
+    #[test]
+    fn parse_launchctl_fixture() {
+        let out = "PID\tStatus\tLabel\n\
+                   653\t0\thomebrew.mxcl.nginx\n\
+                   -\t0\tcom.example.stopped\n\
+                   42\t0\tcom.apple.something\n\
+                   88\t0\torg.postgresql.postgres\n";
+        let got = parse_launchctl_running(out);
+        assert_eq!(got, vec![
+            ("homebrew.mxcl.nginx".to_string(), "653".to_string()),
+            ("org.postgresql.postgres".to_string(), "88".to_string()),
+        ]);
+    }
+
+    #[test]
+    fn parse_sysvinit_fixture() {
+        let out = " [ + ]  ssh\n [ - ]  cups\n nginx        [ started ]\n [ ? ]  weird\n";
+        assert_eq!(parse_sysvinit_running(out), vec!["ssh".to_string(), "nginx".to_string()]);
+    }
+
+    #[test]
+    fn parse_svcs_fixture() {
+        let out = "online\tsvc:/network/ssh:default\n\
+                   disabled\tsvc:/network/telnet:default\n\
+                   online\tsvc:/system/system-log:default\n";
+        assert_eq!(parse_svcs_online(out), vec![
+            "svc:/network/ssh:default".to_string(),
+            "svc:/system/system-log:default".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn glob_matching() {
+        assert!(glob_match("nginx", "nginx"));
+        assert!(!glob_match("nginx", "nginx-ui"));
+        assert!(glob_match("*sql*", "postgresql"));
+        assert!(glob_match("postgres*", "postgresql"));
+        assert!(glob_match("*.service", "ssh.service"));
+        assert!(!glob_match("ngin?", "nginx")); // no '?' support, treated literally
+        assert!(name_allowed("nginx", &[], &["sshd".into()]));
+        assert!(!name_allowed("sshd", &[], &["ssh*".into()]));
+        assert!(name_allowed("nginx", &["ngin*".into()], &[]));
+        assert!(!name_allowed("redis", &["ngin*".into()], &[]));
+    }
+
+    #[test]
+    fn sarif_is_valid_json_with_runs() {
+        use find_threats::*;
+        let mut services = std::collections::BTreeMap::new();
+        services.insert("nginx@1.24.0".to_string(), vec![
+            serde_json::from_value::<ThreatEntry>(serde_json::json!({
+                "cveId": "CVE-2024-0001", "title": "x", "severity": "high",
+                "kev": true, "references": ["https://e/1"], "matchBasis": "constraint"
+            })).unwrap()
+        ]);
+        let results = BatchResults {
+            meta: Meta::default(), services, by_cve: std::collections::BTreeMap::new(),
+            assets: std::collections::BTreeMap::new(), system: None,
+            errors: std::collections::BTreeMap::new(),
+        };
+        let s = sarif::to_sarif(&results);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["version"], "2.1.0");
+        assert_eq!(v["runs"][0]["results"][0]["ruleId"], "CVE-2024-0001");
+        assert_eq!(v["runs"][0]["results"][0]["level"], "error");
     }
 }

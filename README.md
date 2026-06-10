@@ -32,6 +32,8 @@ threat-finder [OPTIONS]
 | `--json` | Print the JSON report to stdout instead of a file |
 | `--severity <LEVEL>` | Only report threats at/above a severity (`critical\|high\|medium\|low`) |
 | `--fail-on <WHAT>` | Exit `5` if matching findings exist: `any\|critical\|high\|medium\|low\|kev\|exposed` (CI gating) |
+| `--sarif <PATH>` | Also write a SARIF 2.1.0 report (for code-scanning UIs) |
+| `--include <GLOB>` / `--exclude <GLOB>` | Filter scanned services by name glob (repeatable) |
 | `-q, --quiet` | Suppress the banner, progress, and summary |
 | `--no-color` | Disable ANSI colors in the summary |
 | `-y, --yes` | Assume defaults, never prompt — for CI/cron |
@@ -101,13 +103,18 @@ JSON with:
   `epss`, `cvssScore`/`cvssVector`, `references`, and `matchBasis` showing whether
   the match was a structured constraint or a free-text fallback), sorted
   highest-risk-first.
-- `assets` — `name@version` → `{ exe, versionSource, exposed, listeners }`, where
-  `versionSource` is `package-db` (authoritative) or `probe` (heuristic).
+- `assets` — `name@version` → `{ exe, versionSource, exposed, reachability, listeners }`,
+  where `versionSource` is `package-db` (authoritative) or `probe` (heuristic) and
+  `reachability` is `loopback` / `private` / `public` (TCP **and** UDP listeners).
+- `byCve` — each CVE rolled up across every service it affects (the "patch once,
+  fix many" remediation view).
 - `system` — optional kernel/distro findings.
 - `errors` — per-service lookup failures, so a failed lookup is never silently
   reported as "no vulnerabilities".
+- `meta` — `{ tool, version, schemaVersion }`.
 
-Keys are sorted (BTreeMap), so reports diff cleanly across runs.
+Keys are sorted (BTreeMap) and there is no timestamp, so reports diff cleanly
+across runs.
 
 ## Tests
 

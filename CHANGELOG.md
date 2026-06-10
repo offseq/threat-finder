@@ -7,6 +7,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Reachability classification (loopback / private / public) for listeners, and
+  UDP listener coverage in addition to TCP.
+- Cross-service CVE grouping (`byCve`) — one fix mapped to every affected service.
+- SARIF 2.1.0 output (`--sarif`) and `--include`/`--exclude` service globs.
+- Output `meta` envelope with `schemaVersion`.
+
+### Fixed
+- **Critical:** `lsof`-based exposure correlation returned nothing on
+  macOS/BSD/Solaris (the `(LISTEN)` suffix defeated the parser), silently
+  disabling the headline feature off-Linux. Now uses `lsof -Fn` field output,
+  with a non-vacuous regression test.
+
+### Changed
+- `ThreatError` now implements `std::error::Error`; single canonical
+  `severity_rank`; pure per-OS parse functions extracted and unit-tested.
+
+## [0.1.0-prev]
+
+### Added
 - Network-exposure correlation: each running service is mapped to its listening
   sockets (`/proc/net` on Linux, `lsof` elsewhere) and flagged when reachable
   off-host. Findings rank exposed-first.

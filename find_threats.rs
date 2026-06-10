@@ -121,6 +121,26 @@ impl From<reqwest::Error> for ThreatError {
     }
 }
 
+impl std::error::Error for ThreatError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ThreatError::Http(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// Canonical severity ordering used across ranking, gating, and display.
+pub fn severity_rank(sev: Option<&str>) -> u8 {
+    match sev.map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("critical") => 4,
+        Some("high")     => 3,
+        Some("medium")   => 2,
+        Some("low")      => 1,
+        _                => 0,
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ThreatEntry {
     #[serde(rename = "cveId")]
@@ -150,13 +170,7 @@ pub struct ThreatEntry {
 
 impl ThreatEntry {
     fn severity_rank(&self) -> u8 {
-        match self.severity.as_deref().map(str::to_lowercase).as_deref() {
-            Some("critical") => 4,
-            Some("high")     => 3,
-            Some("medium")   => 2,
-            Some("low")      => 1,
-            _                => 0,
-        }
+        severity_rank(self.severity.as_deref())
     }
 
     fn cvss_num(&self) -> f64 {
@@ -194,13 +208,45 @@ pub struct AssetInfo {
     #[serde(rename = "versionSource")]
     pub version_source: String,
     pub exposed: bool,
+    /// loopback | private | public | none
+    pub reachability: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub listeners: Vec<String>,
 }
 
+/// Report envelope metadata (stable across runs — no timestamp, so reports diff).
+#[derive(Debug, Serialize)]
+pub struct Meta {
+    pub tool: &'static str,
+    pub version: &'static str,
+    #[serde(rename = "schemaVersion")]
+    pub schema_version: u32,
+}
+
+impl Default for Meta {
+    fn default() -> Self {
+        Meta { tool: "threat-finder", version: env!("CARGO_PKG_VERSION"), schema_version: 1 }
+    }
+}
+
+/// One CVE rolled up across every service it affects — the remediation view
+/// ("patch openssl → closes CVE-X across 6 services").
+#[derive(Debug, Serialize)]
+pub struct CveGroup {
+    pub severity: Option<String>,
+    pub kev: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epss: Option<f64>,
+    pub title: Option<String>,
+    pub assets: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct BatchResults {
+    pub meta: Meta,
     pub services: BTreeMap<String, Vec<ThreatEntry>>,
+    #[serde(rename = "byCve", skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_cve:   BTreeMap<String, CveGroup>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub assets:   BTreeMap<String, AssetInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -218,6 +264,36 @@ impl BatchResults {
             .map(|m| m.values().map(|v| v.len()).sum())
             .unwrap_or(0);
         svc + sys
+    }
+
+    /// Roll findings up by CVE id across all services + system entries.
+    pub fn compute_cve_groups(&mut self) {
+        let mut groups: BTreeMap<String, CveGroup> = BTreeMap::new();
+        let sources = self.services.iter().chain(self.system.iter().flatten());
+        for (key, entries) in sources {
+            for t in entries {
+                let Some(cve) = t.cve_id.clone() else { continue };
+                let g = groups.entry(cve).or_insert_with(|| CveGroup {
+                    severity: t.severity.clone(),
+                    kev: t.kev,
+                    epss: t.epss,
+                    title: t.title.clone(),
+                    assets: Vec::new(),
+                });
+                g.kev |= t.kev;
+                if severity_rank(t.severity.as_deref()) > severity_rank(g.severity.as_deref()) {
+                    g.severity = t.severity.clone();
+                }
+                if !g.assets.iter().any(|a| a == key) {
+                    g.assets.push(key.clone());
+                }
+            }
+        }
+        for g in groups.values_mut() {
+            g.assets.sort();
+            g.assets.dedup();
+        }
+        self.by_cve = groups;
     }
 }
 
@@ -516,10 +592,6 @@ impl PartialEq for Version {
 
 impl Eq for Version {}
 
-fn parse_version(text: &str) -> Option<Version> {
-    Version::parse(text)
-}
-
 /// True if `needle` appears in `haystack` as a standalone version token, i.e.
 /// not glued to surrounding digits or dots. Prevents "1.2" from matching inside
 /// "1.20" or "11.2.3".
@@ -615,12 +687,12 @@ fn threat_matches_service(threat: &Value, service: &str) -> bool {
 
     // nginx false-positive guard
     if service == "nginx" {
-        let blocked = [
+        const BLOCKED: &[&str] = &[
             "nginx-ui", "nginx ui", "nginx plus",
             "nginx javascript", "nginx proxy manager",
         ];
         let combined = format!("{vendor} {product} {title}");
-        if blocked.iter().any(|b| combined.contains(b))
+        if BLOCKED.iter().any(|b| combined.contains(b))
             && !enrich.contains("nginx open source")
             && !desc.contains("nginx open source")
         {
@@ -705,7 +777,7 @@ fn text_mentions_affected_version_range(text: &str, target: &Version, target_raw
 
     for re in RANGE_RES.iter() {
         if let Some(caps) = re.captures(&text) {
-            if let (Some(lo), Some(hi)) = (parse_version(&caps[1]), parse_version(&caps[2])) {
+            if let (Some(lo), Some(hi)) = (Version::parse(&caps[1]), Version::parse(&caps[2])) {
                 if &lo <= target && target <= &hi {
                     return true;
                 }
@@ -714,7 +786,7 @@ fn text_mentions_affected_version_range(text: &str, target: &Version, target_raw
     }
     for re in UPPER_EXCL_RES.iter() {
         if let Some(caps) = re.captures(&text) {
-            if let Some(hi) = parse_version(&caps[1]) {
+            if let Some(hi) = Version::parse(&caps[1]) {
                 if target < &hi {
                     return true;
                 }
@@ -723,7 +795,7 @@ fn text_mentions_affected_version_range(text: &str, target: &Version, target_raw
     }
     for re in UPPER_INCL_RES.iter() {
         if let Some(caps) = re.captures(&text) {
-            if let Some(hi) = parse_version(&caps[1]) {
+            if let Some(hi) = Version::parse(&caps[1]) {
                 if target <= &hi {
                     return true;
                 }
@@ -852,7 +924,7 @@ fn match_version(threat: &Value, target_version: &str) -> Option<MatchBasis> {
         hit.then_some(MatchBasis::FreeText)
     };
 
-    let target = match parse_version(target_version) {
+    let target = match Version::parse(target_version) {
         Some(v) => v,
         None => {
             if let Some(arr) = affected_arr {
