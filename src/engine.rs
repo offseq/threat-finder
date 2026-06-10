@@ -477,12 +477,15 @@ pub fn package_of(exe: &str, os: &OsType) -> Option<(String, String)> {
 }
 
 pub fn dpkg_of(path: &str) -> Option<(String, String)> {
-    // dpkg-query -S <path> -> "pkg: /path"  (or "pkg1, pkg2: /path")
+    // dpkg-query -S <path> -> "pkg: /path" (or "pkg1, pkg2: /path"), possibly
+    // preceded by "diversion by <pkg> from: /path" lines for diverted files.
     let owner = run_cmd("dpkg-query", &["-S", path])?;
-    let pkg = owner.split(':').next()?.split(',').next()?.trim().to_string();
-    if pkg.is_empty() {
-        return None;
-    }
+    let pkg = owner.lines()
+        .find(|l| !l.starts_with("diversion by ") && !l.starts_with("local diversion ") && l.contains(": "))
+        .and_then(|l| l.split(':').next())
+        .and_then(|names| names.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
     let ver = run_cmd("dpkg-query", &["-W", "-f=${Version}", &pkg])?.trim().to_string();
     (!ver.is_empty()).then_some((pkg, ver))
 }
@@ -507,7 +510,7 @@ pub fn rpm_of(path: &str) -> Option<(String, String)> {
         evr.push(':');
     }
     evr.push_str(version);
-    if !release.is_empty() {
+    if !release.is_empty() && release != "(none)" {
         evr.push('-');
         evr.push_str(release);
     }
@@ -724,6 +727,20 @@ pub fn endpoint_host(ep: &str) -> &str {
     host.trim_matches(|c| c == '[' || c == ']')
 }
 
+fn classify_v4(v4: std::net::Ipv4Addr) -> Reachability {
+    let o = v4.octets();
+    if v4.is_loopback() {
+        Reachability::Loopback
+    } else if v4.is_private()
+        || v4.is_link_local()
+        || (o[0] == 100 && (o[1] & 0xc0) == 64) // CGNAT 100.64.0.0/10
+    {
+        Reachability::Private
+    } else {
+        Reachability::Public
+    }
+}
+
 /// Classify how reachable a listener is: loopback, private (LAN/CGNAT/ULA), or
 /// public (routable / wildcard). Sharpens the "internet-exposed" signal.
 pub fn endpoint_reachability(ep: &str) -> Reachability {
@@ -734,27 +751,23 @@ pub fn endpoint_reachability(ep: &str) -> Reachability {
         "127.0.0.1" | "::1" | "localhost" => Reachability::Loopback,
         h => {
             if let Ok(v4) = h.parse::<Ipv4Addr>() {
-                let o = v4.octets();
-                if v4.is_loopback() {
-                    Reachability::Loopback
-                } else if v4.is_private()
-                    || v4.is_link_local()
-                    || (o[0] == 100 && (o[1] & 0xc0) == 64) // CGNAT 100.64.0.0/10
-                {
-                    Reachability::Private
-                } else {
-                    Reachability::Public
-                }
+                classify_v4(v4)
             } else if let Ok(v6) = h.parse::<Ipv6Addr>() {
-                let seg0 = v6.segments()[0];
-                if v6.is_loopback() {
+                // ::ffff:a.b.c.d — classify by the embedded IPv4 (else a
+                // loopback/LAN service appears Public).
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    classify_v4(v4)
+                } else if v6.is_loopback() {
                     Reachability::Loopback
-                } else if (seg0 & 0xfe00) == 0xfc00      // ULA fc00::/7
-                    || (seg0 & 0xffc0) == 0xfe80          // link-local fe80::/10
-                {
-                    Reachability::Private
                 } else {
-                    Reachability::Public
+                    let seg0 = v6.segments()[0];
+                    if (seg0 & 0xfe00) == 0xfc00      // ULA fc00::/7
+                        || (seg0 & 0xffc0) == 0xfe80  // link-local fe80::/10
+                    {
+                        Reachability::Private
+                    } else {
+                        Reachability::Public
+                    }
                 }
             } else {
                 Reachability::Public // unknown host string: assume worst
@@ -1236,6 +1249,10 @@ mod tests {
         assert_eq!(endpoint_reachability("udp 100.64.0.1:53"), Private);
         assert_eq!(endpoint_reachability("127.0.0.1:8080"), Loopback);
         assert_eq!(endpoint_reachability("[::1]:631"), Loopback);
+        // IPv4-mapped IPv6 must classify by the embedded v4 (not fall to Public).
+        assert_eq!(endpoint_reachability("[::ffff:127.0.0.1]:8080"), Loopback);
+        assert_eq!(endpoint_reachability("[::ffff:192.168.1.1]:443"), Private);
+        assert_eq!(endpoint_reachability("[::ffff:203.0.113.5]:443"), Public);
         assert!(Public > Private && Private > Loopback && Loopback > None);
     }
 
@@ -1293,11 +1310,13 @@ pub struct InstalledPkg {
 /// (name, upstream-version). Names may contain hyphens, so anchor on the first
 /// "-<digit>" run.
 fn atom_split(atom: &str) -> Option<(String, String)> {
-    let caps = ATOM_VER_RE.captures(atom)?;
-    let m = caps.get(0)?;
+    let atom = atom.trim();
+    // Anchor on the LAST "-<digit…>" run: the version is the trailing component,
+    // so names with embedded numeric segments (e.g. "gtk-3-3.24.0") split right.
+    let m = ATOM_VER_RE.find_iter(atom).last()?;
     let name = atom[..m.start()].trim().to_string();
-    // Keep the FULL version (incl. -rN / nbN / patchlevel) — the match API needs
-    // it for ecosystem-native comparison; the upstream-only capture is lossy.
+    // Keep the FULL version (incl. -rN / nbN / patchlevel) for ecosystem-native
+    // comparison; the upstream-only capture would be lossy.
     let ver = atom[m.start() + 1..].trim().to_string();
     (!name.is_empty() && !ver.is_empty()).then_some((name, ver))
 }
@@ -1347,7 +1366,7 @@ pub fn parse_rpm_list(out: &str) -> Vec<(String, String)> {
             evr.push(':');
         }
         evr.push_str(version);
-        if !release.is_empty() {
+        if !release.is_empty() && release != "(none)" {
             evr.push('-');
             evr.push_str(release);
         }
@@ -1438,10 +1457,13 @@ mod inventory_tests {
     fn rpm_parse() {
         let out = "openssl\t1\t3.0.7\t18.el9\tx86_64\n\
                    gpg-pubkey\t(none)\tfd431d51\t4ae0493b\t(none)\n\
-                   httpd\t(none)\t2.4.57\t5.el9\tx86_64\n";
+                   httpd\t(none)\t2.4.57\t5.el9\tx86_64\n\
+                   basesystem\t(none)\t11\t(none)\tnoarch\n";
         assert_eq!(parse_rpm_list(out), vec![
             ("openssl".into(), "1:3.0.7-18.el9".into()),
             ("httpd".into(), "2.4.57-5.el9".into()),
+            // literal "(none)" release must not leak into the EVR
+            ("basesystem".into(), "11".into()),
         ]);
     }
 
@@ -1457,6 +1479,8 @@ mod inventory_tests {
             vec![("nginx".into(), "1.26.2-r0".into()), ("musl".into(), "1.2.5-r0".into())]);
         assert_eq!(parse_pkg_info_list("nginx-1.26.2 web server\nbash-5.2.15nb1 shell\n"),
             vec![("nginx".into(), "1.26.2".into()), ("bash".into(), "5.2.15nb1".into())]);
+        // name with an embedded numeric segment splits at the LAST version run
+        assert_eq!(parse_pkg_info_list("gtk-3-3.24.0 toolkit\n"), vec![("gtk-3".into(), "3.24.0".into())]);
     }
 
     #[test]

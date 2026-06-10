@@ -15,14 +15,11 @@ fn level(sev: Option<&str>) -> &'static str {
     }
 }
 
-fn security_severity(t: &ThreatEntry) -> Option<String> {
-    t.cvss_score.as_ref().and_then(|v| v.as_f64()).map(|f| f.to_string())
-}
 
 fn push_entry(rules: &mut BTreeMap<String, Value>, results: &mut Vec<Value>, asset: &str, t: &ThreatEntry) {
     let id = t.cve_id.clone().unwrap_or_else(|| "UNKNOWN".to_string());
 
-    rules.entry(id.clone()).or_insert_with(|| {
+    let rule = rules.entry(id.clone()).or_insert_with(|| {
         let mut rule = json!({
             "id": id,
             "name": id,
@@ -31,11 +28,18 @@ fn push_entry(rules: &mut BTreeMap<String, Value>, results: &mut Vec<Value>, ass
         if let Some(url) = t.references.first() {
             rule["helpUri"] = json!(url);
         }
-        if let Some(ss) = security_severity(t) {
-            rule["properties"] = json!({ "security-severity": ss });
-        }
         rule
     });
+    // security-severity: take the highest CVSS seen across duplicate entries for
+    // this CVE (a later entry may carry a score the first one lacked).
+    if let Some(score) = t.cvss_score.as_ref().and_then(|v| v.as_f64()) {
+        let prev = rule["properties"]["security-severity"]
+            .as_str()
+            .and_then(|s| s.parse::<f64>().ok());
+        if prev.is_none_or(|p| score > p) {
+            rule["properties"]["security-severity"] = json!(score.to_string());
+        }
+    }
 
     results.push(json!({
         "ruleId": id,
@@ -66,13 +70,6 @@ pub fn to_sarif(results: &BatchResults) -> String {
     for (asset, entries) in &results.services {
         for t in entries {
             push_entry(&mut rules, &mut out, asset, t);
-        }
-    }
-    if let Some(sys) = &results.system {
-        for (asset, entries) in sys {
-            for t in entries {
-                push_entry(&mut rules, &mut out, asset, t);
-            }
         }
     }
 

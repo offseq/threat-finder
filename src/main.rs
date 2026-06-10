@@ -186,11 +186,12 @@ fn glob_match(pattern: &str, s: &str) -> bool {
     true
 }
 
-fn name_allowed(name: &str, include: &[String], exclude: &[String]) -> bool {
-    if exclude.iter().any(|p| glob_match(p, name)) {
-        return false;
-    }
-    include.is_empty() || include.iter().any(|p| glob_match(p, name))
+/// Whether an asset passes the include/exclude globs, matched against any of its
+/// `names` (display name + resolved package coordinate): include keeps if any
+/// name matches; exclude drops if any name matches.
+fn asset_allowed(names: &[&str], include: &[String], exclude: &[String]) -> bool {
+    let hits = |globs: &[String]| globs.iter().any(|g| names.iter().any(|n| glob_match(g, n)));
+    !hits(exclude) && (include.is_empty() || hits(include))
 }
 
 
@@ -311,11 +312,6 @@ fn fail_triggered(results: &BatchResults, fail_on: FailOn, floor: Option<Severit
             return true;
         }
     }
-    if let Some(sys) = &results.system {
-        if sys.values().flatten().any(|t| hit(t, false)) {
-            return true;
-        }
-    }
     false
 }
 
@@ -367,7 +363,13 @@ fn main() -> ExitCode {
     }
 
     if !cli.include.is_empty() || !cli.exclude.is_empty() {
-        assets.retain(|a| name_allowed(&a.name, &cli.include, &cli.exclude));
+        // Match against BOTH the display name and the resolved package coordinate
+        // (a unit "ssh" resolves to "openssh-server"): include keeps if either
+        // matches; exclude drops if either matches.
+        assets.retain(|a| {
+            let coord = a.coordinate_name();
+            asset_allowed(&[a.name.as_str(), &coord], &cli.include, &cli.exclude)
+        });
     }
     assets.sort_by_key(|a| a.report_key());
 
@@ -437,7 +439,6 @@ fn main() -> ExitCode {
         by_cve: std::collections::BTreeMap::new(),
         unconfirmed: outcome.unconfirmed,
         assets: asset_map,
-        system:   None,
         errors:   outcome.errors,
     };
     final_results.compute_cve_groups();
@@ -534,10 +535,14 @@ mod tests {
         assert!(glob_match("postgres*", "postgresql"));
         assert!(glob_match("*.service", "ssh.service"));
         assert!(!glob_match("ngin?", "nginx")); // no '?' support, treated literally
-        assert!(name_allowed("nginx", &[], &["sshd".into()]));
-        assert!(!name_allowed("sshd", &[], &["ssh*".into()]));
-        assert!(name_allowed("nginx", &["ngin*".into()], &[]));
-        assert!(!name_allowed("redis", &["ngin*".into()], &[]));
+        // include/exclude over an asset's names (display + coordinate)
+        assert!(asset_allowed(&["nginx"], &[], &["sshd".into()]));
+        assert!(!asset_allowed(&["sshd"], &[], &["ssh*".into()]));
+        assert!(asset_allowed(&["nginx"], &["ngin*".into()], &[]));
+        assert!(!asset_allowed(&["redis"], &["ngin*".into()], &[]));
+        // a unit "ssh" whose package is "openssh-server": excluded via either name
+        assert!(!asset_allowed(&["ssh", "openssh-server"], &[], &["openssh*".into()]));
+        assert!(asset_allowed(&["ssh", "openssh-server"], &["openssh*".into()], &[]));
     }
 
     #[test]
@@ -553,7 +558,7 @@ mod tests {
         let results = BatchResults {
             meta: Meta::default(), services, by_cve: std::collections::BTreeMap::new(),
             unconfirmed: std::collections::BTreeMap::new(),
-            assets: std::collections::BTreeMap::new(), system: None,
+            assets: std::collections::BTreeMap::new(),
             errors: std::collections::BTreeMap::new(),
         };
         let s = sarif::to_sarif(&results);

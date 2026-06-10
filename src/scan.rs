@@ -360,7 +360,10 @@ pub fn run_scan(
     let mut unconfirmed: BTreeMap<String, Vec<ThreatEntry>> = BTreeMap::new();
     let mut errors: BTreeMap<String, String> = BTreeMap::new();
 
-    let keep = |e: &ThreatEntry| severity_rank(e.severity.as_deref()) >= severity_floor;
+    // Known-exploited findings are never filtered out by the severity floor —
+    // dropping a KEV CVE on a severity threshold would contradict risk ranking
+    // and hide it from `--fail-on kev`.
+    let keep = |e: &ThreatEntry| e.kev || severity_rank(e.severity.as_deref()) >= severity_floor;
 
     if !queries.is_empty() {
         let matched = client.match_batch(&queries, strict)?;

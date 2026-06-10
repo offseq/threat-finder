@@ -48,19 +48,13 @@ impl RateLimitInfo {
         if let Some(v) = parse_header(headers, "X-RateLimit-Limit-Monthly") {
             self.limit_monthly = v;
         }
+        // Latest response is authoritative (sequential requests), so a quota-window
+        // reset is reflected immediately rather than pinned stale-low.
         if let Some(v) = parse_header(headers, "X-RateLimit-Remaining-Hourly") {
-            self.remaining_hourly = if self.remaining_hourly == 0 {
-                v
-            } else {
-                self.remaining_hourly.min(v)
-            };
+            self.remaining_hourly = v;
         }
         if let Some(v) = parse_header(headers, "X-RateLimit-Remaining-Monthly") {
-            self.remaining_monthly = if self.remaining_monthly == 0 {
-                v
-            } else {
-                self.remaining_monthly.min(v)
-            };
+            self.remaining_monthly = v;
         }
     }
 }
@@ -98,6 +92,10 @@ fn format_num(n: u64) -> String {
 #[derive(Debug)]
 pub enum ThreatError {
     RateLimitExceeded(String),
+    /// HTTP 413 Payload Too Large: the batch exceeded the tier cap. Carries the
+    /// server-advertised `data.maxBatch`, when present, so the caller can resize
+    /// and retry instead of aborting.
+    BatchTooLarge(Option<usize>),
     Http(reqwest::Error),
     Other(String),
 }
@@ -106,6 +104,8 @@ impl std::fmt::Display for ThreatError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ThreatError::RateLimitExceeded(msg) => write!(f, "Rate limit exceeded: {msg}"),
+            ThreatError::BatchTooLarge(Some(n)) => write!(f, "Batch too large (max {n})"),
+            ThreatError::BatchTooLarge(None)    => write!(f, "Batch too large"),
             ThreatError::Http(e)                => write!(f, "HTTP error: {e}"),
             ThreatError::Other(msg)             => write!(f, "{msg}"),
         }
@@ -248,8 +248,6 @@ pub struct BatchResults {
     /// the primary count, by_cve, and --fail-on.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub unconfirmed: BTreeMap<String, Vec<ThreatEntry>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub system:   Option<BTreeMap<String, Vec<ThreatEntry>>>,
     /// Per-service lookup failures (name -> error). Distinguishes "lookup failed"
     /// from "no CVEs found".
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -258,18 +256,13 @@ pub struct BatchResults {
 
 impl BatchResults {
     pub fn total_vulns(&self) -> usize {
-        let svc: usize = self.services.values().map(|v| v.len()).sum();
-        let sys: usize = self.system.as_ref()
-            .map(|m| m.values().map(|v| v.len()).sum())
-            .unwrap_or(0);
-        svc + sys
+        self.services.values().map(|v| v.len()).sum()
     }
 
-    /// Roll findings up by CVE id across all services + system entries.
+    /// Roll findings up by CVE id across all (confirmed) service entries.
     pub fn compute_cve_groups(&mut self) {
         let mut groups: BTreeMap<String, CveGroup> = BTreeMap::new();
-        let sources = self.services.iter().chain(self.system.iter().flatten());
-        for (key, entries) in sources {
+        for (key, entries) in &self.services {
             for t in entries {
                 let Some(cve) = t.cve_id.clone() else { continue };
                 let g = groups.entry(cve).or_insert_with(|| CveGroup {
@@ -389,6 +382,18 @@ impl ThreatClient {
                 return Err(ThreatError::RateLimitExceeded(message));
             }
 
+            if status.as_u16() == 413 {
+                // Batch exceeded the tier cap. Surface the advertised max so the
+                // caller can resize and retry rather than abort. Not retried here.
+                let max_batch = response.json::<Value>().ok().and_then(|b| {
+                    b.get("data")
+                        .and_then(|d| d.get("maxBatch"))
+                        .and_then(Value::as_u64)
+                        .map(|n| n as usize)
+                });
+                return Err(ThreatError::BatchTooLarge(max_batch));
+            }
+
             if status.is_server_error() && attempt < MAX_RETRIES {
                 self.backoff_sleep(attempt);
                 attempt += 1;
@@ -407,7 +412,11 @@ impl ThreatClient {
                             format!("HTTP {code}: {}", body.chars().take(200).collect::<String>())
                         }
                     });
-                if code == 401 || code == 403 {
+                // 401 = the key itself is missing/invalid → suggest re-entering it.
+                // 403 = the key is VALID but the account lacks API access (wrong
+                // tier / no Pro Console). The server's message already explains
+                // how to fix that, so don't muddy it with "check your API key".
+                if code == 401 {
                     msg = format!("{msg} (check your API key — re-run with --reset to re-enter it)");
                 }
                 return Err(ThreatError::Other(msg));
@@ -432,20 +441,51 @@ impl ThreatClient {
         queries: &[MatchQuery],
         strict: bool,
     ) -> Result<Vec<MatchResult>, ThreatError> {
-        let cap = tier_batch_cap(self.last_rate_limit().limit_hourly);
         let mut out: Vec<MatchResult> = Vec::with_capacity(queries.len());
-        for chunk in queries.chunks(cap) {
+        let mut cursor = 0usize;
+        // The working cap can only shrink within a run (a 413 tells us the real
+        // server limit); we never grow it back past what the server accepted.
+        let mut cap_ceiling = usize::MAX;
+        while cursor < queries.len() {
+            // Recompute every iteration: on the first chunk the rate-limit headers
+            // haven't been seen yet (limit_hourly == 0 -> default 25), but once the
+            // first response populates them, later chunks use the real tier cap.
+            let cap = tier_batch_cap(self.last_rate_limit().limit_hourly).min(cap_ceiling);
+            let end = (cursor + cap).min(queries.len());
+            let chunk = &queries[cursor..end];
+
             let body = MatchBatchRequest { queries: chunk, strict };
-            let json = self.post_json("/match/batch", &body)?;
-            let parsed: MatchBatchResponse = serde_json::from_value(json)
-                .map_err(|e| ThreatError::Other(format!("match/batch decode error: {e}")))?;
-            if parsed.data.results.len() != chunk.len() {
-                return Err(ThreatError::Other(format!(
-                    "match/batch alignment error: sent {} queries, got {} results",
-                    chunk.len(), parsed.data.results.len()
-                )));
+            match self.post_json("/match/batch", &body) {
+                Ok(json) => {
+                    let parsed: MatchBatchResponse = serde_json::from_value(json)
+                        .map_err(|e| ThreatError::Other(format!("match/batch decode error: {e}")))?;
+                    if parsed.data.results.len() != chunk.len() {
+                        return Err(ThreatError::Other(format!(
+                            "match/batch alignment error: sent {} queries, got {} results",
+                            chunk.len(), parsed.data.results.len()
+                        )));
+                    }
+                    out.extend(parsed.data.results);
+                    cursor = end;
+                }
+                Err(ThreatError::BatchTooLarge(max_batch)) => {
+                    // A single item can't be split further; a 413 on it is a hard
+                    // error rather than something we can retry-shrink out of.
+                    if chunk.len() <= 1 {
+                        return Err(ThreatError::BatchTooLarge(max_batch));
+                    }
+                    // Server rejected this chunk as too large. Shrink the working
+                    // cap to the advertised max (or halve it) and retry the SAME
+                    // slice — do not advance the cursor or abort the run. Always
+                    // make strict progress (< chunk.len()) to avoid an infinite loop.
+                    let new_cap = match max_batch {
+                        Some(n) if n >= 1 && n < chunk.len() => n,
+                        _ => chunk.len() / 2,
+                    };
+                    cap_ceiling = new_cap.max(1);
+                }
+                Err(e) => return Err(e),
             }
-            out.extend(parsed.data.results);
         }
         Ok(out)
     }
@@ -590,6 +630,52 @@ pub struct MatchResult {
     pub matches: Vec<MatchHit>,
 }
 
+/// Tolerant EPSS model: the server sends `epss` as an object `{score, percentile}`
+/// (the common case), but defensively we also accept a bare number or null/absent.
+/// A wrong-typed *present* value here would otherwise fail the whole-chunk decode.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum EpssField {
+    Object {
+        #[serde(default)]
+        score: Option<f64>,
+        #[serde(default)]
+        percentile: Option<f64>,
+    },
+    Score(f64),
+    Null,
+}
+
+impl EpssField {
+    fn score(&self) -> Option<f64> {
+        match self {
+            EpssField::Object { score, .. } => *score,
+            EpssField::Score(s) => Some(*s),
+            EpssField::Null => None,
+        }
+    }
+    fn percentile(&self) -> Option<f64> {
+        match self {
+            EpssField::Object { percentile, .. } => *percentile,
+            _ => None,
+        }
+    }
+}
+
+/// Tolerant KEV model: the server sends `kev` as an object
+/// `{addedDate,dueDate,ransomwareUse}` or null. Defensively also accept a bool.
+/// Collapses to "is KEV-listed": object/true => true, null/false/absent => false.
+fn de_kev_bool<'de, D>(de: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Option::<Value>::deserialize(de)? {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => b,
+        Some(_) => true,
+    })
+}
+
 /// One CVE match. Field names follow the maintainer-provided contract; if the
 /// live /match/help differs, only these `rename`s need adjusting.
 #[derive(Debug, Deserialize)]
@@ -598,17 +684,54 @@ pub struct MatchHit {
     pub title: Option<String>,
     pub severity: Option<String>,
     #[serde(rename = "cvssScore")] pub cvss_score: Option<Value>,
-    #[serde(default)] pub epss: Option<f64>,
-    #[serde(default)] pub kev: bool,
+    /// Raw EPSS field, tolerantly decoded from the `{score,percentile}` object, a
+    /// bare number, or null/absent. Read via [`MatchHit::epss`] / [`epss_percentile`].
+    #[serde(default)] epss: Option<EpssField>,
+    /// CISA-KEV listing, collapsed from the `{addedDate,...}` object / null / bool.
+    #[serde(default, deserialize_with = "de_kev_bool")] pub kev: bool,
     #[serde(rename = "knownExploitsInWild", default)] pub known_exploits_in_wild: Option<Value>,
     #[serde(rename = "matchBasis")] pub match_basis: Option<String>,
     #[serde(rename = "matchedRange")] pub matched_range: Option<String>,
+    #[serde(rename = "publishedDate", default)] pub published_date: Option<String>,
+    #[serde(rename = "patchAvailable", default)] pub patch_available: Option<Value>,
     #[serde(default)] pub confirmed: bool,
     #[serde(default)] pub references: Vec<Value>,
 }
 
+impl MatchHit {
+    /// Numeric EPSS score (`epss.score`), or `None` when null/absent.
+    pub fn epss(&self) -> Option<f64> {
+        self.epss.as_ref().and_then(EpssField::score)
+    }
+    /// EPSS percentile, present only in the object shape.
+    pub fn epss_percentile(&self) -> Option<f64> {
+        self.epss.as_ref().and_then(EpssField::percentile)
+    }
+}
+
 fn truthy(v: Option<&Value>) -> bool {
     matches!(v, Some(Value::Bool(true))) || v.and_then(|x| x.as_str()) == Some("true")
+}
+
+/// Read the numeric EPSS score from a raw JSON value that may be the object
+/// `{score, percentile, ...}` (the `/threats` and `/match` shape) or a bare
+/// number. Returns `None` for null/absent/other shapes.
+fn epss_score_from_value(v: Option<&Value>) -> Option<f64> {
+    match v {
+        Some(Value::Object(o)) => o.get("score").and_then(Value::as_f64),
+        other => other.and_then(Value::as_f64),
+    }
+}
+
+/// Collapse a raw `kev` value (object / null / bool) plus the separate
+/// `knownExploitsInWild` flag into a single "exploited / KEV-listed" boolean.
+fn kev_from_value(kev: Option<&Value>, known_exploits: Option<&Value>) -> bool {
+    let kev_listed = match kev {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => true,
+    };
+    kev_listed || truthy(known_exploits)
 }
 
 fn refs_to_strings(refs: &[Value]) -> Vec<String> {
@@ -623,17 +746,18 @@ fn refs_to_strings(refs: &[Value]) -> Vec<String> {
 /// Convert an API match into a ThreatEntry.
 pub fn match_to_entry(m: MatchHit) -> ThreatEntry {
     let kev = m.kev || truthy(m.known_exploits_in_wild.as_ref());
+    let epss = m.epss();
     ThreatEntry {
         cve_id: m.cve_id,
         title: m.title,
         severity: m.severity,
         cvss_score: m.cvss_score,
         cvss_vector: None,
-        epss: m.epss,
+        epss,
         kev,
-        published_date: None,
+        published_date: m.published_date,
         affected_versions: None,
-        patch_available: None,
+        patch_available: m.patch_available,
         references: refs_to_strings(&m.references),
         confirmed: m.confirmed,
         matched_range: m.matched_range,
@@ -653,8 +777,8 @@ pub fn search_to_entry(t: &Value) -> ThreatEntry {
         severity: t.get("severity").and_then(|v| v.as_str()).map(|s| s.to_string()),
         cvss_score: t.get("cvssScore").cloned(),
         cvss_vector: t.get("cvssVector").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        epss: t.get("epss").and_then(|v| v.as_f64()),
-        kev: truthy(t.get("knownExploitsInWild")),
+        epss: epss_score_from_value(t.get("epss")),
+        kev: kev_from_value(t.get("kev"), t.get("knownExploitsInWild")),
         published_date: Some(clean_date(t.get("publishedDate"))),
         affected_versions: t.get("affectedVersions").cloned(),
         patch_available: t.get("patchAvailable").cloned(),
@@ -746,5 +870,101 @@ mod tests {
         assert!(!e.confirmed);
         assert_eq!(e.match_basis, "search-fallback");
         assert!(e.kev);
+    }
+
+    /// A realistic server hit where `epss` and `kev` are OBJECTS (the common live
+    /// shape). Before the fix this failed the WHOLE-chunk decode.
+    fn realistic_hit() -> Value {
+        json!({
+            "id": "abc", "cveId": "CVE-2024-1", "title": "t", "slug": "cve-2024-1",
+            "severity": "high", "cvssScore": 7.2, "type": "vulnerability", "source": "nvd",
+            "publishedDate": "2024-01-01T00:00:00.000Z",
+            "kev": { "addedDate": "2024-02-01", "dueDate": "2024-02-22", "ransomwareUse": "Known" },
+            "epss": { "score": 0.42, "percentile": 0.97 },
+            "knownExploitsInWild": false,
+            "patchAvailable": true,
+            "matchBasis": "coordinate",
+            "matchedRange": "<4.17.21",
+            "matchedCoordinate": "pkg:npm/lodash",
+            "confirmed": true
+        })
+    }
+
+    #[test]
+    fn object_shaped_epss_and_kev_decode() {
+        // Whole envelope: one result, one object-shaped hit, must decode cleanly.
+        let raw = json!({ "data": { "results": [ { "matches": [ realistic_hit() ] } ] } });
+        let resp: MatchBatchResponse = serde_json::from_value(raw)
+            .expect("object-shaped epss/kev must not fail the chunk decode");
+        assert_eq!(resp.data.results.len(), 1);
+
+        let hit = resp.data.results.into_iter().next().unwrap()
+            .matches.into_iter().next().unwrap();
+        assert_eq!(hit.epss(), Some(0.42));
+        assert_eq!(hit.epss_percentile(), Some(0.97));
+        assert!(hit.kev, "object kev => true");
+        assert!(hit.confirmed);
+        assert_eq!(hit.match_basis.as_deref(), Some("coordinate"));
+        assert_eq!(hit.matched_range.as_deref(), Some("<4.17.21"));
+
+        // And the conversion surfaces publishedDate / patchAvailable (BUG 3).
+        let e = match_to_entry(hit);
+        assert_eq!(e.epss, Some(0.42));
+        assert!(e.kev);
+        assert_eq!(e.published_date.as_deref(), Some("2024-01-01T00:00:00.000Z"));
+        assert_eq!(e.patch_available, Some(json!(true)));
+    }
+
+    #[test]
+    fn null_epss_and_kev_decode_to_none_and_false() {
+        let raw = json!({
+            "cveId": "CVE-2024-2", "severity": "low",
+            "epss": null, "kev": null, "matchBasis": "cpe", "matchedRange": "*"
+        });
+        let hit: MatchHit = serde_json::from_value(raw).unwrap();
+        assert_eq!(hit.epss(), None);
+        assert_eq!(hit.epss_percentile(), None);
+        assert!(!hit.kev, "null kev => false");
+        let e = match_to_entry(hit);
+        assert_eq!(e.epss, None);
+        assert!(!e.kev);
+    }
+
+    #[test]
+    fn absent_epss_and_kev_default() {
+        // Neither field present at all.
+        let raw = json!({ "cveId": "CVE-2024-3", "matchBasis": "coordinate" });
+        let hit: MatchHit = serde_json::from_value(raw).unwrap();
+        assert_eq!(hit.epss(), None);
+        assert!(!hit.kev);
+    }
+
+    #[test]
+    fn bare_number_epss_and_bool_kev_defensive() {
+        // Defensive: a bare numeric epss and a bare bool kev are still accepted.
+        let raw = json!({ "cveId": "CVE-2024-4", "epss": 0.5, "kev": true });
+        let hit: MatchHit = serde_json::from_value(raw).unwrap();
+        assert_eq!(hit.epss(), Some(0.5));
+        assert_eq!(hit.epss_percentile(), None);
+        assert!(hit.kev, "bool kev => as-is");
+    }
+
+    #[test]
+    fn search_fallback_reads_object_epss_and_kev() {
+        // GET /threats also returns epss + kev as objects; both paths must agree.
+        let t = json!({
+            "cveId": "CVE-2024-5", "severity": "high",
+            "epss": { "score": 0.33, "percentile": 0.9 },
+            "kev": { "addedDate": "2024-03-01" }
+        });
+        let e = search_to_entry(&t);
+        assert_eq!(e.epss, Some(0.33));
+        assert!(e.kev, "object kev in /threats => true");
+
+        // null kev / null epss => false / None.
+        let t2 = json!({ "cveId": "CVE-2024-6", "epss": null, "kev": null });
+        let e2 = search_to_entry(&t2);
+        assert_eq!(e2.epss, None);
+        assert!(!e2.kev);
     }
 }

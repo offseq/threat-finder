@@ -4,6 +4,48 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2]
+
+### Fixed
+- **Critical: `match/batch` decode no longer fails on real responses.** The
+  server sends `epss` as an object `{score, percentile}` (or `null`) and `kev` as
+  an object `{addedDate, dueDate, ransomwareUse}` (or `null`), but the client
+  modelled them as a bare `f64` / `bool`. A present, wrong-typed value made serde
+  fail the *entire* chunk decode (`match/batch decode error`), breaking virtually
+  every scan (most CVEs carry EPSS). `epss` and `kev` are now decoded tolerantly —
+  accepting object, bare number/bool, `null`, or absent — collapsing to the
+  numeric EPSS score and an "is-KEV-listed" boolean. The `?search=` fallback
+  (`GET /threats`, where `epss`/`kev` are *also* objects) now reads them the same
+  way, so both code paths agree.
+- **Exposure:** IPv4-mapped IPv6 listeners (`::ffff:a.b.c.d`) are classified by the
+  embedded IPv4 — loopback/LAN services are no longer mislabeled `public`.
+- **Severity filter:** `--severity` no longer drops known-exploited (KEV) findings,
+  so `--fail-on kev` still fires under a severity floor.
+- `dpkg -S` diversion lines no longer corrupt package resolution.
+- rpm `(none)` release token no longer leaks into the EVR / purl.
+- Atoms with embedded numeric segments (e.g. `gtk-3-3.24.0`) split correctly.
+- `--include`/`--exclude` match both the unit name and the resolved package.
+- Rate-limit counters reflect the latest response (handles quota-window resets).
+- SARIF `security-severity` uses the highest CVSS seen per CVE.
+- Clearer auth errors: a 403 (valid key, but the account lacks API access — wrong
+  tier / no Pro Console) now shows the server's explanation instead of the
+  misleading "check your API key — re-run with --reset" hint, which is reserved
+  for a 401 (missing/invalid key).
+
+### Removed
+- Vestigial always-empty `system` field and its dead readers.
+
+### Added
+- Match findings now surface `publishedDate` and `patchAvailable` per hit (the
+  server provides them; previously only the search fallback did). The EPSS
+  percentile from the object shape is now exposed too.
+- HTTP 413 handling for over-cap batches: the per-chunk batch cap is recomputed
+  inside the send loop (so Pro/Enterprise keys stop sending 25-item chunks once
+  the first response reveals the tier), and a 413 (`{ "data": { "maxBatch": N } }`)
+  shrinks the working cap to the advertised max — or halves the chunk when absent —
+  and retries the same slice instead of aborting the run. The existing
+  429/`Retry-After` and 5xx retry logic is unchanged.
+
 ## [0.1.1]
 
 ### Fixed
