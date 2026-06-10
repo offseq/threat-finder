@@ -17,11 +17,14 @@ executing the service.
 ## Install
 
 ```sh
+# Homebrew (macOS/Linux) — prebuilt, no toolchain needed
+brew install offseq/tap/threat-finder
+
+# Prebuilt binary via cargo-binstall (Linux/macOS, x86_64 + arm64)
+cargo binstall threat-finder
+
 # From crates.io (compiles from source)
 cargo install threat-finder
-
-# Prebuilt binary, no toolchain needed (Linux/macOS, x86_64 + arm64)
-cargo binstall threat-finder
 ```
 
 Or grab a prebuilt archive from the
