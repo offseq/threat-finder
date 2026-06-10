@@ -85,7 +85,8 @@ OFFSEQ_API_KEY=… threat-finder --yes --quiet --fail-on exposed
 ```
 
 **Exit codes:** `0` ok · `1` lookup/IO error · `2` no API key · `3` unsupported
-OS · `4` rate limit/quota · `5` `--fail-on` threshold met.
+OS · `4` rate limit/quota, or API access required (upgrade needed) · `5`
+`--fail-on` threshold met.
 
 **API key** (get one from the [Radar Console](https://radar.offseq.com/console)),
 resolved in order:
@@ -124,8 +125,9 @@ SSVC-style `decision` band — **`act-now` · `soon` · `schedule` · `track`** 
 from severity, EPSS, KEV, and the owning asset's **network exposure**. The summary
 leads each line with a `[ACT-NOW 92]`-style badge and sorts by it, so the handful
 of public-facing, known-exploited issues float to the top of a noisy host. The
-score is computed the same way locally and server-side, and appears in `--json`
-and SARIF (`properties`).
+score uses the same formula locally and server-side (the Radar monitoring view
+adds a small bonus when a KEV finding is past its due date — a date the CLI
+doesn't have), and appears in `--json` and SARIF (`properties`).
 
 ## Continuous monitoring
 

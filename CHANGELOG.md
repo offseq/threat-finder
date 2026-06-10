@@ -4,6 +4,54 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6]
+
+### Changed
+- **Tier-boundary responses now carry clear upgrade guidance — one line per
+  event, never on a clean run.**
+  - A `403 API access required` (a Free account with no active subscription / Pro
+    Console hitting the first lookup) is no longer reported as a generic
+    `Match lookup failed` with exit `1`. It now surfaces the server's own
+    explanation plus `Upgrade your plan: https://radar.offseq.com/pricing` and
+    `Manage access: https://radar.offseq.com/console`, and exits `4` (the
+    "needs upgrade / quota" family). Other 403s stay generic.
+  - The `429` rate-limit message from the server (which distinguishes an hourly
+    burst from a daily/monthly quota and includes the reset time) is now shown
+    verbatim above the pricing URL instead of being discarded for a generic line.
+  - Monitoring-registration failures caused by a plan cap (host limit or asset
+    cap) now append a single hint pointing at pricing/console. Registration
+    remains non-fatal and the exit code is unchanged.
+  - The `--scope all` budget warning no longer asserts every user is on the free
+    tier's "15 lookups/hour"; it is worded conditionally and links the pricing
+    page, since higher plans lift the cap.
+- Exit code `4` now also covers "API access required (upgrade needed)", reflected
+  in `--help` and the README.
+
+## [0.1.5]
+
+### Fixed
+- **Multiarch dpkg coordinates now match the catalog.** When a running service's
+  binary is owned by a multi-arch (`M-A: same`) library package, `dpkg-query -S`
+  reports an arch-qualified name (e.g. `libssl3:amd64`). The trailing `:<arch>`
+  qualifier is now stripped (for recognised dpkg arch tokens only) before the
+  name becomes a purl coordinate, so `libssl3` matches Radar instead of silently
+  missing. Names containing a colon for any other reason are left untouched.
+- **`--unregister` no longer mints a host id.** It previously called
+  `get_or_create_host_id()`, which generated and persisted a fresh UUID when none
+  existed, then sent a DELETE for an id the server never saw. It now reads the
+  saved id without side effects and, when this machine was never registered,
+  prints a friendly notice and exits `0` without an API call.
+
+### Changed
+- **Registration prompt wording tracks the scan scope.** Under `--scope all` the
+  count is installed packages, so the prompt now reads
+  `Add these N packages to Radar…` instead of `…N services…`; the running-services
+  scope is unchanged. Correct singular/plural in both cases.
+- Exposure matching in the local risk computation is now trimmed and lowercased
+  before comparison, mirroring the server exactly. This is defensive hardening
+  only — it does not change any score for the lowercase exposure strings the
+  client emits today.
+
 ## [0.1.4]
 
 ### Added

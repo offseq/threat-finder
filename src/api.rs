@@ -105,6 +105,11 @@ pub enum ThreatError {
     /// server-advertised `data.maxBatch`, when present, so the caller can resize
     /// and retry instead of aborting.
     BatchTooLarge(Option<usize>),
+    /// HTTP 403 where the body indicates the account lacks API access (no active
+    /// subscription / Pro Console). Distinct from a generic 403 so the caller can
+    /// surface upgrade guidance and a quota exit code instead of a network-style
+    /// failure. Carries the server's explanatory message.
+    AccessDenied(String),
     Http(reqwest::Error),
     Other(String),
 }
@@ -115,6 +120,7 @@ impl std::fmt::Display for ThreatError {
             ThreatError::RateLimitExceeded(msg) => write!(f, "Rate limit exceeded: {msg}"),
             ThreatError::BatchTooLarge(Some(n)) => write!(f, "Batch too large (max {n})"),
             ThreatError::BatchTooLarge(None)    => write!(f, "Batch too large"),
+            ThreatError::AccessDenied(msg)      => write!(f, "{msg}"),
             ThreatError::Http(e)                => write!(f, "HTTP error: {e}"),
             ThreatError::Other(msg)             => write!(f, "{msg}"),
         }
@@ -244,7 +250,10 @@ pub fn compute_risk(
     let epss_val = epss.unwrap_or(0.0).clamp(0.0, 1.0);
     let epss_pts = (epss_val * 25.0).round() as i64;
     let kev_pts = if kev { 20 } else { 0 };
-    let exp_pts = match exposure {
+    // The server lowercases the exposure before comparing; mirror that defensively
+    // so the client matches even if the exposure string ever changes shape.
+    let exposure = exposure.trim().to_ascii_lowercase();
+    let exp_pts = match exposure.as_str() {
         "public"  => 12,
         "private" => 7,
         _         => 0,
@@ -595,6 +604,13 @@ impl ThreatClient {
                 if code == 401 {
                     msg = format!("{msg} (check your API key — re-run with --reset to re-enter it)");
                 }
+                // A 403 whose body talks about API access / a subscription is a
+                // tier boundary, not a generic auth failure — flag it so the
+                // caller can show upgrade guidance and a quota exit code. Other
+                // 403s (e.g. forbidden resource) stay generic.
+                if code == 403 && is_access_denied(&msg) {
+                    return Err(ThreatError::AccessDenied(msg));
+                }
                 return Err(ThreatError::Other(msg));
             }
 
@@ -754,6 +770,14 @@ fn error_message(body: &Value) -> Option<String> {
         .or_else(|| body.get("error"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+/// Whether a 403 body message indicates the account lacks API access (no active
+/// subscription / Pro Console) — a tier boundary the user can upgrade past —
+/// rather than a generic forbidden-resource 403.
+fn is_access_denied(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("api access") || m.contains("subscription")
 }
 
 // ── Inventory / monitoring API ───────────────────────────────────────────────
@@ -1186,6 +1210,19 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn access_denied_classifies_tier_403_only() {
+        // The two real server 403 shapes for a Free account → AccessDenied.
+        assert!(is_access_denied(
+            "API access required. Your account needs an active Basic/Pro/Enterprise \
+             subscription or Pro Console Lifetime Access. Upgrade in Console -> Billing."
+        ));
+        assert!(is_access_denied("Your subscription has expired."));
+        // A generic forbidden-resource 403 must stay a plain Other.
+        assert!(!is_access_denied("Forbidden"));
+        assert!(!is_access_denied("You do not own this host"));
+    }
+
+    #[test]
     fn batch_cap_by_tier() {
         assert_eq!(tier_batch_cap(0), 25);
         assert_eq!(tier_batch_cap(15), 25);
@@ -1469,6 +1506,26 @@ mod tests {
         let (score, _) = compute_risk(Some("critical"), 10.0, Some(-1.0), true, "public", true);
         // negative epss clamps to 0 → 40 + 0 + 20 + 12 = 72.
         assert_eq!(score, 72);
+    }
+
+    #[test]
+    fn risk_score_exposure_is_case_and_whitespace_insensitive() {
+        // The exposure is normalised (trim + lowercase) before matching, mirroring
+        // the server. Mixed-case / padded variants must yield the SAME result as
+        // the canonical lowercase the client emits today.
+        let canonical = compute_risk(Some("high"), 7.5, Some(0.1), false, "public", true);
+        for variant in ["PUBLIC", "Public", " public ", "pUbLiC\n"] {
+            assert_eq!(
+                compute_risk(Some("high"), 7.5, Some(0.1), false, variant, true),
+                canonical,
+                "exposure {variant:?} must match the lowercase result",
+            );
+        }
+        // And a private variant matches its lowercase counterpart too.
+        assert_eq!(
+            compute_risk(Some("medium"), 5.0, Some(0.6), false, "PRIVATE", true),
+            compute_risk(Some("medium"), 5.0, Some(0.6), false, "private", true),
+        );
     }
 
     #[test]

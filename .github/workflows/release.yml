@@ -16,7 +16,7 @@ jobs:
     name: create GitHub release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Create release (idempotent)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -38,7 +38,7 @@ jobs:
           - { target: x86_64-apple-darwin,       os: macos-latest }
           - { target: aarch64-apple-darwin,      os: macos-latest }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Build and upload
         uses: taiki-e/upload-rust-binary-action@v1
@@ -55,7 +55,7 @@ jobs:
     needs: [create-release, binaries]  # don't publish if any archive failed to build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo publish
@@ -73,7 +73,7 @@ jobs:
     needs: binaries  # wait until release assets + checksums exist
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Bump formula in offseq/homebrew-tap
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

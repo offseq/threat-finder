@@ -494,17 +494,40 @@ pub fn dpkg_of(path: &str) -> Option<(String, String)> {
     (!ver.is_empty()).then_some((pkg, ver))
 }
 
+/// Known dpkg architecture tokens. A multiarch (`M-A: same`) package is reported
+/// by `dpkg-query -S` with an arch qualifier (`libssl3:amd64`); that suffix must
+/// be stripped before it becomes a purl coordinate or the Radar catalog never
+/// matches it. We strip only when the part after the last `:` is a real arch, so
+/// a name containing a colon for some other reason is left intact.
+const DPKG_ARCHES: &[&str] = &[
+    "amd64", "arm64", "i386", "armhf", "armel", "ppc64el", "s390x", "riscv64",
+    "mips64el", "mipsel", "mips", "powerpc", "ppc64", "x86_64", "all", "any",
+    "native",
+];
+
+/// Drop a trailing `:<arch>` multiarch qualifier from a dpkg package name when
+/// the suffix is a recognised architecture token. `libssl3:amd64` -> `libssl3`;
+/// a non-arch colon (`foo:bar`) is preserved.
+fn strip_dpkg_arch(name: &str) -> &str {
+    match name.rsplit_once(':') {
+        Some((base, arch)) if DPKG_ARCHES.contains(&arch) => base,
+        _ => name,
+    }
+}
+
 /// Extract the owning package name from `dpkg-query -S` output. The field
 /// separator before the path is `": "`, so we split on the LAST one — names can
 /// carry a multiarch suffix (`libssl3:amd64: /path`) that a naive `split(':')`
 /// would truncate. Diversion lines are skipped; the first comma-listed name wins.
+/// The multiarch arch qualifier is then stripped so the bare name is used as the
+/// coordinate (and `dpkg-query -W` accepts it too).
 fn dpkg_owner_name(out: &str) -> Option<String> {
     out.lines()
         .filter(|l| !l.starts_with("diversion by ") && !l.starts_with("local diversion "))
         .find_map(|l| l.rsplit_once(": "))
         .map(|(names, _path)| names)
         .and_then(|names| names.split(',').next())
-        .map(|s| s.trim().to_string())
+        .map(|s| strip_dpkg_arch(s.trim()).to_string())
         .filter(|s| !s.is_empty())
 }
 
@@ -1506,10 +1529,11 @@ mod inventory_tests {
         // Plain owner line.
         assert_eq!(dpkg_owner_name("nginx: /usr/sbin/nginx").as_deref(), Some("nginx"));
         // Multiarch name carries a `:arch` suffix; split on the LAST ": " so the
-        // architecture qualifier is NOT mistaken for the field separator.
+        // architecture qualifier is NOT mistaken for the field separator, then the
+        // arch qualifier is stripped so the bare coordinate matches the catalog.
         assert_eq!(
             dpkg_owner_name("libssl3:amd64: /usr/lib/x86_64-linux-gnu/libssl.so.3").as_deref(),
-            Some("libssl3:amd64")
+            Some("libssl3")
         );
         // Multiple owners: the first comma-listed package wins.
         assert_eq!(
@@ -1520,7 +1544,20 @@ mod inventory_tests {
         let out = "diversion by libc6 from: /lib/x.so\n\
                    diversion by libc6 to: /lib/x.so.usr-is-merged\n\
                    libc6:amd64: /lib/x.so\n";
-        assert_eq!(dpkg_owner_name(out).as_deref(), Some("libc6:amd64"));
+        assert_eq!(dpkg_owner_name(out).as_deref(), Some("libc6"));
+    }
+
+    #[test]
+    fn strip_dpkg_arch_only_strips_known_arches() {
+        // Recognised arch qualifiers are removed.
+        assert_eq!(strip_dpkg_arch("libssl3:amd64"), "libssl3");
+        assert_eq!(strip_dpkg_arch("libc6:arm64"), "libc6");
+        assert_eq!(strip_dpkg_arch("foo:all"), "foo");
+        // No qualifier at all.
+        assert_eq!(strip_dpkg_arch("nginx"), "nginx");
+        // A colon that is NOT a known arch is preserved (not mangled).
+        assert_eq!(strip_dpkg_arch("foo:bar"), "foo:bar");
+        assert_eq!(strip_dpkg_arch("weird:1.0"), "weird:1.0");
     }
 
     #[test]

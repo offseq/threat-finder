@@ -53,7 +53,7 @@ enum FailOn {
     name = "threat-finder",
     version,
     about = "OffSeq Threat Finder — scan running services for known vulnerabilities",
-    after_help = "EXIT CODES:\n  0  success\n  1  lookup or I/O error\n  2  no API key available\n  3  unsupported OS\n  4  rate limit / quota exhausted\n  5  --fail-on threshold met",
+    after_help = "EXIT CODES:\n  0  success\n  1  lookup or I/O error\n  2  no API key available\n  3  unsupported OS\n  4  rate limit / quota exhausted, or API access required (upgrade needed)\n  5  --fail-on threshold met",
 )]
 struct Cli {
     /// Write the JSON report to this path (default: prompt, or /tmp/threats.json)
@@ -564,7 +564,14 @@ fn main() -> ExitCode {
     // `--unregister` is a standalone action: delete this host's inventory and exit
     // without scanning. Treated as best-effort but its result drives the exit code.
     if cli.unregister {
-        let host_id = auth::get_or_create_host_id();
+        // Read-only lookup: never mint a host id just to delete it. With no saved
+        // id the server has nothing for this machine, so skip the API call.
+        let Some(host_id) = auth::host_id() else {
+            if !cli.quiet {
+                println!("No host is registered from this machine; nothing to unregister.");
+            }
+            return ExitCode::SUCCESS;
+        };
         let client = ThreatClient::new(&api_key);
         match client.unregister(&host_id) {
             Ok(()) => {
@@ -633,10 +640,7 @@ fn main() -> ExitCode {
             eprintln!("[!] Nothing discovered — you may need elevated privileges (try sudo) for full discovery.");
         }
         if cli.scope == ScanScope::All && assets.len() > 15 {
-            eprintln!(
-                "[!] --scope all produced {} unique package(s); the free tier allows 15 lookups/hour — expect rate limiting.",
-                assets.len()
-            );
+            eprintln!("{}", scope_all_budget_warning(assets.len()));
         }
     }
 
@@ -646,9 +650,20 @@ fn main() -> ExitCode {
 
     let outcome = match scan::run_scan(&client, &assets, &os, cli.strict, sev_floor) {
         Ok(o) => o,
-        Err(ThreatError::RateLimitExceeded(_)) => {
+        Err(ThreatError::RateLimitExceeded(msg)) => {
             if let Some(pb) = lookup_pb { pb.finish_and_clear(); }
-            auth::prompt_upgrade();
+            auth::prompt_upgrade(Some(&msg));
+            return ExitCode::from(4);
+        }
+        // FREE accounts (no Pro Console / no active subscription) hit this on the
+        // first /match/batch call. Surface the server's explanation plus a concrete
+        // upgrade path, and exit 4 (needs upgrade / quota) — not 1, which reads as a
+        // network failure.
+        Err(ThreatError::AccessDenied(msg)) => {
+            if let Some(pb) = lookup_pb { pb.finish_and_clear(); }
+            eprintln!("{msg}");
+            eprintln!("Upgrade your plan: https://radar.offseq.com/pricing");
+            eprintln!("Manage access:    https://radar.offseq.com/console");
             return ExitCode::from(4);
         }
         Err(e) => {
@@ -706,7 +721,7 @@ fn main() -> ExitCode {
     // If we'd prompt, ask now and fold the answer back into the action.
     if action == RegisterAction::Prompt {
         let inventory_count = assets.iter().filter(|a| scan::build_purl(a, &os).is_some()).count();
-        match prompt_register(inventory_count) {
+        match prompt_register(inventory_count, cli.scope) {
             PromptAnswer::Yes => action = RegisterAction::Register,
             PromptAnswer::No => action = RegisterAction::Skip,
             PromptAnswer::Never => {
@@ -741,7 +756,12 @@ fn main() -> ExitCode {
                 registration = Some(resp);
             }
             // Non-fatal: a one-line warning, exit code unchanged.
-            Err(e) => eprintln!("[!] Monitoring registration skipped: {e}"),
+            Err(e) => {
+                eprintln!("[!] Monitoring registration skipped: {e}");
+                if is_host_or_asset_cap(&e) {
+                    eprintln!("    Your plan's host/asset cap was reached — raise it at https://radar.offseq.com/pricing (manage hosts: https://radar.offseq.com/console).");
+                }
+            }
         }
     }
 
@@ -828,11 +848,53 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Prompt the user to register N services for monitoring. Returns the parsed
-/// answer (defaulting to Yes on EOF/empty so a bare Enter accepts).
-fn prompt_register(count: usize) -> PromptAnswer {
+/// Scope-aware noun for the inventory being registered: under `--scope all` the
+/// count is installed packages (often thousands), otherwise running services.
+/// Matches the "asset"/"service" wording used in the post-scan summary.
+fn inventory_noun(scope: ScanScope, count: usize) -> &'static str {
+    match (scope, count) {
+        (ScanScope::All, 1) => "package",
+        (ScanScope::All, _) => "packages",
+        (_, 1) => "service",
+        (_, _) => "services",
+    }
+}
+
+/// Warning shown when `--scope all` produced more unique packages than the free
+/// tier's hourly lookup budget. Worded conditionally — the same 15/hr cap maps to
+/// both Free and Pro Console accounts and we can't tell them apart locally — so we
+/// frame it as "on the free tier" and point at pricing rather than asserting the
+/// caller is rate-limited.
+fn scope_all_budget_warning(count: usize) -> String {
+    format!(
+        "[!] --scope all produced {count} unique package(s). On the free tier \
+         (15 lookups/hour) this will rate-limit — higher plans lift the cap: \
+         https://radar.offseq.com/pricing"
+    )
+}
+
+/// Whether a registration error is a plan cap (monitored-host limit or per-host
+/// asset cap) rather than a transient failure. A 413 surfaces as `BatchTooLarge`;
+/// a host-limit 403 surfaces as a message we keyword-match. Used only to decide
+/// whether to append an upgrade hint — registration stays non-fatal either way.
+fn is_host_or_asset_cap(err: &ThreatError) -> bool {
+    match err {
+        ThreatError::BatchTooLarge(_) => true,
+        ThreatError::Other(msg) | ThreatError::AccessDenied(msg) => {
+            let m = msg.to_ascii_lowercase();
+            m.contains("limit") || m.contains("hosts") || m.contains("assets")
+        }
+        _ => false,
+    }
+}
+
+/// Prompt the user to register N items for monitoring. Returns the parsed answer
+/// (defaulting to Yes on EOF/empty so a bare Enter accepts). The noun tracks the
+/// scan scope so `--scope all` says "packages", not "services".
+fn prompt_register(count: usize, scope: ScanScope) -> PromptAnswer {
+    let noun = inventory_noun(scope, count);
     print!(
-        "\nAdd these {count} services to Radar for continuous monitoring & alerts? [Y/n/never] "
+        "\nAdd these {count} {noun} to Radar for continuous monitoring & alerts? [Y/n/never] "
     );
     let _ = io::stdout().flush();
     let mut input = String::new();
@@ -851,6 +913,45 @@ mod tests {
         // verify the derive layout is valid
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn inventory_noun_is_scope_aware_and_pluralised() {
+        // Default/running scope counts services.
+        assert_eq!(inventory_noun(ScanScope::Running, 1), "service");
+        assert_eq!(inventory_noun(ScanScope::Running, 3), "services");
+        assert_eq!(inventory_noun(ScanScope::Running, 0), "services");
+        // --scope all counts installed packages, often thousands.
+        assert_eq!(inventory_noun(ScanScope::All, 1), "package");
+        assert_eq!(inventory_noun(ScanScope::All, 2400), "packages");
+    }
+
+    #[test]
+    fn scope_all_warning_is_plan_agnostic_and_links_pricing() {
+        let w = scope_all_budget_warning(2400);
+        assert!(w.contains("2400 unique package(s)"));
+        // Conditional wording — never asserts the caller IS rate-limited or names
+        // their plan; just points at the free-tier cap and the upgrade path.
+        assert!(w.contains("On the free tier"));
+        assert!(w.contains("https://radar.offseq.com/pricing"));
+        assert!(!w.to_lowercase().contains("expect rate limiting"));
+    }
+
+    #[test]
+    fn host_or_asset_cap_detected_for_plan_limits_only() {
+        // 413 (asset cap) always qualifies.
+        assert!(is_host_or_asset_cap(&ThreatError::BatchTooLarge(Some(50))));
+        assert!(is_host_or_asset_cap(&ThreatError::BatchTooLarge(None)));
+        // Host-limit / too-many-assets 403 bodies (keyword match).
+        assert!(is_host_or_asset_cap(&ThreatError::Other(
+            "Host limit reached. Your plan allows up to 5 monitored hosts.".into()
+        )));
+        assert!(is_host_or_asset_cap(&ThreatError::Other(
+            "Too many assets. Your plan allows up to 100 assets.".into()
+        )));
+        // Unrelated registration failures don't get the upgrade hint.
+        assert!(!is_host_or_asset_cap(&ThreatError::Other("decode error".into())));
+        assert!(!is_host_or_asset_cap(&ThreatError::RateLimitExceeded("slow down".into())));
     }
 
     #[test]

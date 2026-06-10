@@ -180,14 +180,27 @@ fn prompt_for_key() -> String {
     }
 }
 
-/// Message shown on a 429 quota-exhaustion response.
-pub fn prompt_upgrade() {
+/// Message shown on a 429 quota-exhaustion response. `detail`, when present, is
+/// the server's own message — it distinguishes an hourly burst from a daily or
+/// monthly quota and carries the reset time, so we surface it verbatim above the
+/// generic upgrade line rather than guessing.
+pub fn prompt_upgrade(detail: Option<&str>) {
     println!("\n┌─────────────────────────────────────────────┐");
     println!("│            Rate Limit Reached               │");
     println!("└─────────────────────────────────────────────┘\n");
-    println!("You have exhausted the API calls available on your current plan.");
+    println!("{}\n", upgrade_body_line(detail));
     println!("To continue using OffSeq, upgrade your plan at:\n");
     println!("  https://radar.offseq.com/pricing\n");
+}
+
+/// The explanatory line shown by [`prompt_upgrade`]: the server's own message
+/// when it provided a non-empty one (it distinguishes hourly/daily/monthly limits
+/// and carries the reset time), otherwise a generic fallback.
+fn upgrade_body_line(detail: Option<&str>) -> &str {
+    match detail.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => d,
+        None => "You have exhausted the API calls available on your current plan.",
+    }
 }
 
 /// Read a line from stdin. Returns None on EOF so callers don't spin forever.
@@ -201,6 +214,16 @@ fn read_line() -> Option<String> {
 }
 
 // ── Monitoring config (host identity + prompt preference) ────────────────────
+
+/// Return the saved per-host UUID WITHOUT creating or persisting one. `None`
+/// means this machine has never registered (no id on disk yet). Use this for
+/// read-only paths like `--unregister` that must not mint a fresh id as a side
+/// effect; use `get_or_create_host_id()` only when actually registering.
+pub fn host_id() -> Option<String> {
+    load_config()
+        .map(|cfg| cfg.monitoring.host_id)
+        .filter(|id| !id.is_empty())
+}
 
 /// Return the stable per-host UUID, generating and persisting one on first use.
 /// On a config save failure the freshly-generated id is still returned (so a
@@ -236,6 +259,26 @@ pub fn set_monitoring_prompt_mode(mode: &str) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn upgrade_body_prefers_server_detail() {
+        // The server's message (hourly vs monthly + reset time) passes through.
+        assert_eq!(
+            upgrade_body_line(Some("Hourly rate limit reached. Resets at 14:00 UTC. Upgrade your plan for higher limits.")),
+            "Hourly rate limit reached. Resets at 14:00 UTC. Upgrade your plan for higher limits."
+        );
+        // Surrounding whitespace is trimmed.
+        assert_eq!(upgrade_body_line(Some("  Monthly quota used.  ")), "Monthly quota used.");
+        // No detail (or blank) → generic fallback, never an empty line.
+        assert_eq!(
+            upgrade_body_line(None),
+            "You have exhausted the API calls available on your current plan."
+        );
+        assert_eq!(
+            upgrade_body_line(Some("   ")),
+            "You have exhausted the API calls available on your current plan."
+        );
+    }
 
     // config_path() is process-global; serialize the tests that mutate it and
     // point them at an isolated temp dir via $XDG_CONFIG_HOME / $HOME.
@@ -288,6 +331,21 @@ mod tests {
         // And it is readable straight from the on-disk config.
         let cfg = load_config().expect("config persisted");
         assert_eq!(cfg.monitoring.host_id, id1);
+    }
+
+    #[test]
+    fn host_id_read_only_returns_none_without_persisting() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _tmp = TempConfigHome::new();
+
+        // Nothing registered yet: the read-only accessor reports None …
+        assert_eq!(host_id(), None, "unset host id reads back as None");
+        // … and must NOT have written a config (no side-effect persistence).
+        assert!(load_config().is_none(), "host_id() must not create a config");
+
+        // Once a real id is minted, the read-only accessor returns it verbatim.
+        let id = get_or_create_host_id();
+        assert_eq!(host_id().as_deref(), Some(id.as_str()));
     }
 
     #[test]
