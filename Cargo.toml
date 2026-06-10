@@ -1,6 +1,6 @@
 [package]
 name = "threat-finder"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 rust-version = "1.87"
 description = "Runtime vulnerability scanner: finds CVEs in the services and packages actually present on a host and flags which are network-exposed"
@@ -41,3 +41,4 @@ zbus = "4"
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 rpassword = "7"
+uuid = { version = "1", features = ["v4"] }

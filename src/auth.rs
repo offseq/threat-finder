@@ -9,8 +9,34 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Default)]
 struct Config {
+    #[serde(default)]
     api_key: String,
+    /// Continuous-monitoring settings (host identity + prompt preference). Kept
+    /// in its own table so an older config without it still loads.
+    #[serde(default, skip_serializing_if = "Monitoring::is_default")]
+    monitoring: Monitoring,
 }
+
+/// `[monitoring]` config table. `host_id` is a stable per-host UUID generated
+/// once; `prompt` is the post-scan registration prompt mode.
+#[derive(Serialize, Deserialize, Default)]
+struct Monitoring {
+    /// Stable host identity sent as `hostId`. Empty until first generated.
+    #[serde(default)]
+    host_id: String,
+    /// Prompt mode: `ask` (default) | `never` | `always`. Empty == `ask`.
+    #[serde(default)]
+    prompt: String,
+}
+
+impl Monitoring {
+    fn is_default(&self) -> bool {
+        self.host_id.is_empty() && self.prompt.is_empty()
+    }
+}
+
+/// Default prompt mode when none is persisted.
+const DEFAULT_PROMPT_MODE: &str = "ask";
 
 /// Environment variable checked before any saved config — lets the tool run
 /// non-interactively in CI/cron without a config file.
@@ -107,7 +133,10 @@ fn run_initial_setup() {
         match choice.trim() {
             "1" => {
                 let key = prompt_for_key();
-                match save_config(&Config { api_key: key }) {
+                // Preserve any existing [monitoring] section when (re)writing the key.
+                let mut cfg = load_config().unwrap_or_default();
+                cfg.api_key = key;
+                match save_config(&cfg) {
                     Ok(_) => {
                         println!("\n✓  API key saved successfully.\n");
                         return;
@@ -168,5 +197,111 @@ fn read_line() -> Option<String> {
         Ok(0) => None,
         Ok(_) => Some(buf),
         Err(_) => None,
+    }
+}
+
+// ── Monitoring config (host identity + prompt preference) ────────────────────
+
+/// Return the stable per-host UUID, generating and persisting one on first use.
+/// On a config save failure the freshly-generated id is still returned (so a
+/// single run is consistent) — it just won't be stable across runs.
+pub fn get_or_create_host_id() -> String {
+    let mut cfg = load_config().unwrap_or_default();
+    if !cfg.monitoring.host_id.is_empty() {
+        return cfg.monitoring.host_id;
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    cfg.monitoring.host_id = id.clone();
+    let _ = save_config(&cfg);
+    id
+}
+
+/// The post-scan registration prompt mode: `ask` (default) | `never` | `always`.
+pub fn monitoring_prompt_mode() -> String {
+    match load_config() {
+        Some(cfg) if !cfg.monitoring.prompt.is_empty() => cfg.monitoring.prompt,
+        _ => DEFAULT_PROMPT_MODE.to_string(),
+    }
+}
+
+/// Persist the registration prompt mode (e.g. `"never"` after a user opts out).
+/// Returns the IO result so callers can warn if it didn't stick.
+pub fn set_monitoring_prompt_mode(mode: &str) -> io::Result<()> {
+    let mut cfg = load_config().unwrap_or_default();
+    cfg.monitoring.prompt = mode.to_string();
+    save_config(&cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // config_path() is process-global; serialize the tests that mutate it and
+    // point them at an isolated temp dir via $XDG_CONFIG_HOME / $HOME.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TempConfigHome {
+        dir: PathBuf,
+        prev_xdg: Option<std::ffi::OsString>,
+        prev_home: Option<std::ffi::OsString>,
+    }
+
+    impl TempConfigHome {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("tf-test-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&dir).unwrap();
+            let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+            let prev_home = std::env::var_os("HOME");
+            // dirs::config_dir() uses XDG_CONFIG_HOME on Linux and $HOME on macOS.
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+            std::env::set_var("HOME", &dir);
+            TempConfigHome { dir, prev_xdg, prev_home }
+        }
+    }
+
+    impl Drop for TempConfigHome {
+        fn drop(&mut self) {
+            match &self.prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match &self.prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn host_id_generates_persists_and_reloads() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _tmp = TempConfigHome::new();
+
+        let id1 = get_or_create_host_id();
+        assert_eq!(id1.len(), 36, "v4 UUID string");
+        // A second call returns the SAME persisted id (stable across runs).
+        let id2 = get_or_create_host_id();
+        assert_eq!(id1, id2, "host id must be stable once generated");
+
+        // And it is readable straight from the on-disk config.
+        let cfg = load_config().expect("config persisted");
+        assert_eq!(cfg.monitoring.host_id, id1);
+    }
+
+    #[test]
+    fn prompt_mode_defaults_to_ask_and_round_trips() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _tmp = TempConfigHome::new();
+
+        assert_eq!(monitoring_prompt_mode(), "ask", "default when unset");
+        set_monitoring_prompt_mode("never").unwrap();
+        assert_eq!(monitoring_prompt_mode(), "never");
+        // Changing the mode must not clobber an existing host id.
+        let id = get_or_create_host_id();
+        set_monitoring_prompt_mode("always").unwrap();
+        assert_eq!(monitoring_prompt_mode(), "always");
+        assert_eq!(get_or_create_host_id(), id, "host id preserved across prompt writes");
     }
 }

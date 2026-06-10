@@ -191,6 +191,79 @@ pub struct ThreatEntry {
     /// Associated CWE identifiers (e.g. `CWE-77`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cwes:                  Vec<String>,
+    /// Exposure-aware risk score (0..=100), computed locally from this finding +
+    /// the owning asset's exposure, mirroring the server formula so the two agree.
+    /// `None` until [`ThreatEntry::apply_risk`] is called.
+    #[serde(rename = "riskScore", default, skip_serializing_if = "Option::is_none")]
+    pub risk_score:            Option<u32>,
+    /// SSVC-style remediation band (`act-now` | `soon` | `schedule` | `track`),
+    /// derived from `risk_score`, KEV, EPSS and exposure. `None` until scored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision:              Option<String>,
+}
+
+/// Numeric rank for a decision band (higher = more urgent) — used to sort
+/// findings by decision then score deterministically.
+pub fn decision_rank(decision: Option<&str>) -> u8 {
+    match decision {
+        Some("act-now")  => 3,
+        Some("soon")     => 2,
+        Some("schedule") => 1,
+        _                => 0, // "track" / unscored
+    }
+}
+
+/// Compute the exposure-aware risk score and SSVC decision for a finding.
+///
+/// Mirrors the server formula EXACTLY so a locally-computed score matches what
+/// the inventory API stores (the client has no KEV due-date, so the server's
+/// `+5 overdue` term is intentionally omitted — see module docs / CHANGELOG).
+///
+/// `exposure` is the owning asset's reachability (`public`|`private`|`loopback`|
+/// `none`); `confirmed` is whether the version is inside an affected range.
+pub fn compute_risk(
+    severity: Option<&str>,
+    cvss: f64,
+    epss: Option<f64>,
+    kev: bool,
+    exposure: &str,
+    confirmed: bool,
+) -> (u32, String) {
+    let sev = match severity_rank(severity) {
+        4 => 40,
+        3 => 30,
+        2 => 18,
+        1 => 8,
+        _ => {
+            if cvss >= 9.0 { 40 }
+            else if cvss >= 7.0 { 30 }
+            else if cvss >= 4.0 { 18 }
+            else { 8 } // includes cvss>0 and cvss==0
+        }
+    };
+    let epss_val = epss.unwrap_or(0.0).clamp(0.0, 1.0);
+    let epss_pts = (epss_val * 25.0).round() as i64;
+    let kev_pts = if kev { 20 } else { 0 };
+    let exp_pts = match exposure {
+        "public"  => 12,
+        "private" => 7,
+        _         => 0,
+    };
+    let confirm_mul = if confirmed { 1.0 } else { 0.6 };
+    let raw = ((sev + epss_pts + kev_pts + exp_pts) as f64 * confirm_mul).round();
+    let score = raw.clamp(0.0, 100.0) as u32;
+
+    let exposed = exposure == "public" || exposure == "private";
+    let decision = if (kev && exposed && confirmed) || score >= 80 {
+        "act-now"
+    } else if score >= 58 || (kev && confirmed) || (epss_val >= 0.5 && exposed) {
+        "soon"
+    } else if score >= 32 {
+        "schedule"
+    } else {
+        "track"
+    };
+    (score, decision.to_string())
 }
 
 impl ThreatEntry {
@@ -202,9 +275,28 @@ impl ThreatEntry {
         self.cvss_score.as_ref().and_then(|v| v.as_f64()).unwrap_or(0.0)
     }
 
-    /// Highest-risk first: exploited-in-wild, then severity, EPSS, CVSS, CVE id.
-    pub(crate) fn risk_key(&self) -> (bool, u8, i64, i64, String) {
+    /// Compute and store the exposure-aware `risk_score`/`decision` for this
+    /// finding given the owning asset's `exposure` (reachability string). Idempotent.
+    pub fn apply_risk(&mut self, exposure: &str) {
+        let (score, decision) = compute_risk(
+            self.severity.as_deref(),
+            self.cvss_num(),
+            self.epss,
+            self.kev,
+            exposure,
+            self.confirmed,
+        );
+        self.risk_score = Some(score);
+        self.decision = Some(decision);
+    }
+
+    /// Highest-risk first. Once scored, decision band then risk score dominate
+    /// (so the exposure-aware ordering wins); the legacy signals remain as a
+    /// deterministic tie-break (and the sole ordering before `apply_risk`).
+    pub(crate) fn risk_key(&self) -> (u8, u32, bool, u8, i64, i64, String) {
         (
+            decision_rank(self.decision.as_deref()),
+            self.risk_score.unwrap_or(0),
             self.kev,
             self.severity_rank(),
             (self.epss.unwrap_or(0.0) * 1000.0) as i64,
@@ -242,7 +334,9 @@ pub struct Meta {
 
 impl Default for Meta {
     fn default() -> Self {
-        Meta { tool: "threat-finder", version: env!("CARGO_PKG_VERSION"), schema_version: 1 }
+        // schemaVersion 2: findings gained `riskScore`/`decision`, and the report
+        // gained an optional `registration` object (inventory server response).
+        Meta { tool: "threat-finder", version: env!("CARGO_PKG_VERSION"), schema_version: 2 }
     }
 }
 
@@ -256,6 +350,34 @@ pub struct CveGroup {
     pub epss: Option<f64>,
     pub title: Option<String>,
     pub assets: Vec<String>,
+}
+
+/// Slim, JSON-facing capture of the inventory server's registration response —
+/// the drift + summary surfaced in the `registration` field of the report.
+#[derive(Debug, Clone, Serialize)]
+pub struct RegistrationReport {
+    #[serde(rename = "host_id")]
+    pub host_id: String,
+    pub monitoring: bool,
+    #[serde(rename = "assetCount")]
+    pub asset_count: u64,
+    pub drift: RegisterDrift,
+    pub summary: RegisterSummary,
+    #[serde(rename = "newSinceLastCount")]
+    pub new_since_last_count: u64,
+}
+
+impl From<&RegisterResponse> for RegistrationReport {
+    fn from(r: &RegisterResponse) -> Self {
+        RegistrationReport {
+            host_id: r.host_id.clone(),
+            monitoring: r.monitoring,
+            asset_count: r.asset_count,
+            drift: r.drift.clone(),
+            summary: r.summary.clone(),
+            new_since_last_count: r.new_since_last_count,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -274,11 +396,24 @@ pub struct BatchResults {
     /// from "no CVEs found".
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub errors:   BTreeMap<String, String>,
+    /// Inventory-server registration outcome, present only when this run
+    /// registered the host for monitoring (drift + new-since-last summary).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration: Option<RegistrationReport>,
 }
 
 impl BatchResults {
     pub fn total_vulns(&self) -> usize {
         self.services.values().map(|v| v.len()).sum()
+    }
+
+    /// Re-sort every finding bucket (confirmed + unconfirmed) highest-risk first.
+    /// Call after [`ThreatEntry::apply_risk`] so the exposure-aware decision/score
+    /// drive the order (with the legacy KEV/severity/EPSS/CVSS tie-break).
+    pub fn sort_findings(&mut self) {
+        for v in self.services.values_mut().chain(self.unconfirmed.values_mut()) {
+            v.sort_by_key(|e| std::cmp::Reverse(e.risk_key()));
+        }
     }
 
     /// Roll findings up by CVE id across all (confirmed) service entries.
@@ -424,10 +559,13 @@ impl ThreatClient {
                 // Batch exceeded the tier cap. Surface the advertised max so the
                 // caller can resize and retry rather than abort. Not retried here.
                 let max_batch = response.json::<Value>().ok().and_then(|b| {
-                    b.get("data")
-                        .and_then(|d| d.get("maxBatch"))
-                        .and_then(Value::as_u64)
-                        .map(|n| n as usize)
+                    // `/match/batch` advertises `data.maxBatch`; `/inventory/register`
+                    // advertises `data.maxAssets`. Accept either as the cap.
+                    b.get("data").and_then(|d| {
+                        d.get("maxBatch").or_else(|| d.get("maxAssets"))
+                    })
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize)
                 });
                 return Err(ThreatError::BatchTooLarge(max_batch));
             }
@@ -528,6 +666,51 @@ impl ThreatClient {
         Ok(out)
     }
 
+    /// Register (or refresh) this host's asset inventory for continuous
+    /// monitoring. Hits `POST /inventory/register` over the same authenticated,
+    /// retrying request path as `/match/batch`. A 403 (host-limit / no API
+    /// access) or 413 (too many assets) surfaces the server `message`/`maxAssets`
+    /// via [`ThreatError`]. The caller treats any error as non-fatal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_inventory(
+        &self,
+        host_id: &str,
+        hostname: Option<&str>,
+        os: Option<InventoryOs>,
+        agent_version: &str,
+        monitor: bool,
+        assets: &[InventoryAsset],
+    ) -> Result<RegisterResponse, ThreatError> {
+        let body = RegisterRequest {
+            host_id,
+            hostname,
+            os,
+            agent_version,
+            monitor,
+            assets,
+        };
+        // 413 here means "too many assets"; reuse BatchTooLarge to carry the
+        // advertised cap (data.maxAssets) so the caller can report it.
+        let json = self.execute(|| {
+            self.client.post(format!("{BASE_URL}/inventory/register")).json(&body)
+        })?;
+        let resp: RegisterResponse = json
+            .get("data")
+            .cloned()
+            .map(serde_json::from_value)
+            .unwrap_or_else(|| serde_json::from_value(json))
+            .map_err(|e| ThreatError::Other(format!("inventory/register decode error: {e}")))?;
+        Ok(resp)
+    }
+
+    /// Delete this host's inventory (`DELETE /inventory/{hostId}`). Used by
+    /// `--unregister`. Returns Ok on any 2xx.
+    pub fn unregister(&self, host_id: &str) -> Result<(), ThreatError> {
+        let path = format!("{BASE_URL}/inventory/{}", host_id);
+        self.execute(|| self.client.delete(&path))?;
+        Ok(())
+    }
+
     /// GET ?search= fallback for assets with no buildable coordinate. Returns
     /// raw threat objects (no client-side version comparison — they are surfaced
     /// as unconfirmed/triage).
@@ -571,6 +754,124 @@ fn error_message(body: &Value) -> Option<String> {
         .or_else(|| body.get("error"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+// ── Inventory / monitoring API ───────────────────────────────────────────────
+
+/// Optional OS descriptor sent with a registration; every field is optional and
+/// omitted from the wire when absent.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct InventoryOs {
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub os_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distro: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+/// One asset in a registration payload. Built only from assets with a real purl,
+/// so no malformed coordinate is ever sent.
+#[derive(Debug, Clone, Serialize)]
+pub struct InventoryAsset {
+    pub purl: String,
+    pub version: String,
+    pub ecosystem: String,
+    pub name: String,
+    /// Reachability: `public` | `private` | `loopback` | `none`.
+    pub exposure: String,
+    pub exposed: bool,
+    pub runtime: bool,
+}
+
+#[derive(Serialize)]
+struct RegisterRequest<'a> {
+    #[serde(rename = "hostId")]
+    host_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hostname: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    os: Option<InventoryOs>,
+    #[serde(rename = "agentVersion")]
+    agent_version: &'a str,
+    monitor: bool,
+    assets: &'a [InventoryAsset],
+}
+
+/// Drift since the host's previous scan.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RegisterDrift {
+    #[serde(default)]
+    pub added: u64,
+    #[serde(default)]
+    pub removed: u64,
+    #[serde(default)]
+    pub changed: u64,
+}
+
+/// Server-side severity breakdown.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RegisterSummary {
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub confirmed: u64,
+    #[serde(default)]
+    pub kev: u64,
+    #[serde(default)]
+    pub exposed: u64,
+    #[serde(rename = "actNow", default)]
+    pub act_now: u64,
+    #[serde(rename = "bySeverity", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_severity: BTreeMap<String, u64>,
+    #[serde(rename = "byDecision", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_decision: BTreeMap<String, u64>,
+}
+
+/// A finding as returned by the inventory API (`top` / `newSinceLast`). Only the
+/// fields the CLI surfaces are decoded; everything else is ignored.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RegisterFinding {
+    #[serde(rename = "cveId", default)]
+    pub cve_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub severity: Option<String>,
+    #[serde(default)]
+    pub coordinate: Option<String>,
+    #[serde(rename = "riskScore", default)]
+    pub risk_score: Option<u32>,
+    #[serde(default)]
+    pub decision: Option<String>,
+    #[serde(default)]
+    pub kev: bool,
+    #[serde(default)]
+    pub exposed: bool,
+}
+
+/// Decoded `data` from `POST /inventory/register`. All fields `#[serde(default)]`
+/// so a partial / evolving server response never fails the decode.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RegisterResponse {
+    #[serde(rename = "hostId", default)]
+    pub host_id: String,
+    #[serde(default)]
+    pub monitoring: bool,
+    #[serde(default)]
+    pub new: bool,
+    #[serde(rename = "assetCount", default)]
+    pub asset_count: u64,
+    #[serde(default)]
+    pub drift: RegisterDrift,
+    #[serde(default)]
+    pub summary: RegisterSummary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top: Vec<RegisterFinding>,
+    #[serde(rename = "newSinceLast", default, skip_serializing_if = "Vec::is_empty")]
+    pub new_since_last: Vec<RegisterFinding>,
+    #[serde(rename = "newSinceLastCount", default)]
+    pub new_since_last_count: u64,
 }
 
 // ── Match API (exact coordinate) ─────────────────────────────────────────────
@@ -815,6 +1116,8 @@ pub fn match_to_entry(m: MatchHit) -> ThreatEntry {
         fixed_versions: m.fixed_versions,
         remediation: m.remediation,
         cwes: m.cwes,
+        risk_score: None,
+        decision: None,
     }
 }
 
@@ -846,6 +1149,8 @@ pub fn search_to_entry(t: &Value) -> ThreatEntry {
         fixed_versions: str_vec_from_value(t.get("fixedVersions")),
         remediation: t.get("remediation").and_then(|v| v.as_str()).map(|s| s.to_string()),
         cwes: str_vec_from_value(t.get("cwes")),
+        risk_score: None,
+        decision: None,
     }
 }
 
@@ -1097,6 +1402,173 @@ mod tests {
         let v = serde_json::to_value(&e).unwrap();
         assert_eq!(v["fixedVersions"], json!(["4.17.21"]));
         assert_eq!(v["cwes"], json!(["CWE-77"]));
+    }
+
+    #[test]
+    fn risk_score_matches_documented_bands() {
+        // critical + KEV + public + confirmed: 40+20+12 = 72 → but KEV&exposed&
+        // confirmed forces act-now regardless of score.
+        let (score, dec) = compute_risk(Some("critical"), 9.8, Some(0.9), true, "public", true);
+        // sev 40, epss round(0.9*25)=23 (0.9*25=22.5 → 23), kev 20, exp 12 = 95
+        assert_eq!(score, 95);
+        assert_eq!(dec, "act-now");
+
+        // high, no kev, public, confirmed, low epss: 30 + round(0.1*25=2.5→3) + 0
+        // + 12 = 45 → schedule (>=32, <58).
+        let (score, dec) = compute_risk(Some("high"), 7.5, Some(0.1), false, "public", true);
+        assert_eq!(score, 45);
+        assert_eq!(dec, "schedule");
+
+        // medium, no kev, loopback (exp 0), confirmed, no epss: 18 → track (<32).
+        let (score, dec) = compute_risk(Some("medium"), 5.0, None, false, "loopback", true);
+        assert_eq!(score, 18);
+        assert_eq!(dec, "track");
+
+        // Unconfirmed halves the score: high+public, confirmed=false:
+        // (30 + 0 + 0 + 12) * 0.6 = 25.2 → 25 → track.
+        let (score, dec) = compute_risk(Some("high"), 7.0, None, false, "public", false);
+        assert_eq!(score, 25);
+        assert_eq!(dec, "track");
+
+        // KEV + confirmed but NOT exposed (loopback) → not act-now via the
+        // kev&exposed rule, but `kev && confirmed` lands it in soon.
+        let (_score, dec) = compute_risk(Some("low"), 3.0, None, true, "loopback", true);
+        assert_eq!(dec, "soon");
+
+        // epss>=0.5 && exposed (private) with no kev, medium → soon via the epss rule.
+        // sev 18, epss round(0.6*25)=15, exp 7 = 40 (schedule by score) but the
+        // epss>=0.5 && exposed branch promotes it to soon.
+        let (score, dec) = compute_risk(Some("medium"), 5.0, Some(0.6), false, "private", true);
+        assert_eq!(score, 40);
+        assert_eq!(dec, "soon");
+
+        // score>=80 path without kev: critical + public + high epss, confirmed:
+        // 40 + 25 + 0 + 12 = 77 → soon (>=58). Push epss/exposure to cross 80? Use
+        // critical + kev to confirm clamp: 40+25+20+12 = 97 act-now.
+        let (score, dec) = compute_risk(Some("critical"), 10.0, Some(1.0), true, "public", true);
+        assert_eq!(score, 97);
+        assert_eq!(dec, "act-now");
+    }
+
+    #[test]
+    fn risk_score_falls_back_to_cvss_when_severity_missing() {
+        // No severity string → bucket by CVSS. cvss 9.1 → sev 40.
+        let (score, _) = compute_risk(None, 9.1, None, false, "none", true);
+        assert_eq!(score, 40);
+        // cvss 0 → floor 8.
+        let (score, _) = compute_risk(None, 0.0, None, false, "none", true);
+        assert_eq!(score, 8);
+    }
+
+    #[test]
+    fn risk_score_clamps_epss_and_total() {
+        // Out-of-range epss is clamped to [0,1]; total clamped to 100.
+        let (score, _) = compute_risk(Some("critical"), 10.0, Some(5.0), true, "public", true);
+        // 40 + 25 + 20 + 12 = 97 (epss clamp keeps it at 25), still <=100.
+        assert_eq!(score, 97);
+        let (score, _) = compute_risk(Some("critical"), 10.0, Some(-1.0), true, "public", true);
+        // negative epss clamps to 0 → 40 + 0 + 20 + 12 = 72.
+        assert_eq!(score, 72);
+    }
+
+    #[test]
+    fn apply_risk_sets_fields_and_serializes() {
+        let mut e: ThreatEntry = serde_json::from_value(json!({
+            "cveId": "CVE-2024-1", "severity": "critical", "cvssScore": 9.8,
+            "kev": true, "epss": 0.9, "matchBasis": "coordinate", "confirmed": true,
+            "references": []
+        })).unwrap();
+        assert!(e.risk_score.is_none() && e.decision.is_none());
+        e.apply_risk("public");
+        assert_eq!(e.risk_score, Some(95));
+        assert_eq!(e.decision.as_deref(), Some("act-now"));
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["riskScore"], json!(95));
+        assert_eq!(v["decision"], json!("act-now"));
+        // Before scoring the fields are skipped entirely.
+        let e2: ThreatEntry = serde_json::from_value(json!({
+            "cveId": "CVE-2024-2", "matchBasis": "coordinate", "references": [], "kev": false
+        })).unwrap();
+        let v2 = serde_json::to_value(&e2).unwrap();
+        assert!(v2.get("riskScore").is_none() && v2.get("decision").is_none());
+    }
+
+    #[test]
+    fn register_response_decodes_from_sample() {
+        // The documented server `data` payload must decode with all fields.
+        let data = json!({
+            "hostId": "11111111-2222-3333-4444-555555555555",
+            "monitoring": true, "new": true, "assetCount": 1840,
+            "drift": { "added": 5, "removed": 2, "changed": 3 },
+            "summary": {
+                "total": 12, "confirmed": 9, "kev": 2, "exposed": 3,
+                "bySeverity": {"critical":1,"high":4,"medium":5,"low":2},
+                "byDecision": {"act-now":2,"soon":3,"schedule":4,"track":3}, "actNow": 2
+            },
+            "top": [ { "cveId": "CVE-2024-9", "decision": "act-now", "coordinate": "openssl@1.1" } ],
+            "newSinceLast": [ { "cveId": "CVE-2024-10", "decision": "soon", "coordinate": "nginx@1.0" } ],
+            "newSinceLastCount": 3
+        });
+        let resp: RegisterResponse = serde_json::from_value(data).unwrap();
+        assert_eq!(resp.host_id, "11111111-2222-3333-4444-555555555555");
+        assert!(resp.monitoring && resp.new);
+        assert_eq!(resp.asset_count, 1840);
+        assert_eq!((resp.drift.added, resp.drift.removed, resp.drift.changed), (5, 2, 3));
+        assert_eq!(resp.summary.act_now, 2);
+        assert_eq!(resp.summary.kev, 2);
+        assert_eq!(resp.summary.by_severity.get("critical"), Some(&1));
+        assert_eq!(resp.summary.by_decision.get("schedule"), Some(&4));
+        assert_eq!(resp.new_since_last_count, 3);
+        assert_eq!(resp.new_since_last.len(), 1);
+        assert_eq!(resp.new_since_last[0].cve_id.as_deref(), Some("CVE-2024-10"));
+
+        // A sparse / partial response must still decode (all fields default).
+        let sparse: RegisterResponse =
+            serde_json::from_value(json!({ "monitoring": false })).unwrap();
+        assert!(!sparse.monitoring && !sparse.new);
+        assert_eq!(sparse.asset_count, 0);
+    }
+
+    #[test]
+    fn registration_report_serializes_expected_shape() {
+        let resp = RegisterResponse {
+            host_id: "abc".into(), monitoring: true, asset_count: 10,
+            new_since_last_count: 2, ..Default::default()
+        };
+        let report = RegistrationReport::from(&resp);
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["host_id"], json!("abc"));
+        assert_eq!(v["monitoring"], json!(true));
+        assert_eq!(v["assetCount"], json!(10));
+        assert_eq!(v["newSinceLastCount"], json!(2));
+        assert!(v.get("drift").is_some() && v.get("summary").is_some());
+    }
+
+    #[test]
+    fn inventory_payload_serializes_camel_case() {
+        let body = RegisterRequest {
+            host_id: "h1",
+            hostname: Some("web-01"),
+            os: Some(InventoryOs { os_type: Some("linux".into()), distro: Some("ubuntu".into()), version: None }),
+            agent_version: "0.1.4",
+            monitor: true,
+            assets: &[InventoryAsset {
+                purl: "pkg:deb/ubuntu/openssl@1.1.1f".into(),
+                version: "1.1.1f".into(), ecosystem: "deb".into(), name: "openssl".into(),
+                exposure: "public".into(), exposed: true, runtime: true,
+            }],
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["hostId"], json!("h1"));
+        assert_eq!(v["hostname"], json!("web-01"));
+        assert_eq!(v["agentVersion"], json!("0.1.4"));
+        assert_eq!(v["monitor"], json!(true));
+        // os.version is None → omitted; os.type kept under the wire key "type".
+        assert_eq!(v["os"]["type"], json!("linux"));
+        assert!(v["os"].get("version").is_none());
+        assert_eq!(v["assets"][0]["purl"], json!("pkg:deb/ubuntu/openssl@1.1.1f"));
+        assert_eq!(v["assets"][0]["exposure"], json!("public"));
+        assert_eq!(v["assets"][0]["runtime"], json!(true));
     }
 
     #[test]

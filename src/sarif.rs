@@ -62,6 +62,12 @@ fn push_entry(rules: &mut BTreeMap<String, Value>, results: &mut Vec<Value>, ass
         "confirmed": t.confirmed,
         "matchBasis": t.match_basis,
     });
+    if let Some(decision) = &t.decision {
+        props["decision"] = json!(decision);
+    }
+    if let Some(score) = t.risk_score {
+        props["riskScore"] = json!(score);
+    }
     if !t.cwes.is_empty() {
         props["cwe"] = json!(t.cwes);
     }

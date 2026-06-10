@@ -4,6 +4,40 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4]
+
+### Added
+- **Continuous-monitoring registration (opt-in).** After a scan, the tool can
+  register the discovered assets with Radar's host-inventory API for ongoing
+  monitoring and alerts. In an interactive human session it asks
+  `Add these N services to Radar for continuous monitoring & alerts? [Y/n/never]`
+  — `never` persists a "don't ask again" preference. New flags: `--register`
+  (register without prompting, for CI/automation), `--no-register` (never register
+  this run), `--host-name <NAME>` (friendly hostname to send), and `--unregister`
+  (delete this host's inventory and exit). Registration is **off by default** in
+  non-interactive/CI runs unless `--register` or the `always` prompt mode is set,
+  and a registration failure is non-fatal (a one-line warning; the exit code is
+  unchanged). The payload is built only from assets with a real purl, so no
+  malformed coordinate is ever sent. A stable per-host `host_id` (UUID) and the
+  prompt mode live in a new `[monitoring]` section of the config file.
+- **Exposure-aware risk score + SSVC decision per finding.** Every finding now
+  carries a `riskScore` (0–100) and a `decision` band (`act-now` | `soon` |
+  `schedule` | `track`), computed locally from the finding plus the **owning
+  asset's network exposure**, mirroring the server formula so local and server
+  scores agree. The terminal summary shows a `[ACT-NOW 92]`-style badge and
+  findings are sorted by decision then score; `decision`/`riskScore` are exposed
+  in the JSON report and in SARIF result `properties`.
+- **Two-way surfacing (drift + new-since-last).** A successful registration adds
+  an optional `registration` object to the JSON report (`host_id`, `monitoring`,
+  `assetCount`, `drift{added,removed,changed}`, `summary{…}`, `newSinceLastCount`)
+  and, in human mode, prints the drift (`+added / -removed / ~changed`), the
+  act-now / exposed / KEV counts, and the top few findings new since the last scan.
+- `uuid` dependency (v4) for the stable host identity.
+
+### Changed
+- Report `schemaVersion` bumped to **2** (findings gained `riskScore`/`decision`;
+  the report gained the optional `registration` object).
+
 ## [0.1.3]
 
 ### Added
