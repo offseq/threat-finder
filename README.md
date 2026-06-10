@@ -1,5 +1,10 @@
 # OffSeq Threat Finder
 
+[![CI](https://github.com/offseq/threat-finder/actions/workflows/ci.yml/badge.svg)](https://github.com/offseq/threat-finder/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/threat-finder.svg)](https://crates.io/crates/threat-finder)
+[![docs.rs](https://img.shields.io/docsrs/threat-finder)](https://docs.rs/threat-finder)
+![license](https://img.shields.io/crates/l/threat-finder.svg)
+
 A command-line tool that discovers the services running on a host, determines
 their versions, and matches them against known vulnerabilities from the
 [OffSeq](https://radar.offseq.com) threat API.
@@ -9,15 +14,26 @@ Solaris/illumos, resolving each running service to its real binary and — where
 possible — reading the version straight from the OS package database rather than
 executing the service.
 
-## Build
+## Install
 
 ```sh
-cargo build --release
-# binary at target/release/threat-finder
+# From crates.io (compiles from source)
+cargo install threat-finder
+
+# Prebuilt binary, no toolchain needed (Linux/macOS, x86_64 + arm64)
+cargo binstall threat-finder
 ```
 
-Requires a recent stable Rust toolchain (edition 2021, Rust ≥ 1.87 — the
-dependency set pulls in crates that need it).
+Or grab a prebuilt archive from the
+[latest release](https://github.com/offseq/threat-finder/releases/latest)
+and put `threat-finder` on your `PATH`. To build from source:
+
+```sh
+cargo build --release   # -> target/release/threat-finder
+```
+
+Requires a recent stable Rust toolchain (edition 2021, Rust ≥ 1.87). Linux and
+macOS are supported (Windows is not — discovery relies on Unix facilities).
 
 ## Usage
 

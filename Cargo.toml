@@ -3,14 +3,22 @@ name = "threat-finder"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.87"
-description = "OffSeq Threat Finder - scans running services for known vulnerabilities"
+description = "Runtime vulnerability scanner: finds CVEs in the services and packages actually present on a host and flags which are network-exposed"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/offseq/threat-finder"
 homepage = "https://radar.offseq.com"
+documentation = "https://docs.rs/threat-finder"
 keywords = ["security", "vulnerability", "cve", "scanner", "cli"]
 categories = ["command-line-utilities"]
-publish = false
+exclude = [".github/", "/*.svg"]
+
+# `cargo binstall threat-finder` fetches the prebuilt release archives instead
+# of compiling. Matches the artifact names produced by .github/workflows/release.yml.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/threat-finder-v{ version }-{ target }.{ archive-format }"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
 
 [lib]
 name = "find_threats"
