@@ -48,13 +48,7 @@ threat-finder [OPTIONS]
 You need an OffSeq API key (get one at <https://radar.offseq.com/console>).
 It is resolved in this order:
 
-1. The `OFFSEQ_API_KEY` environment variable (best for CI/cron).
-2. The saved config at `$XDG_CONFIG_HOME/offseq-rust/config.toml`
-   (`~/Library/Application Support/offseq-rust/config.toml` on macOS),
-   created `0600` inside a `0700` directory.
-3. An interactive first-run setup (key entry is hidden), used only on a TTY.
-
-Non-interactive runs with no key available exit with status `2`.
+The `OFFSEQ_API_KEY` environment variable (best for CI/cron).
 
 ### Examples
 
@@ -83,30 +77,6 @@ sent; it is all local runtime state.
 Findings are also enriched with CISA **KEV** (known-exploited) flags, **EPSS**
 scores, and CVSS vectors, and sorted highest-risk-first deterministically.
 
-## How matching works
-
-The API's `affectedVersions` field is a list of constraint strings, evaluated as
-a logical **OR** across the list; each element is the **AND** of its
-space-separated comparators:
-
-| Constraint | Meaning |
-|------------|---------|
-| `*` | all versions affected |
-| `=1.2.3` | exactly this version |
-| `<2.4.49` | strictly before (i.e. *fixed in* 2.4.49) |
-| `<=2.4.48` | up to and including |
-| `>=2.0.0` | this version and later |
-| `>2.0.0` | strictly after |
-| `>=2.0.0 <2.5.2` | from 2.0.0 up to **but excluding** 2.5.2 |
-| `>=3.0.0 <=3.4.2` | 3.0.0 through 3.4.2 inclusive |
-
-Versions are compared numerically with implicit trailing zeros (`1.2 == 1.2.0`,
-`1.20 > 1.2`); Debian/RPM epochs (`1:2.3.4`) and revision suffixes
-(`-4ubuntu5`) are stripped to the upstream version before comparison. Parsing is
-fail-closed: a malformed constraint element never matches. When a record has no
-usable structured constraint, a conservative free-text scan of the description is
-used as a fallback.
-
 ## Per-OS support
 
 | OS | Discovery | Version source |
@@ -123,14 +93,6 @@ On macOS, Apple system services (`com.apple.*` and SIP-protected system
 binaries) are intentionally skipped — they are covered by the OS-version system
 lookup, and probing hundreds of them is pointless and slow.
 
-## Security notes
-
-- Version probing only ever executes an **absolute path to a real file**, with a
-  sanitized environment (`env_clear`, minimal `PATH`, no stdin) — closing the
-  PATH-hijack code-execution risk for a tool often run as root.
-- The package database is preferred over executing the service for its version.
-- The API key is never placed in a child process's environment or argv.
-
 ## Output
 
 JSON with:
@@ -146,14 +108,6 @@ JSON with:
   reported as "no vulnerabilities".
 
 Keys are sorted (BTreeMap), so reports diff cleanly across runs.
-
-## Caveat: distro backports
-
-Constraints encode **upstream** version math. A distro-backported package such as
-`2.4.48-1ubuntu0.1` parses to `2.4.48` and will match an upstream `<2.4.49`
-constraint even though the fix may have been backported — i.e. it can produce a
-false positive. The full packaged version is preserved in the report so an
-analyst can verify against the distro changelog.
 
 ## Tests
 
