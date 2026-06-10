@@ -30,6 +30,7 @@ threat-finder [OPTIONS]
 |------|-------------|
 | `-o, --output <PATH>` | Write the JSON report to `PATH` (default: prompt, or `/tmp/threats.json`) |
 | `--json` | Print the JSON report to stdout instead of a file |
+| `--scope <SCOPE>` | `running` (default — live services only) or `all` (+ every installed OS package) |
 | `--severity <LEVEL>` | Only report threats at/above a severity (`critical\|high\|medium\|low`) |
 | `--fail-on <WHAT>` | Exit `5` if matching findings exist: `any\|critical\|high\|medium\|low\|kev\|exposed` (CI gating) |
 | `--sarif <PATH>` | Also write a SARIF 2.1.0 report (for code-scanning UIs) |
@@ -78,6 +79,25 @@ sent; it is all local runtime state.
 
 Findings are also enriched with CISA **KEV** (known-exploited) flags, **EPSS**
 scores, and CVSS vectors, and sorted highest-risk-first deterministically.
+
+## Scan scope & coverage
+
+By default the tool scans **running services** — the small, high-signal set whose
+exposure it can correlate. `--scope all` additionally enumerates **every
+installed OS package** (`dpkg`/`rpm`/`pacman`/`apk`/`brew`/`pkg`/`pkg_info`),
+expanding the matched surface from a handful of services to the full package
+inventory (10–50×) so far more of the Radar catalog applies. A package that also
+backs a running, exposed process keeps its exposure (assets are deduplicated and
+merged), so prioritization survives the wider inventory.
+
+> Note: `--scope all` can produce hundreds–thousands of unique packages. On the
+> free tier (15 lookups/hour) this will rate-limit; bulk lookups and a local
+> cache are planned. The tool warns when the inventory exceeds the free-tier
+> budget.
+
+Internally the engine is a library crate (`find_threats`) with a `Collector`
+abstraction (running-services and os-packages today; lockfiles / containers /
+SBOM are future collectors), so the binary is a thin CLI over it.
 
 ## Per-OS support
 

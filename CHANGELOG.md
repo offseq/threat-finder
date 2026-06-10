@@ -7,6 +7,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Split into a reusable library crate (`find_threats`) + thin binary, with a
+  generic `Asset`/`Collector` abstraction (running-services is now a collector).
+- `--scope all`: a full installed-OS-package inventory collector
+  (dpkg/rpm/pacman/apk/brew/pkg/pkg_info), expanding matched coverage ~10–50×.
+  Assets are deduplicated and merged so a package backing a running, exposed
+  process keeps its runtime exposure. Defaults to `--scope running` (quota-safe),
+  with a warning when the inventory exceeds the free-tier budget.
+
+### Added (prior)
 - Reachability classification (loopback / private / public) for listeners, and
   UDP listener coverage in addition to TCP.
 - Cross-service CVE grouping (`byCve`) — one fix mapped to every affected service.

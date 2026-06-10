@@ -1,119 +1,19 @@
-use std::io::{self, IsTerminal, Read, Write};
-use std::process::{Command, Stdio, ExitCode};
-use std::time::{Duration, Instant};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use find_threats::{
-    ThreatClient,
-    ThreatError,
-    BatchResults,
-    ThreatEntry,
-    run_batch,
-    run_system_lookup,
-    print_plan_info,
-    ServiceEntry as ThreatServiceEntry,
-    SystemInfo as ThreatSystemInfo,
-};
+//! Host engine: OS detection, service discovery, binary resolution, version
+//! sourcing (package DB first, `--version` probe as fallback), and
+//! network-exposure correlation. Pure host interaction — no API types.
 
-use clap::Parser;
-use indicatif::{ProgressBar, ProgressStyle};
+use std::fs;
+use std::io::Read;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
 use once_cell::sync::Lazy;
-use serde::Serialize;
 use rayon::prelude::*;
 use regex::Regex;
+use serde::Serialize;
 use zbus::blocking::Connection;
 use zbus::zvariant::OwnedValue;
-
-mod auth;
-mod find_threats;
-mod sarif;
-
-#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
-enum Severity {
-    Critical,
-    High,
-    Medium,
-    Low,
-}
-
-impl Severity {
-    fn as_api(self) -> &'static str {
-        match self {
-            Severity::Critical => "critical",
-            Severity::High => "high",
-            Severity::Medium => "medium",
-            Severity::Low => "low",
-        }
-    }
-}
-
-#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
-enum FailOn {
-    /// Any finding at all
-    Any,
-    Critical,
-    High,
-    Medium,
-    Low,
-    /// Only CISA known-exploited findings
-    Kev,
-    /// Only findings on a network-exposed service
-    Exposed,
-}
-
-#[derive(Parser, Debug)]
-#[command(
-    name = "threat-finder",
-    version,
-    about = "OffSeq Threat Finder — scan running services for known vulnerabilities",
-    after_help = "EXIT CODES:\n  0  success\n  1  lookup or I/O error\n  2  no API key available\n  3  unsupported OS\n  4  rate limit / quota exhausted\n  5  --fail-on threshold met",
-)]
-struct Cli {
-    /// Write the JSON report to this path (default: prompt, or /tmp/threats.json)
-    #[arg(short, long, value_name = "PATH")]
-    output: Option<PathBuf>,
-
-    /// Print the JSON report to stdout instead of writing a file
-    #[arg(long)]
-    json: bool,
-
-    /// Only report threats at or above this severity
-    #[arg(long, value_enum, value_name = "LEVEL")]
-    severity: Option<Severity>,
-
-    /// Exit non-zero (5) when matching findings exist — for CI gating
-    #[arg(long, value_enum, value_name = "WHAT")]
-    fail_on: Option<FailOn>,
-
-    /// Also write a SARIF 2.1.0 report to this path (for code-scanning UIs)
-    #[arg(long, value_name = "PATH")]
-    sarif: Option<PathBuf>,
-
-    /// Only scan services whose name matches this glob (repeatable)
-    #[arg(long, value_name = "GLOB")]
-    include: Vec<String>,
-
-    /// Skip services whose name matches this glob (repeatable)
-    #[arg(long, value_name = "GLOB")]
-    exclude: Vec<String>,
-
-    /// Reduce output: no banner or progress indicators
-    #[arg(short, long)]
-    quiet: bool,
-
-    /// Never use ANSI colors in the summary
-    #[arg(long)]
-    no_color: bool,
-
-    /// Assume defaults and never prompt — for CI/cron use
-    #[arg(short = 'y', long)]
-    yes: bool,
-
-    /// Re-enter the API key, ignoring any saved one
-    #[arg(long)]
-    reset: bool,
-}
 
 #[derive(Debug, Clone)]
 pub enum LinuxDistro {
@@ -135,7 +35,7 @@ pub enum VersionSource {
 }
 
 impl VersionSource {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             VersionSource::PackageDb => "package-db",
             VersionSource::Probe => "probe",
@@ -153,7 +53,7 @@ pub enum Reachability {
 }
 
 impl Reachability {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Reachability::None => "none",
             Reachability::Loopback => "loopback",
@@ -176,14 +76,14 @@ pub struct ServiceInfo {
 }
 
 #[derive(Serialize)]
-pub struct SystemInfo {
+pub struct SystemFacts {
     pub kernel_name:    String,
     pub kernel_version: String,
     pub distro_name:    String,
     pub distro_version: String,
 }
 
-fn detect_linux_distro() -> LinuxDistro {
+pub fn detect_linux_distro() -> LinuxDistro {
     if let Ok(content) = std::fs::read_to_string("/etc/os-release") {
         let field = |key: &str| -> String {
             content.lines()
@@ -236,7 +136,7 @@ pub fn detect_os() -> OsType {
 }
 
 /// Human-readable OS label for display (instead of Debug formatting).
-fn os_label(os: &OsType) -> String {
+pub fn os_label(os: &OsType) -> String {
     match os {
         OsType::Linux(d) => format!("Linux ({})", parse_linux_distro_version(d).0),
         OsType::MacOs => "macOS".into(),
@@ -250,7 +150,7 @@ fn os_label(os: &OsType) -> String {
     }
 }
 
-fn gather_system_info(os: &OsType) -> Option<SystemInfo> {
+pub fn gather_system_info(os: &OsType) -> Option<SystemFacts> {
     let kernel_version = run_cmd("uname", &["-r"])
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
@@ -262,7 +162,7 @@ fn gather_system_info(os: &OsType) -> Option<SystemInfo> {
     match os {
         OsType::Linux(distro) => {
             let (distro_name, distro_version) = parse_linux_distro_version(distro);
-            Some(SystemInfo {
+            Some(SystemFacts {
                 kernel_name: "linux".into(),
                 kernel_version,
                 distro_name,
@@ -273,7 +173,7 @@ fn gather_system_info(os: &OsType) -> Option<SystemInfo> {
             let version = run_cmd("sw_vers", &["-productVersion"])
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default();
-            Some(SystemInfo {
+            Some(SystemFacts {
                 kernel_name: "darwin".into(),
                 kernel_version,
                 distro_name: "macos".into(),
@@ -281,7 +181,7 @@ fn gather_system_info(os: &OsType) -> Option<SystemInfo> {
             })
         }
         OsType::FreeBsd => {
-            Some(SystemInfo {
+            Some(SystemFacts {
                 kernel_name:    "freebsd".into(),
                 kernel_version: kernel_version.clone(),
                 distro_name:    "freebsd".into(),
@@ -289,7 +189,7 @@ fn gather_system_info(os: &OsType) -> Option<SystemInfo> {
             })
         }
         OsType::DragonFlyBsd => {
-            Some(SystemInfo {
+            Some(SystemFacts {
                 kernel_name:    "dragonfly".into(),
                 kernel_version: kernel_version.clone(),
                 distro_name:    "dragonfly".into(),
@@ -297,7 +197,7 @@ fn gather_system_info(os: &OsType) -> Option<SystemInfo> {
             })
         }
         OsType::OpenBsd => {
-            Some(SystemInfo {
+            Some(SystemFacts {
                 kernel_name:    "openbsd".into(),
                 kernel_version: kernel_version.clone(),
                 distro_name:    "openbsd".into(),
@@ -305,7 +205,7 @@ fn gather_system_info(os: &OsType) -> Option<SystemInfo> {
             })
         }
         OsType::NetBsd => {
-            Some(SystemInfo {
+            Some(SystemFacts {
                 kernel_name:    "netbsd".into(),
                 kernel_version: kernel_version.clone(),
                 distro_name:    "netbsd".into(),
@@ -316,7 +216,7 @@ fn gather_system_info(os: &OsType) -> Option<SystemInfo> {
             let version = run_cmd("uname", &["-v"])
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default();
-            Some(SystemInfo {
+            Some(SystemFacts {
                 kernel_name: "sunos".into(),
                 kernel_version,
                 distro_name: "solaris".into(),
@@ -324,7 +224,7 @@ fn gather_system_info(os: &OsType) -> Option<SystemInfo> {
             })
         }
         OsType::Illumos => {
-            Some(SystemInfo {
+            Some(SystemFacts {
                 kernel_name:    "illumos".into(),
                 kernel_version: kernel_version.clone(),
                 distro_name:    "illumos".into(),
@@ -335,24 +235,24 @@ fn gather_system_info(os: &OsType) -> Option<SystemInfo> {
     }
 }
 
-struct UnitEntry {
+pub struct UnitEntry {
     name: String,
     exe:  String,
     pid:  Option<u32>,
 }
 
-static EXECSTART_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#""/([^"]+)""#).unwrap());
+pub static EXECSTART_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#""/([^"]+)""#).unwrap());
 
 // One row of systemd's Manager.ListUnits() reply:
 // (name, description, load_state, active_state, sub_state, following,
 //  unit_obj_path, job_id, job_type, job_obj_path)
-type SystemdUnit = (
+pub type SystemdUnit = (
     String, String, String, String, String, String,
     zbus::zvariant::OwnedObjectPath, u32, String,
     zbus::zvariant::OwnedObjectPath,
 );
 
-fn list_systemd_units(conn: &Connection) -> Vec<UnitEntry> {
+pub fn list_systemd_units(conn: &Connection) -> Vec<UnitEntry> {
     let proxy = match zbus::blocking::Proxy::new(
         conn,
         "org.freedesktop.systemd1",
@@ -389,7 +289,7 @@ fn list_systemd_units(conn: &Connection) -> Vec<UnitEntry> {
 
 /// Resolve a unit to (absolute binary, MainPID). PID is kept for exposure
 /// correlation even when the path comes from a non-PID strategy.
-fn resolve_exe(conn: &Connection, obj_path: &str, unit_name: &str) -> Option<(String, Option<u32>)> {
+pub fn resolve_exe(conn: &Connection, obj_path: &str, unit_name: &str) -> Option<(String, Option<u32>)> {
     let svc_proxy = zbus::blocking::Proxy::new(
         conn,
         "org.freedesktop.systemd1",
@@ -439,7 +339,7 @@ fn resolve_exe(conn: &Connection, obj_path: &str, unit_name: &str) -> Option<(St
     None
 }
 
-fn normalize_service_name(name: &str) -> &str {
+pub fn normalize_service_name(name: &str) -> &str {
     match name {
         "ssh"           => "openssh",
         "apache2"       => "apache",
@@ -453,11 +353,11 @@ fn normalize_service_name(name: &str) -> &str {
 /// systemd template instance: "postgresql@15-main" -> "postgresql". The instance
 /// part is host-specific and never matches an API product name, so it is dropped
 /// from the search term (the full name is still kept for display).
-fn strip_instance(name: &str) -> &str {
+pub fn strip_instance(name: &str) -> &str {
     name.split('@').next().unwrap_or(name)
 }
 
-fn parse_linux_distro_version(distro: &LinuxDistro) -> (String, String) {
+pub fn parse_linux_distro_version(distro: &LinuxDistro) -> (String, String) {
     let name = match distro {
         LinuxDistro::Ubuntu   => "ubuntu",
         LinuxDistro::Debian   => "debian",
@@ -483,54 +383,8 @@ fn parse_linux_distro_version(distro: &LinuxDistro) -> (String, String) {
     (name.to_string(), version)
 }
 
-fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return format!("{}/{}", home.display(), rest);
-        }
-    }
-    path.to_string()
-}
 
-fn prompt_output_path() -> String {
-    let default = "/tmp/threats.json";
-    print!("Output path [{}]: ", default);
-    let _ = io::stdout().flush();
-
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).unwrap_or(0) == 0 {
-        return default.to_string(); // EOF
-    }
-    let input = input.trim();
-
-    if input.is_empty() {
-        default.to_string()
-    } else {
-        let expanded = expand_tilde(input);
-
-        let path = std::path::Path::new(&expanded);
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                eprintln!(
-                    "Warning: directory '{}' does not exist. Output may fail.",
-                    parent.display()
-                );
-            }
-        }
-
-        expanded
-    }
-}
-
-//
-// Two principles from the analysis:
-//   1. NEVER execute a bare name resolved through an attacker-influenceable PATH
-//      (run_timed enforces this — absolute, real files only).
-//   2. Prefer the package database over executing the daemon for its version;
-//      probing the binary is a last resort.
-
-// systemd oneshot units that should never be treated as a running daemon.
-const SYSTEMD_ONE_SHOTS: &[&str] = &[
+pub const SYSTEMD_ONE_SHOTS: &[&str] = &[
     "systemd-journal-flush", "systemd-tmpfiles-setup",
     "systemd-tmpfiles-setup-dev", "systemd-tmpfiles-setup-dev-early",
     "systemd-udev-trigger", "systemd-update-utmp", "systemd-user-sessions",
@@ -538,7 +392,7 @@ const SYSTEMD_ONE_SHOTS: &[&str] = &[
     "systemd-modules-load", "systemd-sysctl",
 ];
 
-const SAFE_PATH_DIRS: &[&str] = &[
+pub const SAFE_PATH_DIRS: &[&str] = &[
     "/usr/local/sbin", "/usr/local/bin",
     "/usr/sbin", "/usr/bin", "/sbin", "/bin",
     "/opt/homebrew/bin", "/opt/homebrew/sbin",
@@ -546,7 +400,7 @@ const SAFE_PATH_DIRS: &[&str] = &[
 ];
 
 /// A few service names whose daemon binary is reliably different from the name.
-fn daemon_alias(service: &str) -> &str {
+pub fn daemon_alias(service: &str) -> &str {
     match service {
         "ssh" => "sshd",
         _ => service,
@@ -556,7 +410,7 @@ fn daemon_alias(service: &str) -> &str {
 /// Resolve a service/command name to an absolute binary path by reading the
 /// filesystem only (no execution). Tries the name, then a "<name>d" daemon
 /// variant, across common bin dirs and any absolute $PATH entries.
-fn resolve_binary(name: &str) -> Option<String> {
+pub fn resolve_binary(name: &str) -> Option<String> {
     let first = name.split_whitespace().next().unwrap_or(name);
     if first.starts_with('/') {
         return Path::new(first).is_file().then(|| first.to_string());
@@ -583,16 +437,16 @@ fn resolve_binary(name: &str) -> Option<String> {
 }
 
 // "name-1.2.3-r0" / "nginx-1.26.2nb1" -> "1.2.3" / "1.26.2"
-static ATOM_VER_RE: Lazy<Regex> =
+pub static ATOM_VER_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"-(\d[0-9A-Za-z.+~]*)").unwrap());
 
-fn atom_version(atom: &str) -> Option<String> {
+pub fn atom_version(atom: &str) -> Option<String> {
     ATOM_VER_RE.captures(atom.trim()).map(|c| c[1].to_string())
 }
 
 /// Ask the OS package database for the version that owns `exe`. Returns None when
 /// no package owns it (e.g. a base-system binary) so the caller can fall back.
-fn package_version(exe: &str, os: &OsType) -> Option<String> {
+pub fn package_version(exe: &str, os: &OsType) -> Option<String> {
     let real = fs::canonicalize(exe).ok()?;
     let path = real.to_string_lossy().to_string();
 
@@ -616,7 +470,7 @@ fn package_version(exe: &str, os: &OsType) -> Option<String> {
     }
 }
 
-fn dpkg_version(path: &str) -> Option<String> {
+pub fn dpkg_version(path: &str) -> Option<String> {
     // dpkg-query -S <path> -> "pkg: /path"  (or "pkg1, pkg2: /path")
     let owner = run_cmd("dpkg-query", &["-S", path])?;
     let pkg = owner.split(':').next()?.split(',').next()?.trim().to_string();
@@ -628,7 +482,7 @@ fn dpkg_version(path: &str) -> Option<String> {
     (!ver.is_empty()).then_some(ver)
 }
 
-fn rpm_version(path: &str) -> Option<String> {
+pub fn rpm_version(path: &str) -> Option<String> {
     let out = run_cmd("rpm", &["-qf", "--queryformat", "%{VERSION}\n", path])?;
     let v = out.lines().next()?.trim().to_string();
     if v.is_empty() || v.to_lowercase().contains("not owned") {
@@ -638,21 +492,21 @@ fn rpm_version(path: &str) -> Option<String> {
     }
 }
 
-fn pacman_version(path: &str) -> Option<String> {
+pub fn pacman_version(path: &str) -> Option<String> {
     // pacman -Qo <path> -> "/usr/bin/nginx is owned by nginx 1.27.0-1"
     let out = run_cmd("pacman", &["-Qo", path])?;
     let after = out.split(" is owned by ").nth(1)?;
     after.split_whitespace().nth(1).map(|s| s.to_string())
 }
 
-fn apk_version(path: &str) -> Option<String> {
+pub fn apk_version(path: &str) -> Option<String> {
     // apk info -W <path> -> "<path> is owned by nginx-1.26.2-r0"
     let out = run_cmd("apk", &["info", "-W", path])?;
     let atom = out.split("owned by ").nth(1)?;
     atom_version(atom)
 }
 
-fn homebrew_version(path: &str) -> Option<String> {
+pub fn homebrew_version(path: &str) -> Option<String> {
     // canonicalized brew binaries live at .../Cellar/<name>/<version>/...
     let idx = path.find("/Cellar/")?;
     let rest = &path[idx + "/Cellar/".len()..];
@@ -662,13 +516,13 @@ fn homebrew_version(path: &str) -> Option<String> {
     (!version.is_empty()).then_some(version)
 }
 
-fn freebsd_pkg_version(path: &str) -> Option<String> {
+pub fn freebsd_pkg_version(path: &str) -> Option<String> {
     // pkg which -q <path> -> "nginx-1.27.0"
     let atom = run_cmd("pkg", &["which", "-q", path])?;
     atom_version(&atom)
 }
 
-fn pkg_info_version(path: &str, file_flag: bool) -> Option<String> {
+pub fn pkg_info_version(path: &str, file_flag: bool) -> Option<String> {
     // OpenBSD: pkg_info -E <path> -> "nginx-1.26.2: /usr/local/sbin/nginx"
     // NetBSD : pkg_info -Fe <path> -> "nginx-1.26.2nb1"
     let out = if file_flag {
@@ -682,14 +536,14 @@ fn pkg_info_version(path: &str, file_flag: bool) -> Option<String> {
 
 /// Get a version for a resolved binary: package DB first, probe as last resort.
 /// Also reports which source produced the version (a trust signal).
-fn version_for_binary(exe: &str, os: &OsType) -> Option<(String, VersionSource)> {
+pub fn version_for_binary(exe: &str, os: &OsType) -> Option<(String, VersionSource)> {
     if let Some(v) = package_version(exe, os) {
         return Some((v, VersionSource::PackageDb));
     }
     probe_version(exe).map(|v| (v, VersionSource::Probe))
 }
 
-fn make_service(name: &str, exe: &str, pid: Option<u32>, os: &OsType) -> Option<ServiceInfo> {
+pub fn make_service(name: &str, exe: &str, pid: Option<u32>, os: &OsType) -> Option<ServiceInfo> {
     let (version, source) = version_for_binary(exe, os)?;
     Some(ServiceInfo {
         name: name.to_string(),
@@ -704,7 +558,7 @@ fn make_service(name: &str, exe: &str, pid: Option<u32>, os: &OsType) -> Option<
 }
 
 /// Build a ServiceInfo from a service name by resolving its binary and version.
-fn service_from_name(display_name: &str, os: &OsType) -> Option<ServiceInfo> {
+pub fn service_from_name(display_name: &str, os: &OsType) -> Option<ServiceInfo> {
     let exe = resolve_binary(display_name)?;
     make_service(display_name, &exe, None, os)
 }
@@ -715,7 +569,7 @@ fn service_from_name(display_name: &str, os: &OsType) -> Option<ServiceInfo> {
 // any is reachable off-host — is the tool's signature capability: manifest
 // scanners can't see runtime state, and external scanners need a second host.
 
-fn listening_endpoints(pid: u32) -> Vec<String> {
+pub fn listening_endpoints(pid: u32) -> Vec<String> {
     let mut eps = if cfg!(target_os = "linux") {
         linux_listeners(pid)
     } else {
@@ -730,7 +584,7 @@ fn listening_endpoints(pid: u32) -> Vec<String> {
 /// so the address is a clean `n`-prefixed line — the human format suffixes each
 /// row with "(LISTEN)", which the old `.last()` parser picked up instead of the
 /// address, leaving exposure silently dead on every non-Linux platform.
-fn lsof_listeners(pid: u32) -> Vec<String> {
+pub fn lsof_listeners(pid: u32) -> Vec<String> {
     let mut out = Vec::new();
     for ep in lsof_names(pid, &["-iTCP", "-sTCP:LISTEN"]) {
         out.push(format!("tcp {ep}"));
@@ -741,7 +595,7 @@ fn lsof_listeners(pid: u32) -> Vec<String> {
     out
 }
 
-fn lsof_names(pid: u32, filter: &[&str]) -> Vec<String> {
+pub fn lsof_names(pid: u32, filter: &[&str]) -> Vec<String> {
     let pid = pid.to_string();
     let mut args = vec!["-nP", "-p", &pid];
     args.extend_from_slice(filter);
@@ -756,7 +610,7 @@ fn lsof_names(pid: u32, filter: &[&str]) -> Vec<String> {
         .collect()
 }
 
-fn proc_socket_inodes(pid: u32) -> std::collections::HashSet<String> {
+pub fn proc_socket_inodes(pid: u32) -> std::collections::HashSet<String> {
     let mut inodes = std::collections::HashSet::new();
     if let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) {
         for fd in fds.flatten() {
@@ -773,7 +627,7 @@ fn proc_socket_inodes(pid: u32) -> std::collections::HashSet<String> {
     inodes
 }
 
-fn linux_listeners(pid: u32) -> Vec<String> {
+pub fn linux_listeners(pid: u32) -> Vec<String> {
     let inodes = proc_socket_inodes(pid);
     if inodes.is_empty() {
         return Vec::new();
@@ -815,7 +669,7 @@ fn linux_listeners(pid: u32) -> Vec<String> {
 }
 
 /// Parse a /proc/net hex "addr:port" (little-endian) into "ip:port".
-fn parse_proc_addr(s: &str, v6: bool) -> Option<String> {
+pub fn parse_proc_addr(s: &str, v6: bool) -> Option<String> {
     let (addr, port) = s.split_once(':')?;
     let port = u16::from_str_radix(port, 16).ok()?;
     if v6 {
@@ -838,7 +692,7 @@ fn parse_proc_addr(s: &str, v6: bool) -> Option<String> {
 }
 
 /// Bare host of an endpoint (drops a `tcp `/`udp ` prefix, port, and brackets).
-fn endpoint_host(ep: &str) -> &str {
+pub fn endpoint_host(ep: &str) -> &str {
     let ep = ep.strip_prefix("tcp ").or_else(|| ep.strip_prefix("udp ")).unwrap_or(ep);
     let host = ep.rsplit_once(':').map(|(h, _)| h).unwrap_or(ep);
     host.trim_matches(|c| c == '[' || c == ']')
@@ -846,7 +700,7 @@ fn endpoint_host(ep: &str) -> &str {
 
 /// Classify how reachable a listener is: loopback, private (LAN/CGNAT/ULA), or
 /// public (routable / wildcard). Sharpens the "internet-exposed" signal.
-fn endpoint_reachability(ep: &str) -> Reachability {
+pub fn endpoint_reachability(ep: &str) -> Reachability {
     use std::net::{Ipv4Addr, Ipv6Addr};
     let host = endpoint_host(ep);
     match host {
@@ -884,7 +738,7 @@ fn endpoint_reachability(ep: &str) -> Reachability {
 }
 
 /// Fill in listening endpoints + reachability for services that resolved to a PID.
-fn enrich_exposure(services: &mut [ServiceInfo]) {
+pub fn enrich_exposure(services: &mut [ServiceInfo]) {
     for s in services.iter_mut() {
         if let Some(pid) = s.pid {
             let eps = listening_endpoints(pid);
@@ -895,7 +749,7 @@ fn enrich_exposure(services: &mut [ServiceInfo]) {
     }
 }
 
-static VERSION_EXTRACT_RE: Lazy<Regex> = Lazy::new(|| {
+pub static VERSION_EXTRACT_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"(?ix)
         (?:version:\s*)?
@@ -911,7 +765,7 @@ static VERSION_EXTRACT_RE: Lazy<Regex> = Lazy::new(|| {
     ).unwrap()
 });
 
-fn run_timed(exe: &str, flag: &str, timeout: Duration) -> Option<(bool, String, String)> {
+pub fn run_timed(exe: &str, flag: &str, timeout: Duration) -> Option<(bool, String, String)> {
     // Only ever execute an absolute path to a real file. This function runs
     // discovered binaries (often as root), so a bare name resolved via PATH is
     // refused outright to close the PATH-hijack code-execution hole.
@@ -954,7 +808,7 @@ fn run_timed(exe: &str, flag: &str, timeout: Duration) -> Option<(bool, String, 
 
 // Extract a clean version token from raw `--version` output.
 
-fn extract_version(text: &str) -> Option<String> {
+pub fn extract_version(text: &str) -> Option<String> {
     const BAD: &[&str] = &[
         "invalid", "unknown option", "usage:", "error:",
         "must be", "superuser", "permission",
@@ -984,7 +838,7 @@ fn extract_version(text: &str) -> Option<String> {
     None
 }
 
-fn looks_like_real_version(version: &str) -> bool {
+pub fn looks_like_real_version(version: &str) -> bool {
     if version.is_empty() {
         return false;
     }
@@ -998,9 +852,9 @@ fn looks_like_real_version(version: &str) -> bool {
     true
 }
 
-const TIMEOUT: Duration = Duration::from_secs(2);
+pub const TIMEOUT: Duration = Duration::from_secs(2);
 
-fn probe_version(exe: &str) -> Option<String> {
+pub fn probe_version(exe: &str) -> Option<String> {
     let bin_name = exe.rsplit('/').next().unwrap_or(exe);
 
     for flag in &["--version", "-V", "-v", "version"] {
@@ -1021,13 +875,13 @@ fn probe_version(exe: &str) -> Option<String> {
     None
 }
 
-fn run_cmd(program: &str, args: &[&str]) -> Option<String> {
+pub fn run_cmd(program: &str, args: &[&str]) -> Option<String> {
     Command::new(program).args(args).output().ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
-fn scan_sysvinit(os: &OsType) -> Vec<ServiceInfo> {
+pub fn scan_sysvinit(os: &OsType) -> Vec<ServiceInfo> {
     let output = run_cmd("service", &["--status-all"])
         .or_else(|| run_cmd("rc-status", &["--all"]));
 
@@ -1046,7 +900,7 @@ fn scan_sysvinit(os: &OsType) -> Vec<ServiceInfo> {
 }
 
 /// Parse running service names from `service --status-all` / `rc-status --all`.
-fn parse_sysvinit_running(output: &str) -> Vec<String> {
+pub fn parse_sysvinit_running(output: &str) -> Vec<String> {
     output.lines()
         .filter_map(|line| {
             let t = line.trim();
@@ -1068,7 +922,7 @@ fn parse_sysvinit_running(output: &str) -> Vec<String> {
 /// `--version` is both useless (they don't report versions) and a subprocess
 /// storm. Only third-party software (Homebrew, /usr/local, /Applications,
 /// /Library) is worth a CVE lookup.
-fn macos_relevant_path(exe: &str) -> bool {
+pub fn macos_relevant_path(exe: &str) -> bool {
     if exe.starts_with("/opt/")
         || exe.starts_with("/usr/local/")
         || exe.starts_with("/Applications/")
@@ -1082,7 +936,7 @@ fn macos_relevant_path(exe: &str) -> bool {
         || exe.starts_with("/sbin/"))
 }
 
-fn scan_launchctl(os: &OsType) -> Vec<ServiceInfo> {
+pub fn scan_launchctl(os: &OsType) -> Vec<ServiceInfo> {
     // `launchctl list` columns: PID  Status  Label. A numeric PID means running.
     // Resolve the running process's absolute binary via `ps -o comm=` (the old
     // code fed the reverse-DNS Label straight into Command::new, which never
@@ -1109,7 +963,7 @@ fn scan_launchctl(os: &OsType) -> Vec<ServiceInfo> {
 
 /// Parse running (label, pid) pairs from `launchctl list`, skipping non-running
 /// entries (PID "-") and Apple system services.
-fn parse_launchctl_running(output: &str) -> Vec<(String, String)> {
+pub fn parse_launchctl_running(output: &str) -> Vec<(String, String)> {
     output.lines().skip(1)
         .filter_map(|line| {
             let mut cols = line.split('\t');
@@ -1127,12 +981,12 @@ fn parse_launchctl_running(output: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn binary_basename(exe: &str) -> String {
+pub fn binary_basename(exe: &str) -> String {
     exe.rsplit('/').next().unwrap_or(exe).to_string()
 }
 
 /// "/opt/homebrew/Cellar/nginx/1.27.0/bin/nginx" (canonicalized) -> "nginx"
-fn homebrew_formula(exe: &str) -> Option<String> {
+pub fn homebrew_formula(exe: &str) -> Option<String> {
     let real = fs::canonicalize(exe).ok()?;
     let s = real.to_string_lossy();
     let idx = s.find("/Cellar/")?;
@@ -1141,12 +995,12 @@ fn homebrew_formula(exe: &str) -> Option<String> {
 
 /// Turn a reverse-DNS launchd label into a friendlier service name, e.g.
 /// "homebrew.mxcl.postgresql" -> "postgresql", "org.postgresql.postgres" -> "postgres".
-fn friendly_label(label: &str) -> Option<String> {
+pub fn friendly_label(label: &str) -> Option<String> {
     let last = label.rsplit('.').next()?.trim();
     (!last.is_empty()).then(|| last.to_string())
 }
 
-fn scan_bsd_rc(os: &OsType) -> Vec<ServiceInfo> {
+pub fn scan_bsd_rc(os: &OsType) -> Vec<ServiceInfo> {
     // `service -e` prints absolute rc.d script PATHS; the old code intersected
     // those against the bare names from `service -l`, yielding the empty set.
     // Take the basename of each enabled script instead.
@@ -1170,7 +1024,7 @@ fn scan_bsd_rc(os: &OsType) -> Vec<ServiceInfo> {
         .collect()
 }
 
-fn scan_openbsd(os: &OsType) -> Vec<ServiceInfo> {
+pub fn scan_openbsd(os: &OsType) -> Vec<ServiceInfo> {
     // `rcctl ls started` = currently running (the old `rcctl ls on` listed
     // merely *enabled* services, including stopped ones).
     let names: Vec<String> = run_cmd("rcctl", &["ls", "started"])
@@ -1183,7 +1037,7 @@ fn scan_openbsd(os: &OsType) -> Vec<ServiceInfo> {
         .collect()
 }
 
-fn scan_netbsd(os: &OsType) -> Vec<ServiceInfo> {
+pub fn scan_netbsd(os: &OsType) -> Vec<ServiceInfo> {
     // NetBSD has no rcctl. Enumerate /etc/rc.d and ask each script its status.
     let names: Vec<String> = match fs::read_dir("/etc/rc.d") {
         Ok(d) => d.filter_map(|e| e.ok())
@@ -1208,7 +1062,7 @@ fn scan_netbsd(os: &OsType) -> Vec<ServiceInfo> {
 }
 
 /// Parse online FMRIs from `svcs -H -o state,fmri`.
-fn parse_svcs_online(output: &str) -> Vec<String> {
+pub fn parse_svcs_online(output: &str) -> Vec<String> {
     output.lines()
         .filter_map(|l| {
             let mut it = l.split_whitespace();
@@ -1219,7 +1073,7 @@ fn parse_svcs_online(output: &str) -> Vec<String> {
         .collect()
 }
 
-fn scan_smf(os: &OsType) -> Vec<ServiceInfo> {
+pub fn scan_smf(os: &OsType) -> Vec<ServiceInfo> {
     // svcs -H -o state,fmri  (machine-readable, no header)
     let output = run_cmd("svcs", &["-H", "-o", "state,fmri"]).unwrap_or_default();
     if output.is_empty() {
@@ -1248,7 +1102,7 @@ fn scan_smf(os: &OsType) -> Vec<ServiceInfo> {
         .collect()
 }
 
-fn scan_services(os: &OsType) -> Vec<ServiceInfo> {
+pub fn scan_services(os: &OsType) -> Vec<ServiceInfo> {
     match os {
         OsType::Linux(_) => {
             if let Ok(conn) = Connection::system() {
@@ -1276,424 +1130,11 @@ fn scan_services(os: &OsType) -> Vec<ServiceInfo> {
     }
 }
 
-fn spinner(msg: &str, quiet: bool) -> Option<ProgressBar> {
-    if quiet {
-        return None;
-    }
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::with_template("{spinner:.cyan} {msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-    );
-    pb.set_message(msg.to_string());
-    pb.enable_steady_tick(Duration::from_millis(100));
-    Some(pb)
-}
-
-/// Minimal case-insensitive glob: `*` matches any run of characters.
-fn glob_match(pattern: &str, s: &str) -> bool {
-    let pattern = pattern.to_lowercase();
-    let s = s.to_lowercase();
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 1 {
-        return s == pattern; // no wildcard → exact
-    }
-    let mut idx = 0;
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        if i == 0 {
-            if !s[idx..].starts_with(part) {
-                return false;
-            }
-            idx += part.len();
-        } else if i == parts.len() - 1 {
-            return s[idx..].ends_with(part);
-        } else {
-            match s[idx..].find(part) {
-                Some(p) => idx += p + part.len(),
-                None => return false,
-            }
-        }
-    }
-    true
-}
-
-fn name_allowed(name: &str, include: &[String], exclude: &[String]) -> bool {
-    if exclude.iter().any(|p| glob_match(p, name)) {
-        return false;
-    }
-    include.is_empty() || include.iter().any(|p| glob_match(p, name))
-}
-
-fn reachability_rank(r: &str) -> u8 {
-    match r {
-        "public" => 3,
-        "private" => 2,
-        "loopback" => 1,
-        _ => 0,
-    }
-}
-
-use find_threats::severity_rank as sev_rank;
-
-fn severity_floor(s: Option<Severity>) -> u8 {
-    match s {
-        Some(Severity::Critical) => 4,
-        Some(Severity::High)     => 3,
-        Some(Severity::Medium)   => 2,
-        Some(Severity::Low)      => 1,
-        None                     => 0,
-    }
-}
-
-fn paint(s: &str, code: &str, color: bool) -> String {
-    if color { format!("\x1b[{code}m{s}\x1b[0m") } else { s.to_string() }
-}
-
-fn sev_label(sev: Option<&str>, color: bool) -> String {
-    let (txt, code) = match sev_rank(sev) {
-        4 => ("CRIT", "1;31"),
-        3 => ("HIGH", "31"),
-        2 => ("MED ", "33"),
-        1 => ("LOW ", "2"),
-        _ => ("UNK ", "2"),
-    };
-    paint(txt, code, color)
-}
-
-/// Ranked, optionally-colored terminal summary — exposed and highest-risk first.
-fn print_summary(results: &BatchResults, color: bool) {
-    let mut rows: Vec<(&String, bool, &Vec<ThreatEntry>)> = results.services.iter()
-        .filter(|(_, v)| !v.is_empty())
-        .map(|(k, v)| (k, results.assets.get(k).map(|a| a.exposed).unwrap_or(false), v))
-        .collect();
-    if rows.is_empty() {
-        return;
-    }
-    rows.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.len().cmp(&a.2.len())).then(a.0.cmp(b.0)));
-
-    println!("\n{}", paint("Vulnerability summary (highest risk first):", "1", color));
-    for (key, exposed, threats) in &rows {
-        let badge = if *exposed {
-            let asset = results.assets.get(*key);
-            let reach = asset.map(|a| a.reachability.as_str()).unwrap_or("private");
-            let eps = asset.map(|a| a.listeners.join(", ")).unwrap_or_default();
-            let code = if reach == "public" { "1;31" } else { "1;33" };
-            format!("  {}", paint(&format!("[{} {eps}]", reach.to_uppercase()), code, color))
-        } else {
-            String::new()
-        };
-        println!("\n  {} — {} finding(s){badge}", paint(key, "1;36", color), threats.len());
-        for t in threats.iter().take(5) {
-            let cve = t.cve_id.as_deref().unwrap_or("(no id)");
-            let kev = if t.kev { format!(" {}", paint("[KEV]", "1;31", color)) } else { String::new() };
-            let title: String = t.title.as_deref().unwrap_or("").chars().take(72).collect();
-            println!("      {}  {cve}{kev}  {title}", sev_label(t.severity.as_deref(), color));
-        }
-        if threats.len() > 5 {
-            println!("      … and {} more", threats.len() - 5);
-        }
-    }
-
-    // CVEs that hit more than one service — the highest-leverage fixes.
-    let mut shared: Vec<(&String, &find_threats::CveGroup)> = results.by_cve.iter()
-        .filter(|(_, g)| g.assets.len() > 1)
-        .collect();
-    if !shared.is_empty() {
-        shared.sort_by(|a, b| {
-            (b.1.kev, sev_rank(b.1.severity.as_deref()), b.1.assets.len())
-                .cmp(&(a.1.kev, sev_rank(a.1.severity.as_deref()), a.1.assets.len()))
-                .then(a.0.cmp(b.0))
-        });
-        println!("\n{}", paint("Top shared CVEs (one fix, many services):", "1", color));
-        for (cve, g) in shared.iter().take(5) {
-            let kev = if g.kev { format!(" {}", paint("[KEV]", "1;31", color)) } else { String::new() };
-            println!(
-                "  {}  {}{kev}  affects {} services",
-                sev_label(g.severity.as_deref(), color), cve, g.assets.len()
-            );
-        }
-    }
-
-    let total: usize = rows.iter().map(|r| r.2.len()).sum();
-    let exposed_svcs = rows.iter().filter(|r| r.1).count();
-    let kev = rows.iter().flat_map(|r| r.2.iter()).filter(|t| t.kev).count();
-    println!(
-        "\n{total} finding(s) across {} service(s); {exposed_svcs} exposed, {kev} known-exploited.",
-        rows.len()
-    );
-}
-
-/// Whether the configured --fail-on threshold is met by any finding.
-fn fail_triggered(results: &BatchResults, fail_on: FailOn, floor: Option<Severity>) -> bool {
-    let floor = severity_floor(floor);
-    let hit = |t: &ThreatEntry, exposed: bool| match fail_on {
-        FailOn::Any      => sev_rank(t.severity.as_deref()) >= floor,
-        FailOn::Critical => sev_rank(t.severity.as_deref()) >= 4,
-        FailOn::High     => sev_rank(t.severity.as_deref()) >= 3,
-        FailOn::Medium   => sev_rank(t.severity.as_deref()) >= 2,
-        FailOn::Low      => sev_rank(t.severity.as_deref()) >= 1,
-        FailOn::Kev      => t.kev,
-        FailOn::Exposed  => exposed && sev_rank(t.severity.as_deref()) >= floor,
-    };
-    for (key, threats) in &results.services {
-        let exposed = results.assets.get(key).map(|a| a.exposed).unwrap_or(false);
-        if threats.iter().any(|t| hit(t, exposed)) {
-            return true;
-        }
-    }
-    if let Some(sys) = &results.system {
-        if sys.values().flatten().any(|t| hit(t, false)) {
-            return true;
-        }
-    }
-    false
-}
-
-fn main() -> ExitCode {
-    let cli = Cli::parse();
-
-    let os = detect_os();
-    if let OsType::Unsupported(name) = &os {
-        eprintln!("Unsupported OS: {name}. Nothing to scan.");
-        return ExitCode::from(3);
-    }
-
-    let interactive = !cli.yes && io::stdin().is_terminal();
-
-    let api_key = match auth::resolve_api_key(cli.reset, interactive) {
-        Some(k) => k,
-        None => {
-            eprintln!(
-                "No API key available. Set OFFSEQ_API_KEY, or run interactively to enter one."
-            );
-            return ExitCode::from(2);
-        }
-    };
-
-    // Decide where output goes before doing any slow work.
-    let to_stdout = cli.json;
-    let mut threats_path = if to_stdout {
-        PathBuf::new()
-    } else {
-        cli.output.clone().unwrap_or_else(|| {
-            if interactive {
-                PathBuf::from(prompt_output_path())
-            } else {
-                PathBuf::from("/tmp/threats.json")
-            }
-        })
-    };
-
-    if !cli.quiet {
-        println!("\nDetected OS: {}\n", os_label(&os));
-    }
-
-    let scan_pb = spinner("Scanning running services…", cli.quiet);
-    let mut services = scan_services(&os);
-    let system_info = gather_system_info(&os);
-    if let Some(pb) = scan_pb {
-        pb.finish_and_clear();
-    }
-
-    if !cli.quiet {
-        if let Some(ref sys) = system_info {
-            println!("System:");
-            println!("  Kernel:  {} {}", sys.kernel_name, sys.kernel_version);
-            println!("  Distro:  {} {}", sys.distro_name, sys.distro_version);
-        }
-    }
-
-    if !cli.include.is_empty() || !cli.exclude.is_empty() {
-        services.retain(|s| name_allowed(&s.name, &cli.include, &cli.exclude));
-    }
-    services.sort_by(|a, b| a.name.cmp(&b.name));
-
-    let exposure_pb = spinner("Correlating network exposure…", cli.quiet);
-    enrich_exposure(&mut services);
-    if let Some(pb) = exposure_pb { pb.finish_and_clear(); }
-
-    if !cli.quiet {
-        let exposed = services.iter().filter(|s| s.exposed).count();
-        let suffix = if exposed > 0 { format!(", {exposed} network-exposed") } else { String::new() };
-        println!("Found {} service(s){suffix}\n", services.len());
-        if services.is_empty() {
-            eprintln!("[!] No running services discovered — you may need elevated privileges (try sudo) for full discovery.");
-        }
-    }
-
-    let entries: Vec<ThreatServiceEntry> = services
-        .iter()
-        .map(|svc| ThreatServiceEntry {
-            name: normalize_service_name(strip_instance(&svc.name)).to_string(),
-            version: svc.version.clone(),
-        })
-        .collect();
-
-    let client = Arc::new(ThreatClient::new(&api_key));
-    let lookup_pb = spinner("Querying the OffSeq threat API…", cli.quiet);
-    let severity = cli.severity.map(|s| s.as_api());
-
-    let batch = match run_batch(&client, &entries, 100, severity, None, None) {
-        Ok(r) => r,
-        Err(ThreatError::RateLimitExceeded(_)) => {
-            if let Some(pb) = lookup_pb { pb.finish_and_clear(); }
-            auth::prompt_upgrade();
-            return ExitCode::from(4);
-        }
-        Err(e) => {
-            if let Some(pb) = lookup_pb { pb.finish_and_clear(); }
-            eprintln!("Threat lookup failed: {e}");
-            return ExitCode::from(1);
-        }
-    };
-
-    let system_results = if let Some(ref sys) = system_info {
-        let threat_sys = ThreatSystemInfo {
-            kernel_name: sys.kernel_name.clone(),
-            kernel_version: sys.kernel_version.clone(),
-            distro_name: sys.distro_name.clone(),
-            distro_version: sys.distro_version.clone(),
-        };
-
-        match run_system_lookup(&client, &threat_sys, 100, severity, None, None) {
-            Ok(r) => Some(r),
-            Err(ThreatError::RateLimitExceeded(_)) => {
-                if let Some(pb) = lookup_pb { pb.finish_and_clear(); }
-                auth::prompt_upgrade();
-                return ExitCode::from(4);
-            }
-            Err(e) => {
-                eprintln!("System lookup failed: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    if let Some(pb) = lookup_pb { pb.finish_and_clear(); }
-    if !cli.quiet { print_plan_info(&client.last_rate_limit()); }
-
-    let mut assets: std::collections::BTreeMap<String, find_threats::AssetInfo> =
-        std::collections::BTreeMap::new();
-    for svc in &services {
-        let key = format!("{}@{}", normalize_service_name(strip_instance(&svc.name)), svc.version);
-        let a = assets.entry(key).or_insert_with(|| find_threats::AssetInfo {
-            exe: svc.exe.clone(),
-            version: svc.version.clone(),
-            version_source: svc.source.as_str().to_string(),
-            exposed: false,
-            reachability: Reachability::None.as_str().to_string(),
-            listeners: Vec::new(),
-        });
-        a.exposed |= svc.exposed;
-        if svc.reach.as_str() != a.reachability {
-            // Keep the most-exposed classification across merged services.
-            if reachability_rank(svc.reach.as_str()) > reachability_rank(&a.reachability) {
-                a.reachability = svc.reach.as_str().to_string();
-            }
-        }
-        for l in &svc.listeners {
-            if !a.listeners.contains(l) { a.listeners.push(l.clone()); }
-        }
-    }
-
-    let mut final_results = BatchResults {
-        meta: find_threats::Meta::default(),
-        services: batch.results,
-        by_cve: std::collections::BTreeMap::new(),
-        assets,
-        system:   system_results,
-        errors:   batch.errors,
-    };
-    final_results.compute_cve_groups();
-
-    let output_json = match serde_json::to_string_pretty(&final_results) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("Failed to serialize results: {e}");
-            return ExitCode::from(1);
-        }
-    };
-
-    if let Some(ref sarif_path) = cli.sarif {
-        if let Err(e) = fs::write(sarif_path, sarif::to_sarif(&final_results)) {
-            eprintln!("[!] Couldn't write SARIF to '{}': {e}", sarif_path.display());
-            return ExitCode::from(1);
-        } else if !cli.quiet {
-            println!("SARIF report written to {}", sarif_path.display());
-        }
-    }
-
-    if to_stdout {
-        println!("{output_json}");
-    } else {
-        loop {
-            match fs::write(&threats_path, &output_json) {
-                Ok(_) => break,
-                Err(e) => {
-                    eprintln!("\n[!] Couldn't write to '{}': {e}", threats_path.display());
-                    if !interactive {
-                        return ExitCode::from(1);
-                    }
-                    print!("Enter a new output path: ");
-                    let _ = io::stdout().flush();
-                    let mut new_path = String::new();
-                    if io::stdin().read_line(&mut new_path).unwrap_or(0) == 0 {
-                        return ExitCode::from(1);
-                    }
-                    let new_path = new_path.trim();
-                    threats_path = PathBuf::from(expand_tilde(
-                        if new_path.is_empty() { "/tmp/threats.json" } else { new_path },
-                    ));
-                }
-            }
-        }
-    }
-
-    if !cli.quiet && !to_stdout {
-        let color = !cli.no_color
-            && std::env::var_os("NO_COLOR").is_none()
-            && io::stdout().is_terminal();
-        print_summary(&final_results, color);
-    }
-
-    let total = final_results.total_vulns();
-    let word = if total == 1 { "vulnerability" } else { "vulnerabilities" };
-    if !final_results.errors.is_empty() {
-        eprintln!(
-            "[!] {} service lookup(s) failed; see the \"errors\" map in the output.",
-            final_results.errors.len()
-        );
-    }
-    if to_stdout {
-        eprintln!("Found {total} {word}.");
-    } else if !cli.quiet {
-        println!("\nReport saved to {}", threats_path.display());
-    }
-
-    if let Some(f) = cli.fail_on {
-        if fail_triggered(&final_results, f, cli.severity) {
-            return ExitCode::from(5);
-        }
-    }
-
-    ExitCode::SUCCESS
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cli_parses() {
-        // verify the derive layout is valid
-        use clap::CommandFactory;
-        Cli::command().debug_assert();
-    }
+    use std::path::Path;
+    use std::time::Duration;
 
     #[test]
     fn atom_version_extraction() {
@@ -1707,7 +1148,7 @@ mod tests {
     fn homebrew_version_from_cellar_path() {
         let p = "/opt/homebrew/Cellar/nginx/1.27.0/bin/nginx";
         assert_eq!(homebrew_version(p).as_deref(), Some("1.27.0"));
-        assert_eq!(homebrew_formula(p), None); // formula needs a real canonicalize
+        assert_eq!(homebrew_formula(p), None); // needs a real canonicalize
         assert_eq!(homebrew_version("/usr/sbin/sshd"), None);
     }
 
@@ -1728,7 +1169,6 @@ mod tests {
 
     #[test]
     fn resolve_binary_finds_real_tool_and_rejects_garbage() {
-        // `sh` exists in /bin on every unix
         let sh = resolve_binary("sh").expect("sh should resolve");
         assert!(sh.starts_with('/') && Path::new(&sh).is_file());
         assert_eq!(resolve_binary("definitely-not-a-real-binary-xyz"), None);
@@ -1736,36 +1176,22 @@ mod tests {
 
     #[test]
     fn run_timed_refuses_non_absolute() {
-        // bare name must be refused (PATH-hijack guard), even though `sh` exists
         assert!(run_timed("sh", "--version", Duration::from_secs(1)).is_none());
     }
 
-    // Real integration smoke test for the macOS discovery rewrite. Only meaningful
-    // on macOS; runs actual launchctl/ps so it is #[ignore]d by default (run with
-    // `cargo test -- --ignored`). The old code returned an empty list here.
     #[test]
     #[ignore]
     #[cfg(target_os = "macos")]
     fn macos_discovery_finds_services() {
         let mut found = scan_launchctl(&OsType::MacOs);
-        assert!(
-            !found.is_empty(),
-            "macOS scan should discover at least one running service with a version"
-        );
+        assert!(!found.is_empty(), "macOS scan should discover at least one service");
         for s in &found {
             assert!(s.exe.starts_with('/'), "exe should be absolute: {}", s.exe);
             assert!(!s.version.is_empty(), "version should be non-empty for {}", s.name);
         }
-        // Exercise the exposure-correlation (lsof) path end to end. A typical
-        // macOS host runs at least one listener (e.g. rapportd, mDNSResponder),
-        // so we expect the lsof parser to return at least one endpoint overall.
         enrich_exposure(&mut found);
         let total_listeners: usize = found.iter().map(|s| s.listeners.len()).sum();
-        assert!(
-            total_listeners > 0,
-            "lsof exposure parsing returned no listeners across any service — \
-             the lsof field-output parser is likely broken again"
-        );
+        assert!(total_listeners > 0, "lsof exposure parsing returned no listeners");
         for s in &found {
             for ep in &s.listeners {
                 assert!(ep.contains(':'), "listener endpoint should be host:port: {ep}");
@@ -1781,7 +1207,7 @@ mod tests {
         assert_eq!(endpoint_reachability("203.0.113.5:22"), Public);
         assert_eq!(endpoint_reachability("192.168.1.5:22"), Private);
         assert_eq!(endpoint_reachability("10.0.0.9:5432"), Private);
-        assert_eq!(endpoint_reachability("udp 100.64.0.1:53"), Private); // CGNAT
+        assert_eq!(endpoint_reachability("udp 100.64.0.1:53"), Private);
         assert_eq!(endpoint_reachability("127.0.0.1:8080"), Loopback);
         assert_eq!(endpoint_reachability("[::1]:631"), Loopback);
         assert!(Public > Private && Private > Loopback && Loopback > None);
@@ -1789,9 +1215,7 @@ mod tests {
 
     #[test]
     fn proc_addr_parsing() {
-        // little-endian hex 0100007F = 127.0.0.1, port 0x1F90 = 8080
         assert_eq!(parse_proc_addr("0100007F:1F90", false).as_deref(), Some("127.0.0.1:8080"));
-        // 0.0.0.0:443
         assert_eq!(parse_proc_addr("00000000:01BB", false).as_deref(), Some("0.0.0.0:443"));
     }
 
@@ -1802,8 +1226,7 @@ mod tests {
                    -\t0\tcom.example.stopped\n\
                    42\t0\tcom.apple.something\n\
                    88\t0\torg.postgresql.postgres\n";
-        let got = parse_launchctl_running(out);
-        assert_eq!(got, vec![
+        assert_eq!(parse_launchctl_running(out), vec![
             ("homebrew.mxcl.nginx".to_string(), "653".to_string()),
             ("org.postgresql.postgres".to_string(), "88".to_string()),
         ]);
@@ -1825,40 +1248,167 @@ mod tests {
             "svc:/system/system-log:default".to_string(),
         ]);
     }
+}
+
+// ── Phase 1: full installed-package inventory ────────────────────────────────
+//
+// Enumerate EVERY installed package (not just those backing a running process)
+// so the scanner can match the full Radar catalog. Each list_* shells out once
+// and parses with a pure helper (fixture-tested below).
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledPkg {
+    pub name: String,
+    pub version: String,
+    pub tool: &'static str,
+}
+
+/// Split a package atom like "nginx-1.26.2-r0" / "openssl-3.0.7" into
+/// (name, upstream-version). Names may contain hyphens, so anchor on the first
+/// "-<digit>" run.
+fn atom_split(atom: &str) -> Option<(String, String)> {
+    let caps = ATOM_VER_RE.captures(atom)?;
+    let m = caps.get(0)?;
+    let name = atom[..m.start()].trim().to_string();
+    let ver = caps.get(1)?.as_str().to_string();
+    (!name.is_empty() && !ver.is_empty()).then_some((name, ver))
+}
+
+pub fn parse_dpkg_list(out: &str) -> Vec<(String, String)> {
+    out.lines().filter_map(|l| {
+        let mut c = l.split('\t');
+        let status = c.next()?;
+        let name = c.next()?;
+        let ver = c.next()?;
+        // 2nd status char 'i' = installed/held; drops 'rc' config-only etc.
+        if status.chars().nth(1) != Some('i') || name.is_empty() || ver.is_empty() {
+            return None;
+        }
+        Some((name.to_string(), ver.to_string()))
+    }).collect()
+}
+
+pub fn parse_rpm_list(out: &str) -> Vec<(String, String)> {
+    out.lines().filter_map(|l| {
+        let mut c = l.split('\t');
+        let name = c.next()?;
+        let _epoch = c.next()?;
+        let ver = c.next()?;
+        if name == "gpg-pubkey" || name.is_empty() || ver.is_empty() {
+            return None;
+        }
+        Some((name.to_string(), ver.to_string()))
+    }).collect()
+}
+
+pub fn parse_pacman_list(out: &str) -> Vec<(String, String)> {
+    out.lines().filter_map(|l| {
+        let mut it = l.split_whitespace();
+        Some((it.next()?.to_string(), it.next()?.to_string()))
+    }).collect()
+}
+
+pub fn parse_apk_list(out: &str) -> Vec<(String, String)> {
+    out.lines().filter_map(|l| atom_split(l.trim())).collect()
+}
+
+pub fn parse_brew_list(out: &str) -> Vec<(String, String)> {
+    // "name v1 v2 ..." — one entry per kept version.
+    out.lines().flat_map(|l| {
+        let mut it = l.split_whitespace();
+        let name = match it.next() { Some(n) => n.to_string(), None => return Vec::new() };
+        it.map(|v| (name.clone(), v.to_string())).collect::<Vec<_>>()
+    }).collect()
+}
+
+pub fn parse_pkg_query_list(out: &str) -> Vec<(String, String)> {
+    // FreeBSD `pkg query '%n %v'`
+    out.lines().filter_map(|l| {
+        let mut it = l.split_whitespace();
+        Some((it.next()?.to_string(), it.next()?.to_string()))
+    }).collect()
+}
+
+pub fn parse_pkg_info_list(out: &str) -> Vec<(String, String)> {
+    // OpenBSD/NetBSD `pkg_info` — first token is the PKGNAME atom.
+    out.lines().filter_map(|l| atom_split(l.split_whitespace().next()?)).collect()
+}
+
+fn tagged(tool: &'static str, pairs: Vec<(String, String)>) -> Vec<InstalledPkg> {
+    pairs.into_iter().map(|(name, version)| InstalledPkg { name, version, tool }).collect()
+}
+
+/// Enumerate all installed packages for the host's OS. Empty when no supported
+/// package manager is available (e.g. Solaris IPS — deferred).
+pub fn list_installed(os: &OsType) -> Vec<InstalledPkg> {
+    match os {
+        OsType::Linux(distro) => match distro {
+            LinuxDistro::Debian | LinuxDistro::Ubuntu | LinuxDistro::Kali =>
+                tagged("dpkg", run_cmd("dpkg-query", &["-W", "-f=${db:Status-Abbrev}\t${binary:Package}\t${Version}\t${Architecture}\n"]).map(|o| parse_dpkg_list(&o)).unwrap_or_default()),
+            LinuxDistro::Fedora | LinuxDistro::Rhel | LinuxDistro::CentOs | LinuxDistro::OpenSuse =>
+                tagged("rpm", run_cmd("rpm", &["-qa", "--qf", "%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n"]).map(|o| parse_rpm_list(&o)).unwrap_or_default()),
+            LinuxDistro::Arch =>
+                tagged("pacman", run_cmd("pacman", &["-Q"]).map(|o| parse_pacman_list(&o)).unwrap_or_default()),
+            LinuxDistro::Alpine =>
+                tagged("apk", run_cmd("apk", &["info", "-v"]).map(|o| parse_apk_list(&o)).unwrap_or_default()),
+            _ => Vec::new(),
+        },
+        OsType::MacOs =>
+            tagged("brew", run_cmd("brew", &["list", "--versions"]).map(|o| parse_brew_list(&o)).unwrap_or_default()),
+        OsType::FreeBsd | OsType::DragonFlyBsd =>
+            tagged("pkg", run_cmd("pkg", &["query", "%n %v"]).map(|o| parse_pkg_query_list(&o)).unwrap_or_default()),
+        OsType::OpenBsd =>
+            tagged("pkg_info", run_cmd("pkg_info", &["-q"]).map(|o| parse_pkg_info_list(&o)).unwrap_or_default()),
+        OsType::NetBsd =>
+            tagged("pkg_info", run_cmd("pkg_info", &[]).map(|o| parse_pkg_info_list(&o)).unwrap_or_default()),
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    use super::*;
 
     #[test]
-    fn glob_matching() {
-        assert!(glob_match("nginx", "nginx"));
-        assert!(!glob_match("nginx", "nginx-ui"));
-        assert!(glob_match("*sql*", "postgresql"));
-        assert!(glob_match("postgres*", "postgresql"));
-        assert!(glob_match("*.service", "ssh.service"));
-        assert!(!glob_match("ngin?", "nginx")); // no '?' support, treated literally
-        assert!(name_allowed("nginx", &[], &["sshd".into()]));
-        assert!(!name_allowed("sshd", &[], &["ssh*".into()]));
-        assert!(name_allowed("nginx", &["ngin*".into()], &[]));
-        assert!(!name_allowed("redis", &["ngin*".into()], &[]));
+    fn dpkg_parse() {
+        let out = "ii \topenssl\t3.0.11-1~deb12u2\tamd64\n\
+                   rc \toldpkg\t1.0\tamd64\n\
+                   ii \tnginx\t1.22.1-9\tall\n";
+        assert_eq!(parse_dpkg_list(out), vec![
+            ("openssl".into(), "3.0.11-1~deb12u2".into()),
+            ("nginx".into(), "1.22.1-9".into()),
+        ]);
     }
 
     #[test]
-    fn sarif_is_valid_json_with_runs() {
-        use find_threats::*;
-        let mut services = std::collections::BTreeMap::new();
-        services.insert("nginx@1.24.0".to_string(), vec![
-            serde_json::from_value::<ThreatEntry>(serde_json::json!({
-                "cveId": "CVE-2024-0001", "title": "x", "severity": "high",
-                "kev": true, "references": ["https://e/1"], "matchBasis": "constraint"
-            })).unwrap()
+    fn rpm_parse() {
+        let out = "openssl\t1\t3.0.7\t18.el9\tx86_64\n\
+                   gpg-pubkey\t(none)\tfd431d51\t4ae0493b\t(none)\n\
+                   httpd\t(none)\t2.4.57\t5.el9\tx86_64\n";
+        assert_eq!(parse_rpm_list(out), vec![
+            ("openssl".into(), "3.0.7".into()),
+            ("httpd".into(), "2.4.57".into()),
         ]);
-        let results = BatchResults {
-            meta: Meta::default(), services, by_cve: std::collections::BTreeMap::new(),
-            assets: std::collections::BTreeMap::new(), system: None,
-            errors: std::collections::BTreeMap::new(),
-        };
-        let s = sarif::to_sarif(&results);
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["version"], "2.1.0");
-        assert_eq!(v["runs"][0]["results"][0]["ruleId"], "CVE-2024-0001");
-        assert_eq!(v["runs"][0]["results"][0]["level"], "error");
+    }
+
+    #[test]
+    fn pacman_parse() {
+        assert_eq!(parse_pacman_list("nginx 1.27.0-1\nopenssl 3.3.2-1\n"),
+            vec![("nginx".into(), "1.27.0-1".into()), ("openssl".into(), "3.3.2-1".into())]);
+    }
+
+    #[test]
+    fn apk_and_pkginfo_atoms() {
+        assert_eq!(parse_apk_list("nginx-1.26.2-r0\nmusl-1.2.5-r0\n"),
+            vec![("nginx".into(), "1.26.2".into()), ("musl".into(), "1.2.5".into())]);
+        assert_eq!(parse_pkg_info_list("nginx-1.26.2 web server\nbash-5.2.15nb1 shell\n"),
+            vec![("nginx".into(), "1.26.2".into()), ("bash".into(), "5.2.15nb1".into())]);
+    }
+
+    #[test]
+    fn brew_multi_version() {
+        assert_eq!(parse_brew_list("openssl@3 3.3.1 3.3.2\nnginx 1.27.0\n"),
+            vec![("openssl@3".into(), "3.3.1".into()), ("openssl@3".into(), "3.3.2".into()),
+                 ("nginx".into(), "1.27.0".into())]);
     }
 }

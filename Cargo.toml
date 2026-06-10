@@ -12,9 +12,13 @@ keywords = ["security", "vulnerability", "cve", "scanner", "cli"]
 categories = ["command-line-utilities"]
 publish = false
 
+[lib]
+name = "find_threats"
+path = "src/lib.rs"
+
 [[bin]]
 name = "threat-finder"
-path = "main.rs"
+path = "src/main.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

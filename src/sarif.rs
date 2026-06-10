@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-use crate::find_threats::{severity_rank, BatchResults, ThreatEntry};
+use crate::api::{severity_rank, BatchResults, ThreatEntry};
 
 fn level(sev: Option<&str>) -> &'static str {
     match severity_rank(sev) {
