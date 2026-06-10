@@ -66,3 +66,48 @@ jobs:
             exit 0
           fi
           cargo publish --locked --token "$TOKEN"
+
+  update-homebrew:
+    name: bump homebrew tap
+    needs: binaries  # wait until release assets + checksums exist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bump formula in offseq/homebrew-tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAP_TOKEN:-}" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN secret not set — skipping Homebrew bump."
+            exit 0
+          fi
+          tag="$GITHUB_REF_NAME"; ver="${tag#v}"
+          mkdir -p sums
+          for t in aarch64-apple-darwin x86_64-apple-darwin \
+                   aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+              --pattern "threat-finder-$tag-$t.sha256" --dir sums --clobber
+          done
+          sha() { awk '{print $1}' "sums/threat-finder-$tag-$1.sha256"; }
+          formula="$(sed \
+            -e "s/__VERSION__/$ver/g" \
+            -e "s/__SHA_MAC_ARM__/$(sha aarch64-apple-darwin)/" \
+            -e "s/__SHA_MAC_X86__/$(sha x86_64-apple-darwin)/" \
+            -e "s/__SHA_LIN_ARM__/$(sha aarch64-unknown-linux-gnu)/" \
+            -e "s/__SHA_LIN_X86__/$(sha x86_64-unknown-linux-gnu)/" \
+            packaging/homebrew/threat-finder.rb.tmpl)"
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/offseq/homebrew-tap" tap
+          mkdir -p tap/Formula
+          printf '%s\n' "$formula" > tap/Formula/threat-finder.rb
+          cd tap
+          git config user.name "offseq-bot"
+          git config user.email "noreply@offseq.com"
+          git add Formula/threat-finder.rb
+          if git diff --cached --quiet; then
+            echo "Formula already up to date."
+            exit 0
+          fi
+          git commit -m "threat-finder $ver"
+          git push
