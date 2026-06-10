@@ -16,12 +16,8 @@ use find_threats::{
     ThreatError,
     BatchResults,
     ThreatEntry,
-    run_batch,
-    run_system_lookup,
     print_plan_info,
     severity_rank as sev_rank,
-    ServiceEntry as ThreatServiceEntry,
-    SystemInfo as ThreatSystemInfo,
 };
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,17 +26,6 @@ enum Severity {
     High,
     Medium,
     Low,
-}
-
-impl Severity {
-    fn as_api(self) -> &'static str {
-        match self {
-            Severity::Critical => "critical",
-            Severity::High => "high",
-            Severity::Medium => "medium",
-            Severity::Low => "low",
-        }
-    }
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +65,10 @@ struct Cli {
     /// Only report threats at or above this severity
     #[arg(long, value_enum, value_name = "LEVEL")]
     severity: Option<Severity>,
+
+    /// Only report confirmed matches (ask the API to omit coordinate-unconfirmed)
+    #[arg(long)]
+    strict: bool,
 
     /// Exit non-zero (5) when matching findings exist — for CI gating
     #[arg(long, value_enum, value_name = "WHAT")]
@@ -288,9 +277,20 @@ fn print_summary(results: &BatchResults, color: bool) {
     let exposed_svcs = rows.iter().filter(|r| r.1).count();
     let kev = rows.iter().flat_map(|r| r.2.iter()).filter(|t| t.kev).count();
     println!(
-        "\n{total} finding(s) across {} service(s); {exposed_svcs} exposed, {kev} known-exploited.",
+        "\n{total} confirmed finding(s) across {} asset(s); {exposed_svcs} exposed, {kev} known-exploited.",
         rows.len()
     );
+    let unconfirmed: usize = results.unconfirmed.values().map(|v| v.len()).sum();
+    if unconfirmed > 0 {
+        println!(
+            "{}",
+            paint(
+                &format!("{unconfirmed} coordinate-unconfirmed finding(s) for triage (see \"unconfirmed\" in the report)."),
+                "2",
+                color,
+            )
+        );
+    }
 }
 
 /// Whether the configured --fail-on threshold is met by any finding.
@@ -394,14 +394,12 @@ fn main() -> ExitCode {
         }
     }
 
-    let entries: Vec<ThreatServiceEntry> = assets.iter().map(|a| a.to_service_entry()).collect();
-
     let client = Arc::new(ThreatClient::new(&api_key));
-    let lookup_pb = spinner("Querying the OffSeq threat API…", cli.quiet);
-    let severity = cli.severity.map(|s| s.as_api());
+    let lookup_pb = spinner("Matching coordinates against OffSeq Radar…", cli.quiet);
+    let sev_floor = severity_floor(cli.severity);
 
-    let batch = match run_batch(&client, &entries, 100, severity, None, None) {
-        Ok(r) => r,
+    let outcome = match scan::run_scan(&client, &assets, &os, cli.strict, sev_floor) {
+        Ok(o) => o,
         Err(ThreatError::RateLimitExceeded(_)) => {
             if let Some(pb) = lookup_pb { pb.finish_and_clear(); }
             auth::prompt_upgrade();
@@ -409,33 +407,9 @@ fn main() -> ExitCode {
         }
         Err(e) => {
             if let Some(pb) = lookup_pb { pb.finish_and_clear(); }
-            eprintln!("Threat lookup failed: {e}");
+            eprintln!("Match lookup failed: {e}");
             return ExitCode::from(1);
         }
-    };
-
-    let system_results = if let Some(ref sys) = system_info {
-        let threat_sys = ThreatSystemInfo {
-            kernel_name: sys.kernel_name.clone(),
-            kernel_version: sys.kernel_version.clone(),
-            distro_name: sys.distro_name.clone(),
-            distro_version: sys.distro_version.clone(),
-        };
-
-        match run_system_lookup(&client, &threat_sys, 100, severity, None, None) {
-            Ok(r) => Some(r),
-            Err(ThreatError::RateLimitExceeded(_)) => {
-                if let Some(pb) = lookup_pb { pb.finish_and_clear(); }
-                auth::prompt_upgrade();
-                return ExitCode::from(4);
-            }
-            Err(e) => {
-                eprintln!("System lookup failed: {e}");
-                None
-            }
-        }
-    } else {
-        None
     };
 
     if let Some(pb) = lookup_pb { pb.finish_and_clear(); }
@@ -459,11 +433,12 @@ fn main() -> ExitCode {
 
     let mut final_results = BatchResults {
         meta: find_threats::Meta::default(),
-        services: batch.results,
+        services: outcome.results,
         by_cve: std::collections::BTreeMap::new(),
+        unconfirmed: outcome.unconfirmed,
         assets: asset_map,
-        system:   system_results,
-        errors:   batch.errors,
+        system:   None,
+        errors:   outcome.errors,
     };
     final_results.compute_cve_groups();
 
@@ -577,6 +552,7 @@ mod tests {
         ]);
         let results = BatchResults {
             meta: Meta::default(), services, by_cve: std::collections::BTreeMap::new(),
+            unconfirmed: std::collections::BTreeMap::new(),
             assets: std::collections::BTreeMap::new(), system: None,
             errors: std::collections::BTreeMap::new(),
         };

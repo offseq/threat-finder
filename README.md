@@ -33,6 +33,7 @@ threat-finder [OPTIONS]
 | `--scope <SCOPE>` | `running` (default — live services only) or `all` (+ every installed OS package) |
 | `--severity <LEVEL>` | Only report threats at/above a severity (`critical\|high\|medium\|low`) |
 | `--fail-on <WHAT>` | Exit `5` if matching findings exist: `any\|critical\|high\|medium\|low\|kev\|exposed` (CI gating) |
+| `--strict` | Only report confirmed matches (ask the API to omit coordinate-unconfirmed) |
 | `--sarif <PATH>` | Also write a SARIF 2.1.0 report (for code-scanning UIs) |
 | `--include <GLOB>` / `--exclude <GLOB>` | Filter scanned services by name glob (repeatable) |
 | `-q, --quiet` | Suppress the banner, progress, and summary |
@@ -65,6 +66,25 @@ OFFSEQ_API_KEY=… threat-finder --yes --json --severity high > report.json
 # Fail the build only when a network-exposed service has a known-exploited CVE
 OFFSEQ_API_KEY=… threat-finder --yes --quiet --fail-on exposed
 ```
+
+## How matching works
+
+Each discovered asset is turned into a **Package-URL (purl)** carrying its *full*
+version — epoch and distro revision included — plus a `?distro=` qualifier, e.g.
+`pkg:deb/ubuntu/openssl@1.1.1f-1ubuntu2.16?distro=focal`. The whole host
+inventory is sent in batched `POST /match/batch` calls (one request per
+tier-sized chunk) and matched **server-side with ecosystem-native version rules**
+(dpkg/rpm/apk/semver). This means a backported-and-fixed build such as
+`1.18.0-6+deb11u3` is correctly **not** flagged — there is no client-side version
+guessing anymore.
+
+Results are split by the API's `confirmed` flag: confirmed matches (the target
+version is inside an affected range) are the reported findings; coordinate
+matches whose version can't be confirmed are surfaced separately as
+**unconfirmed / triage** (kept out of the count, `byCve`, and `--fail-on`). Use
+`--strict` to drop the unconfirmed set entirely. Assets with no buildable
+coordinate (currently the BSDs) fall back to a name `?search=` and are reported
+as unconfirmed.
 
 ## What makes it different: network-exposure correlation
 
@@ -119,17 +139,18 @@ lookup, and probing hundreds of them is pointless and slow.
 
 JSON with:
 
-- `services` — `name@version` → array of findings (each with `severity`, `kev`,
-  `epss`, `cvssScore`/`cvssVector`, `references`, and `matchBasis` showing whether
-  the match was a structured constraint or a free-text fallback), sorted
-  highest-risk-first.
+- `services` — `name@version` → array of **confirmed** findings (each with
+  `severity`, `kev`, `epss`, `cvssScore`, `references`, `confirmed`,
+  `matchedRange`, and `matchBasis` = `coordinate` / `cpe` / `search-fallback`),
+  sorted highest-risk-first.
+- `unconfirmed` — `name@version` → coordinate matches whose version couldn't be
+  confirmed (triage), kept out of the primary count.
 - `assets` — `name@version` → `{ exe, versionSource, exposed, reachability, listeners }`,
   where `versionSource` is `package-db` (authoritative) or `probe` (heuristic) and
   `reachability` is `loopback` / `private` / `public` (TCP **and** UDP listeners).
-- `byCve` — each CVE rolled up across every service it affects (the "patch once,
-  fix many" remediation view).
-- `system` — optional kernel/distro findings.
-- `errors` — per-service lookup failures, so a failed lookup is never silently
+- `byCve` — each CVE rolled up across every confirmed-affected asset (the "patch
+  once, fix many" remediation view).
+- `errors` — per-asset lookup failures, so a failed lookup is never silently
   reported as "no vulnerabilities".
 - `meta` — `{ tool, version, schemaVersion }`.
 

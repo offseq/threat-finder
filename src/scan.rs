@@ -7,10 +7,15 @@
 //! so the "what's actually running and reachable" signal survives the wider
 //! inventory.
 
-use crate::api::ServiceEntry;
+use std::collections::BTreeMap;
+
+use crate::api::{
+    match_to_entry, search_to_entry, severity_rank, BatchOutcome, MatchQuery, ThreatClient,
+    ThreatEntry, ThreatError,
+};
 use crate::engine::{
-    enrich_exposure, list_installed, normalize_service_name, scan_services, strip_instance,
-    OsType, Reachability, ServiceInfo, VersionSource,
+    enrich_exposure, list_installed, normalize_service_name, os_release_field, scan_services,
+    strip_instance, LinuxDistro, OsType, Reachability, ServiceInfo, VersionSource,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -90,10 +95,6 @@ impl Asset {
     /// Stable map key shared with `run_batch` results: normalized-name@version.
     pub fn report_key(&self) -> String {
         format!("{}@{}", self.lookup_key(), self.version)
-    }
-
-    pub fn to_service_entry(&self) -> ServiceEntry {
-        ServiceEntry { name: self.lookup_key(), version: self.version.clone() }
     }
 
     /// "package-db" if any source is authoritative, else "probe".
@@ -227,6 +228,162 @@ fn merge_into(dst: &mut Asset, src: Asset) {
     }
 }
 
+// ── Coordinate (purl) construction ───────────────────────────────────────────
+
+/// Percent-encode a purl component value (RFC3986-ish). Keeps `.`/`-`/`~`/`:`/`_`
+/// literal (they appear in deb/rpm versions); encodes the reserved characters
+/// that would otherwise break the purl/qualifier grammar.
+fn pct(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '+' => o.push_str("%2B"),
+            '@' => o.push_str("%40"),
+            ' ' => o.push_str("%20"),
+            '?' => o.push_str("%3F"),
+            '#' => o.push_str("%23"),
+            '%' => o.push_str("%25"),
+            _ => o.push(c),
+        }
+    }
+    o
+}
+
+fn deb_namespace(d: &LinuxDistro) -> &'static str {
+    match d {
+        LinuxDistro::Ubuntu => "ubuntu",
+        LinuxDistro::Kali => "kali",
+        _ => "debian",
+    }
+}
+
+fn rpm_namespace(d: &LinuxDistro) -> &'static str {
+    match d {
+        LinuxDistro::Fedora => "fedora",
+        LinuxDistro::OpenSuse => "opensuse",
+        LinuxDistro::CentOs => "centos",
+        _ => "redhat",
+    }
+}
+
+/// Build a Package-URL for an asset, keeping the FULL version (epoch/revision)
+/// and adding `?distro=` so Radar compares with the native package rules
+/// (a backported-and-fixed build is then correctly NOT flagged). Returns None
+/// for ecosystems with no reliable purl type (BSD/generic) — caller falls back.
+pub fn build_purl(a: &Asset, os: &OsType) -> Option<String> {
+    let ver = pct(&a.version);
+    match a.ecosystem {
+        Ecosystem::Deb => {
+            let ns = match os {
+                OsType::Linux(d) => deb_namespace(d),
+                _ => "debian",
+            };
+            let mut p = format!("pkg:deb/{ns}/{}@{ver}", pct(&a.name.to_lowercase()));
+            if let Some(c) = os_release_field("VERSION_CODENAME") {
+                p.push_str(&format!("?distro={}", pct(&c)));
+            }
+            Some(p)
+        }
+        Ecosystem::Rpm => {
+            // rpm names are case-sensitive — do NOT lowercase.
+            let ns = match os {
+                OsType::Linux(d) => rpm_namespace(d),
+                _ => "redhat",
+            };
+            let mut p = format!("pkg:rpm/{ns}/{}@{ver}", pct(&a.name));
+            if let Some(rel) = os_release_field("VERSION_ID") {
+                p.push_str(&format!("?distro={ns}-{}", pct(&rel)));
+            }
+            Some(p)
+        }
+        Ecosystem::Alpine => {
+            let mut p = format!("pkg:apk/alpine/{}@{ver}", pct(&a.name.to_lowercase()));
+            if let Some(vid) = os_release_field("VERSION_ID") {
+                let mm: Vec<&str> = vid.split('.').take(2).collect();
+                p.push_str(&format!("?distro=v{}", mm.join(".")));
+            }
+            Some(p)
+        }
+        Ecosystem::Arch => Some(format!("pkg:pacman/arch/{}@{ver}", pct(&a.name.to_lowercase()))),
+        Ecosystem::Homebrew => Some(format!("pkg:brew/{}@{ver}", pct(&a.name))),
+        _ => None, // BSD / Generic → search fallback
+    }
+}
+
+fn to_match_query(a: &Asset, os: &OsType) -> Option<MatchQuery> {
+    build_purl(a, os).map(MatchQuery::purl)
+}
+
+/// Match a host inventory against Radar by exact coordinate (purl) in batched
+/// POSTs, falling back to `?search=` for assets with no buildable coordinate.
+/// Confirmed matches go to `results`; coordinate-unconfirmed to `unconfirmed`.
+pub fn run_scan(
+    client: &ThreatClient,
+    assets: &[Asset],
+    os: &OsType,
+    strict: bool,
+    severity_floor: u8,
+) -> Result<BatchOutcome, ThreatError> {
+    let mut queries: Vec<MatchQuery> = Vec::new();
+    let mut query_keys: Vec<String> = Vec::new();
+    let mut fallback: BTreeMap<String, Vec<String>> = BTreeMap::new(); // search-name -> report_keys
+
+    for a in assets {
+        match to_match_query(a, os) {
+            Some(q) => {
+                queries.push(q);
+                query_keys.push(a.report_key());
+            }
+            None => fallback.entry(a.lookup_key()).or_default().push(a.report_key()),
+        }
+    }
+
+    let mut results: BTreeMap<String, Vec<ThreatEntry>> = BTreeMap::new();
+    let mut unconfirmed: BTreeMap<String, Vec<ThreatEntry>> = BTreeMap::new();
+    let mut errors: BTreeMap<String, String> = BTreeMap::new();
+
+    let keep = |e: &ThreatEntry| severity_rank(e.severity.as_deref()) >= severity_floor;
+
+    if !queries.is_empty() {
+        let matched = client.match_batch(&queries, strict)?;
+        for (key, result) in query_keys.iter().zip(matched) {
+            for hit in result.matches {
+                let entry = match_to_entry(hit);
+                if !keep(&entry) {
+                    continue;
+                }
+                let bucket = if entry.confirmed { &mut results } else { &mut unconfirmed };
+                bucket.entry(key.clone()).or_default().push(entry);
+            }
+        }
+    }
+
+    // One ?search= per unique name; apply to every asset key sharing it.
+    for (name, keys) in fallback {
+        match client.search_threats(&name, 100) {
+            Ok(threats) => {
+                let entries: Vec<ThreatEntry> =
+                    threats.iter().map(search_to_entry).filter(|e| keep(e)).collect();
+                for key in keys {
+                    if !entries.is_empty() {
+                        unconfirmed.entry(key).or_default().extend(entries.iter().cloned());
+                    }
+                }
+            }
+            Err(ThreatError::RateLimitExceeded(m)) => return Err(ThreatError::RateLimitExceeded(m)),
+            Err(e) => {
+                errors.insert(name, e.to_string());
+            }
+        }
+    }
+
+    for v in results.values_mut().chain(unconfirmed.values_mut()) {
+        v.sort_by_key(|e| std::cmp::Reverse(e.risk_key()));
+    }
+
+    Ok(BatchOutcome { results, unconfirmed, errors })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,7 +398,6 @@ mod tests {
         let a = pkg_asset("ssh", "9.6");
         assert_eq!(a.lookup_key(), "openssh");
         assert_eq!(a.report_key(), "openssh@9.6");
-        assert_eq!(a.to_service_entry().name, "openssh");
     }
 
     #[test]
@@ -259,5 +415,49 @@ mod tests {
         assert!(a.runtime.as_ref().unwrap().exposed, "runtime/exposure preserved");
         assert!(a.sources.contains(&Source::PackageDb) && a.sources.contains(&Source::Probe));
         assert_eq!(a.version_source_label(), "package-db");
+    }
+
+    fn linux(d: LinuxDistro) -> OsType { OsType::Linux(d) }
+    fn asset_eco(eco: Ecosystem, name: &str, ver: &str) -> Asset {
+        Asset { ecosystem: eco, name: name.into(), version: ver.into(),
+            sources: vec![Source::PackageDb], locations: vec![], runtime: None }
+    }
+
+    #[test]
+    fn purl_deb_keeps_full_version() {
+        let a = asset_eco(Ecosystem::Deb, "OpenSSL", "1.1.1f-1ubuntu2.16");
+        let p = build_purl(&a, &linux(LinuxDistro::Ubuntu)).unwrap();
+        assert!(p.starts_with("pkg:deb/ubuntu/openssl@1.1.1f-1ubuntu2.16"), "{p}");
+    }
+
+    #[test]
+    fn purl_deb_encodes_plus() {
+        let a = asset_eco(Ecosystem::Deb, "nginx", "1.18.0-6+deb11u3");
+        let p = build_purl(&a, &linux(LinuxDistro::Debian)).unwrap();
+        assert!(p.starts_with("pkg:deb/debian/nginx@1.18.0-6%2Bdeb11u3"), "{p}");
+    }
+
+    #[test]
+    fn purl_rpm_case_and_evr() {
+        let a = asset_eco(Ecosystem::Rpm, "NetworkManager", "1:1.42.2-1.el9");
+        let p = build_purl(&a, &linux(LinuxDistro::Rhel)).unwrap();
+        assert!(p.starts_with("pkg:rpm/redhat/NetworkManager@1:1.42.2-1.el9"), "{p}");
+    }
+
+    #[test]
+    fn purl_apk_arch_brew_and_bsd() {
+        assert!(build_purl(&asset_eco(Ecosystem::Alpine, "musl", "1.2.5-r0"), &linux(LinuxDistro::Alpine))
+            .unwrap().starts_with("pkg:apk/alpine/musl@1.2.5-r0"));
+        assert!(build_purl(&asset_eco(Ecosystem::Arch, "nginx", "1.27.0-1"), &linux(LinuxDistro::Arch))
+            .unwrap().starts_with("pkg:pacman/arch/nginx@1.27.0-1"));
+        assert_eq!(build_purl(&asset_eco(Ecosystem::Homebrew, "openssl@3", "3.3.2"), &OsType::MacOs)
+            .unwrap(), "pkg:brew/openssl%403@3.3.2");
+        assert_eq!(build_purl(&asset_eco(Ecosystem::FreeBsdPkg, "nginx", "1.27.0"), &OsType::FreeBsd), None);
+    }
+
+    #[test]
+    fn pct_encoding() {
+        assert_eq!(pct("a+b@c d"), "a%2Bb%40c%20d");
+        assert_eq!(pct("1.2.3-4ubuntu5"), "1.2.3-4ubuntu5");
     }
 }

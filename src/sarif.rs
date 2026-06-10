@@ -52,6 +52,7 @@ fn push_entry(rules: &mut BTreeMap<String, Value>, results: &mut Vec<Value>, ass
         "properties": {
             "kev": t.kev,
             "epss": t.epss,
+            "confirmed": t.confirmed,
             "matchBasis": t.match_basis,
         }
     }));

@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **Migrated to Radar exact-coordinate matching** (`POST /match/batch`). Each
+  asset becomes a Package-URL with its full version + `?distro=` and the whole
+  inventory is matched server-side with ecosystem-native version rules, in one
+  request per tier-sized chunk (replacing per-service free-text search). Removed
+  the client-side version-constraint engine and the hard-coded nginx blocklist.
+  Backported-and-fixed builds are no longer false-flagged.
+- Findings now split into `confirmed` (reported) and `unconfirmed` (triage,
+  excluded from the count / `byCve` / `--fail-on`); added `--strict`. `?search=`
+  is retained only as a fallback for assets with no buildable coordinate.
+
 ### Added
 - Split into a reusable library crate (`find_threats`) + thin binary, with a
   generic `Asset`/`Collector` abstraction (running-services is now a collector).

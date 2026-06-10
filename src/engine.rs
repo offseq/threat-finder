@@ -1270,8 +1270,24 @@ fn atom_split(atom: &str) -> Option<(String, String)> {
     let caps = ATOM_VER_RE.captures(atom)?;
     let m = caps.get(0)?;
     let name = atom[..m.start()].trim().to_string();
-    let ver = caps.get(1)?.as_str().to_string();
+    // Keep the FULL version (incl. -rN / nbN / patchlevel) — the match API needs
+    // it for ecosystem-native comparison; the upstream-only capture is lossy.
+    let ver = atom[m.start() + 1..].trim().to_string();
     (!name.is_empty() && !ver.is_empty()).then_some((name, ver))
+}
+
+/// Read a single field from /etc/os-release (e.g. VERSION_CODENAME, VERSION_ID).
+pub fn os_release_field(key: &str) -> Option<String> {
+    let content = std::fs::read_to_string("/etc/os-release").ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix(key).and_then(|r| r.strip_prefix('=')) {
+            let v = rest.trim().trim_matches('"').to_string();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 pub fn parse_dpkg_list(out: &str) -> Vec<(String, String)> {
@@ -1292,12 +1308,24 @@ pub fn parse_rpm_list(out: &str) -> Vec<(String, String)> {
     out.lines().filter_map(|l| {
         let mut c = l.split('\t');
         let name = c.next()?;
-        let _epoch = c.next()?;
-        let ver = c.next()?;
-        if name == "gpg-pubkey" || name.is_empty() || ver.is_empty() {
+        let epoch = c.next()?;
+        let version = c.next()?;
+        let release = c.next().unwrap_or("");
+        if name == "gpg-pubkey" || name.is_empty() || version.is_empty() {
             return None;
         }
-        Some((name.to_string(), ver.to_string()))
+        // Full EVR so Radar can compare with rpm rules: [epoch:]version-release.
+        let mut evr = String::new();
+        if !epoch.is_empty() && epoch != "(none)" {
+            evr.push_str(epoch);
+            evr.push(':');
+        }
+        evr.push_str(version);
+        if !release.is_empty() {
+            evr.push('-');
+            evr.push_str(release);
+        }
+        Some((name.to_string(), evr))
     }).collect()
 }
 
@@ -1386,8 +1414,8 @@ mod inventory_tests {
                    gpg-pubkey\t(none)\tfd431d51\t4ae0493b\t(none)\n\
                    httpd\t(none)\t2.4.57\t5.el9\tx86_64\n";
         assert_eq!(parse_rpm_list(out), vec![
-            ("openssl".into(), "3.0.7".into()),
-            ("httpd".into(), "2.4.57".into()),
+            ("openssl".into(), "1:3.0.7-18.el9".into()),
+            ("httpd".into(), "2.4.57-5.el9".into()),
         ]);
     }
 
@@ -1400,7 +1428,7 @@ mod inventory_tests {
     #[test]
     fn apk_and_pkginfo_atoms() {
         assert_eq!(parse_apk_list("nginx-1.26.2-r0\nmusl-1.2.5-r0\n"),
-            vec![("nginx".into(), "1.26.2".into()), ("musl".into(), "1.2.5".into())]);
+            vec![("nginx".into(), "1.26.2-r0".into()), ("musl".into(), "1.2.5-r0".into())]);
         assert_eq!(parse_pkg_info_list("nginx-1.26.2 web server\nbash-5.2.15nb1 shell\n"),
             vec![("nginx".into(), "1.26.2".into()), ("bash".into(), "5.2.15nb1".into())]);
     }
