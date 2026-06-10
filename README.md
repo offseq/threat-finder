@@ -18,9 +18,10 @@ ecosystem-native version rules, so backported/fixed builds aren't false-flagged.
 Vulnerability summary (highest risk first):
 
   openssh-server@1:8.9p1-3ubuntu0.6 — 1 finding(s)  [PUBLIC tcp 0.0.0.0:22]
-      HIGH  CVE-2024-6387  [KEV]  regreSSHion: remote code execution in OpenSSH
+      [ACT-NOW 92]  HIGH  CVE-2024-6387  [KEV]  regreSSHion: remote code execution in OpenSSH
+                          → fix: 1:8.9p1-3ubuntu0.10   https://radar.offseq.com/threat/…
   nginx@1.18.0-6ubuntu14.4 — 1 finding(s)
-      MED   CVE-2023-44487        HTTP/2 Rapid Reset
+      [SCHEDULE 41] MED   CVE-2023-44487        HTTP/2 Rapid Reset
 
 2 confirmed finding(s) across 2 asset(s); 1 exposed, 1 known-exploited.
 ```
@@ -69,6 +70,10 @@ threat-finder [OPTIONS]
 | `--no-color` | Disable ANSI colors |
 | `-y, --yes` | Assume defaults, never prompt (CI/cron) |
 | `--reset` | Re-enter the API key, ignoring the saved one |
+| `--register` | Register the scanned host with Radar for continuous monitoring (no prompt) |
+| `--no-register` | Don't register or prompt for monitoring this run |
+| `--host-name <NAME>` | Friendly hostname to send with a registration |
+| `--unregister` | Remove this host's inventory from Radar and exit |
 | `-h, --help` / `-V, --version` | Help / version |
 
 ```sh
@@ -112,7 +117,40 @@ tool maps each running service's process to the sockets it is **listening** on
 `loopback` / `private` / `public`. A vulnerable service on `0.0.0.0` is a very
 different risk from one on `127.0.0.1`: findings rank exposed-first and
 `--fail-on exposed` gates CI on exactly that. No packets are sent. Findings also
-carry CISA **KEV** and **EPSS**, used in the deterministic risk ranking.
+carry CISA **KEV** and **EPSS**.
+
+**Exposure-aware prioritization.** Every finding gets a `riskScore` (0–100) and an
+SSVC-style `decision` band — **`act-now` · `soon` · `schedule` · `track`** — fused
+from severity, EPSS, KEV, and the owning asset's **network exposure**. The summary
+leads each line with a `[ACT-NOW 92]`-style badge and sorts by it, so the handful
+of public-facing, known-exploited issues float to the top of a noisy host. The
+score is computed the same way locally and server-side, and appears in `--json`
+and SARIF (`properties`).
+
+## Continuous monitoring
+
+A one-off scan is a point in time. Register a host once and Radar keeps watching:
+when a **newly-published CVE** affects one of its coordinates, you get an alert
+(email + Console), prioritized by exposure — no re-scan needed.
+
+After an interactive scan, the tool asks:
+
+```text
+Add these 42 services to Radar for continuous monitoring & alerts? [Y/n/never]
+```
+
+`Y` registers this host; `n` skips this run; `never` remembers your choice (it's
+saved to the config and you won't be asked again). On a re-scan it also reports
+**drift** (`+added / -removed / ~changed`) and any findings **new since your last
+scan**. Manage your hosts — toggle monitoring, view findings, deregister — under
+**Inventory** in the [Radar Console](https://radar.offseq.com/console).
+
+For automation, skip the prompt: `--register` registers non-interactively (off by
+default in CI), `--no-register` opts out, `--host-name <NAME>` labels the host, and
+`--unregister` removes it. A stable per-host id and your prompt preference live in
+`$XDG_CONFIG_HOME/offseq-rust/config.toml`. Registration never changes the exit
+code — a monitoring hiccup won't fail your scan. Requires a Basic/Pro/Enterprise
+plan (or Pro Console).
 
 ## Scope & coverage
 
@@ -126,7 +164,8 @@ coordinate). The kernel is covered as its package (`linux-image…`) under
 
 > `--scope all` can yield hundreds–thousands of packages. On the free tier
 > (15 lookups/hour) this will rate-limit; the tool warns when the inventory
-> exceeds the budget. Bulk lookups and a local cache are on the roadmap.
+> exceeds the budget. (Lookups are already batched; a local result cache is on
+> the roadmap.)
 
 ## Per-OS support
 
@@ -150,14 +189,17 @@ version, and probing hundreds of them is pointless.
 JSON, with deterministic (sorted) keys and no timestamp, so reports diff cleanly:
 
 - **`services`** — `pkg@version` → confirmed findings (`cveId`, `severity`,
-  `cvssScore`, `epss`, `kev`, `confirmed`, `matchedRange`, `matchBasis`,
-  `references`), highest-risk first.
+  `cvssScore`, `epss`, `kev`, `riskScore`, `decision`, `confirmed`, `matchedRange`,
+  `matchBasis`, `fixedVersions`, `remediation`, `cwes`, `references`, `radarUrl`),
+  highest-risk first.
 - **`unconfirmed`** — coordinate matches whose version couldn't be confirmed (triage).
 - **`assets`** — `pkg@version` → `{ exe, versionSource, exposed, reachability, listeners }`
   (`versionSource` = `package-db` | `probe`; `reachability` covers TCP **and** UDP).
 - **`byCve`** — each CVE rolled up across every affected asset ("patch once, fix many").
 - **`errors`** — per-asset lookup failures, so a failure never reads as "clean".
-- **`meta`** — `{ tool, version, schemaVersion }`.
+- **`registration`** — present when the run registered the host: `host_id`,
+  `monitoring`, `drift`, `summary`, `newSinceLastCount`.
+- **`meta`** — `{ tool, version, schemaVersion }` (`schemaVersion` 2).
 
 A SARIF 2.1.0 report (`--sarif`) is also available for code-scanning UIs.
 
