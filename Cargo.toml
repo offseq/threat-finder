@@ -1,6 +1,6 @@
 [package]
 name = "threat-finder"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 rust-version = "1.87"
 description = "Runtime vulnerability scanner: finds CVEs in the services and packages actually present on a host and flags which are network-exposed"

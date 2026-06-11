@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7]
+
+### Fixed
+- **Registration report JSON now uses `hostId` (camelCase) instead of
+  `host_id`.** Every sibling field in the report (`assetCount`,
+  `newSinceLastCount`, …) and the Radar API already use camelCase, so the lone
+  snake_case `host_id` broke any consumer keying the report by `hostId`. If you
+  parse the `--json` report's `registration.hostId`, it is now present.
+
+### Changed
+- Listener discovery streams `/proc/net/{tcp,tcp6,udp,udp6}` line-by-line via a
+  buffered reader instead of reading each table fully into memory, bounding peak
+  memory on hosts with very large connection tables.
+
 ## [0.1.6]
 
 ### Changed

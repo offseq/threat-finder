@@ -3,7 +3,7 @@
 //! network-exposure correlation. Pure host interaction — no API types.
 
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -704,10 +704,15 @@ pub fn linux_listeners(pid: u32) -> Vec<String> {
     }
     let mut out = Vec::new();
 
+    // Stream each /proc/net table line-by-line (BufReader) rather than slurping
+    // the whole file — peak memory is one line, not the full table, which can be
+    // large on hosts with many connections.
+
     // TCP: state 0A = LISTEN.
     for (path, v6) in [("/proc/net/tcp", false), ("/proc/net/tcp6", true)] {
-        let Ok(content) = fs::read_to_string(path) else { continue };
-        for line in content.lines().skip(1) {
+        let Ok(file) = fs::File::open(path) else { continue };
+        for line in BufReader::new(file).lines().skip(1) {
+            let Ok(line) = line else { continue };
             let cols: Vec<&str> = line.split_whitespace().collect();
             if cols.len() < 10 || cols[3] != "0A" {
                 continue;
@@ -722,8 +727,9 @@ pub fn linux_listeners(pid: u32) -> Vec<String> {
 
     // UDP: a bound listener has no remote peer (remote port == 0).
     for (path, v6) in [("/proc/net/udp", false), ("/proc/net/udp6", true)] {
-        let Ok(content) = fs::read_to_string(path) else { continue };
-        for line in content.lines().skip(1) {
+        let Ok(file) = fs::File::open(path) else { continue };
+        for line in BufReader::new(file).lines().skip(1) {
+            let Ok(line) = line else { continue };
             let cols: Vec<&str> = line.split_whitespace().collect();
             if cols.len() < 10 || !cols[2].ends_with(":0000") {
                 continue;

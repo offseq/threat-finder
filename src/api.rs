@@ -365,7 +365,9 @@ pub struct CveGroup {
 /// the drift + summary surfaced in the `registration` field of the report.
 #[derive(Debug, Clone, Serialize)]
 pub struct RegistrationReport {
-    #[serde(rename = "host_id")]
+    // camelCase to match the sibling fields (assetCount/newSinceLastCount) and
+    // the Radar contract — the rest of the JSON report is camelCase.
+    #[serde(rename = "hostId")]
     pub host_id: String,
     pub monitoring: bool,
     #[serde(rename = "assetCount")]
@@ -1594,7 +1596,7 @@ mod tests {
         };
         let report = RegistrationReport::from(&resp);
         let v = serde_json::to_value(&report).unwrap();
-        assert_eq!(v["host_id"], json!("abc"));
+        assert_eq!(v["hostId"], json!("abc"));
         assert_eq!(v["monitoring"], json!(true));
         assert_eq!(v["assetCount"], json!(10));
         assert_eq!(v["newSinceLastCount"], json!(2));
