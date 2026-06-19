@@ -1296,6 +1296,7 @@ pub fn scan_services(os: &OsType) -> Vec<ServiceInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::path::Path;
     use std::time::Duration;
 
