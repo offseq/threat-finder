@@ -43,6 +43,11 @@ const DEFAULT_PROMPT_MODE: &str = "ask";
 /// non-interactively in CI/cron without a config file.
 const ENV_KEY: &str = "OFFSEQ_API_KEY";
 
+/// Overrides the base directory for the config file. Useful for CI/containers
+/// (and tests) that need a deterministic, isolated config location independent
+/// of the OS's per-user directory resolution.
+const CONFIG_DIR_ENV: &str = "OFFSEQ_CONFIG_DIR";
+
 /// Resolve an API key from, in order: the OFFSEQ_API_KEY env var, the saved
 /// config (unless `reset`), then interactive setup (only if `interactive`).
 /// Returns None when no key can be obtained without prompting.
@@ -71,7 +76,12 @@ pub fn resolve_api_key(reset: bool, interactive: bool) -> Option<String> {
 }
 
 fn config_path() -> PathBuf {
-    let base = dirs::config_dir()
+    // An explicit override wins, so the config location is deterministic
+    // regardless of platform directory resolution (env-honoring vs. OS Known
+    // Folders API). Falls back to the per-user config dir.
+    let base = std::env::var_os(CONFIG_DIR_ENV)
+        .map(PathBuf::from)
+        .or_else(dirs::config_dir)
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("offseq-rust").join("config.toml")
 }
@@ -323,40 +333,27 @@ mod tests {
 
     struct TempConfigHome {
         dir: PathBuf,
-        prev_xdg: Option<std::ffi::OsString>,
-        prev_home: Option<std::ffi::OsString>,
-        prev_appdata: Option<std::ffi::OsString>,
+        prev: Option<std::ffi::OsString>,
     }
 
     impl TempConfigHome {
         fn new() -> Self {
             let dir = std::env::temp_dir().join(format!("tf-test-{}", uuid::Uuid::new_v4()));
             fs::create_dir_all(&dir).unwrap();
-            let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
-            let prev_home = std::env::var_os("HOME");
-            let prev_appdata = std::env::var_os("APPDATA");
-            // dirs::config_dir() uses XDG_CONFIG_HOME on Linux, $HOME on macOS,
-            // and %APPDATA% on Windows — redirect all three so the test is hermetic.
-            std::env::set_var("XDG_CONFIG_HOME", &dir);
-            std::env::set_var("HOME", &dir);
-            std::env::set_var("APPDATA", &dir);
-            TempConfigHome { dir, prev_xdg, prev_home, prev_appdata }
+            // The explicit override makes config_path() deterministic on every
+            // platform (dirs 6 reads the Windows Known Folders API directly, so
+            // redirecting %APPDATA% no longer works there).
+            let prev = std::env::var_os(CONFIG_DIR_ENV);
+            std::env::set_var(CONFIG_DIR_ENV, &dir);
+            TempConfigHome { dir, prev }
         }
     }
 
     impl Drop for TempConfigHome {
         fn drop(&mut self) {
-            match &self.prev_xdg {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-            match &self.prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match &self.prev_appdata {
-                Some(v) => std::env::set_var("APPDATA", v),
-                None => std::env::remove_var("APPDATA"),
+            match &self.prev {
+                Some(v) => std::env::set_var(CONFIG_DIR_ENV, v),
+                None => std::env::remove_var(CONFIG_DIR_ENV),
             }
             let _ = fs::remove_dir_all(&self.dir);
         }

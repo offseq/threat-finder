@@ -36,18 +36,17 @@ path = "src/main.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
-dirs = "5"
-once_cell = "1"
+toml = "1"
+dirs = "6"
 rayon = "1"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 clap = { version = "4", features = ["derive"] }
-indicatif = "0.17"
+indicatif = "0.18"
 rpassword = "7"
 uuid = { version = "1", features = ["v4"] }
 
 # systemd discovery is Linux-only; D-Bus (zbus) doesn't belong on macOS/Windows
 # builds (and its Windows transport deps don't build cleanly), so gate it here.
 [target.'cfg(target_os = "linux")'.dependencies]
-zbus = "4"
+zbus = "5"
