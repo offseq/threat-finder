@@ -43,7 +43,7 @@ rayon = "1"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 clap = { version = "4", features = ["derive"] }
-indicatif = "0.17"
+indicatif = "0.18"
 rpassword = "7"
 uuid = { version = "1", features = ["v4"] }
 
