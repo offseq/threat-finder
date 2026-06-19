@@ -47,6 +47,70 @@ fn run_capture(program: &str, args: &[&str]) -> Option<String> {
     if s.trim().is_empty() { None } else { Some(s) }
 }
 
+/// Run a PowerShell script capturing stdout regardless of exit status. Used when
+/// the wrapped tool (e.g. winget) may return non-zero or needs PowerShell to fix
+/// up its console encoding/width first.
+fn ps_capture(script: &str) -> Option<String> {
+    run_capture(
+        "powershell",
+        &["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+    )
+}
+
+/// Strip ANSI/VT escape sequences and carriage returns that tools like winget
+/// draw even with `--disable-interactivity`.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' {
+            continue;
+        }
+        if c == '\u{1b}' {
+            // CSI: ESC '[' ... final byte in @-~ ; also handle ESC ']' (OSC).
+            if let Some(&next) = chars.peek() {
+                if next == '[' {
+                    chars.next();
+                    for cc in chars.by_ref() {
+                        if ('@'..='~').contains(&cc) {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Reduce a free-text version (e.g. a binary's `ProductVersion`,
+/// `"10.0.19041.1 (WinBuild.160101.0800)"` or `"6,0,0,0"`) to the leading
+/// dotted-numeric token so it forms a usable CPE/coordinate version. Returns the
+/// input trimmed if no numeric prefix is found.
+fn sanitize_version(raw: &str) -> String {
+    let first = raw.split_whitespace().next().unwrap_or("");
+    // Comma-grouped versions ("6,0,0,0") → dots, only when there are no dots.
+    let first = if first.contains(',') && !first.contains('.') {
+        first.replace(',', ".")
+    } else {
+        first.to_string()
+    };
+    // Keep the leading run of version-ish characters.
+    let v: String = first
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '_' || c.is_ascii_alphabetic())
+        .collect();
+    let v = v.trim_matches(|c: char| c == '.' || c == '-' || c == '_');
+    if v.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        v.to_string()
+    } else {
+        first.trim().to_string()
+    }
+}
+
 /// Parse a PowerShell `ConvertTo-Json` payload that is an array of `T` — but
 /// tolerate the 5.1 quirk where a single element is emitted as a bare object.
 fn parse_json_array<T: DeserializeOwned>(s: &str) -> Vec<T> {
@@ -85,7 +149,8 @@ $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 [pscustomobject]@{
   ProductName=$cv.ProductName; DisplayVersion=$cv.DisplayVersion; ReleaseId=$cv.ReleaseId
   CurrentBuild=$cv.CurrentBuild; UBR=$cv.UBR; EditionID=$cv.EditionID
-  InstallationType=$cv.InstallationType; Arch=$env:PROCESSOR_ARCHITECTURE
+  InstallationType=$cv.InstallationType
+  Arch=$(if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE })
 } | ConvertTo-Json -Compress"#;
 
 /// Detect the running Windows identity (registry `CurrentVersion`). On a host
@@ -167,7 +232,7 @@ fn app_asset(eco: Ecosystem, raw_name: &str, version: &str, source_tag: &str) ->
     if name.is_empty() {
         return None;
     }
-    let version = version.trim().to_string();
+    let version = sanitize_version(version);
     let cpe = cpe_for_app(&name, &version);
     Some(Asset {
         ecosystem: eco,
@@ -227,27 +292,39 @@ fn parse_registry_apps(raw: &str) -> Vec<Asset> {
         .collect()
 }
 
+// Run winget through PowerShell so we can force UTF-8 output (winget emits
+// UTF-16/VT noise on a redirected pipe) and a wide buffer (so long names don't
+// truncate the Version column). winget isn't present on Server 2019/2022 by
+// default; absence is fine.
+const WINGET_SCRIPT: &str = r#"$ErrorActionPreference='SilentlyContinue'
+try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}
+winget list --disable-interactivity --accept-source-agreements | Out-String -Width 512"#;
+
 fn winget_apps() -> Vec<Asset> {
-    // winget isn't present on Server 2019/2022 by default; absence is fine.
-    match run_capture("winget", &["list", "--disable-interactivity", "--accept-source-agreements"]) {
+    match ps_capture(WINGET_SCRIPT) {
         Some(out) => parse_winget_list(&out),
         None => Vec::new(),
     }
 }
 
-/// Pure: parse `winget list` fixed-width columns. Detects the `Name`/`Version`
-/// columns from the header so a missing `Available` column doesn't shift fields,
-/// and skips the dashed separator and progress-spinner lines.
+/// Pure: parse `winget list` fixed-width columns. Detects the `Name`/`Id`/
+/// `Version` columns from the header so a missing `Available` column doesn't
+/// shift fields, and skips the dashed separator and progress lines. Column
+/// offsets are measured in **chars** (not bytes) so multibyte names in data rows
+/// stay aligned with the ASCII header.
 fn parse_winget_list(out: &str) -> Vec<Asset> {
-    let mut lines = out.lines().filter(|l| !l.trim().is_empty());
+    let cleaned = strip_ansi(out);
+    let mut lines = cleaned.lines().filter(|l| !l.trim().is_empty());
     // Find the header row (contains both "Name" and "Version").
     let header = match lines.by_ref().find(|l| l.contains("Name") && l.contains("Version")) {
         Some(h) => h,
         None => return Vec::new(),
     };
-    let name_col = header.find("Name");
-    let id_col = header.find("Id");
-    let ver_col = header.find("Version");
+    // Char-index positions (header is ASCII, so this equals visual columns).
+    let char_index_of = |hay: &str, needle: &str| hay.find(needle).map(|b| hay[..b].chars().count());
+    let name_col = char_index_of(header, "Name");
+    let id_col = char_index_of(header, "Id");
+    let ver_col = char_index_of(header, "Version");
     let (Some(name_col), Some(ver_col)) = (name_col, ver_col) else {
         return Vec::new();
     };
@@ -410,8 +487,8 @@ fn parse_npm_list(out: &str) -> Vec<Asset> {
 
 #[derive(Debug, Deserialize)]
 struct PipEntry {
-    name: String,
-    version: String,
+    name: Option<String>,
+    version: Option<String>,
 }
 
 fn pip_packages() -> Vec<Asset> {
@@ -428,7 +505,7 @@ fn pip_packages() -> Vec<Asset> {
 fn parse_pip_list(out: &str) -> Vec<Asset> {
     parse_json_array::<PipEntry>(out)
         .into_iter()
-        .map(|e| lang_asset(Ecosystem::PyPI, &e.name, &e.version))
+        .filter_map(|e| Some(lang_asset(Ecosystem::PyPI, &e.name?, &e.version?)))
         .collect()
 }
 
@@ -477,6 +554,7 @@ fn lang_asset(eco: Ecosystem, name: &str, version: &str) -> Asset {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct WinService {
+    name: Option<String>,
     display: Option<String>,
     exe: Option<String>,
     pid: Option<u32>,
@@ -495,8 +573,8 @@ const SERVICES_SCRIPT: &str = r#"$ErrorActionPreference='SilentlyContinue'
 @(Get-CimInstance Win32_Service -Filter "State='Running'" | ForEach-Object {
   $p=$_.PathName; $exe=$null; $ver=$null
   if ($p) { if ($p -match '^"([^"]+)"') { $exe=$matches[1] } else { $exe=($p -split ' ')[0] } }
-  if ($exe -and (Test-Path $exe)) { try { $ver=(Get-Item $exe).VersionInfo.ProductVersion } catch {} }
-  [pscustomobject]@{ Display=$_.DisplayName; Exe=$exe; Pid=[int]$_.ProcessId; Version=$ver }
+  if ($exe -and (Test-Path $exe)) { try { $vi=(Get-Item $exe).VersionInfo; $ver=$vi.FileVersion; if (-not $ver) { $ver=$vi.ProductVersion } } catch {} }
+  [pscustomobject]@{ Name=$_.Name; Display=$_.DisplayName; Exe=$exe; Pid=[int]$_.ProcessId; Version=$ver }
 }) | ConvertTo-Json -Compress"#;
 
 const LISTENERS_SCRIPT: &str = r#"$ErrorActionPreference='SilentlyContinue'
@@ -508,8 +586,43 @@ fn running_services() -> Vec<Asset> {
     if services.is_empty() {
         return Vec::new();
     }
-    let listeners = ps(LISTENERS_SCRIPT).map(|s| parse_json_array::<WinListener>(&s)).unwrap_or_default();
+    // Get-NetTCPConnection is absent on Server Core / older images; fall back to
+    // `netstat -ano` (always present) so the exposure signal doesn't vanish.
+    let mut listeners = ps(LISTENERS_SCRIPT).map(|s| parse_json_array::<WinListener>(&s)).unwrap_or_default();
+    if listeners.is_empty() {
+        if let Some(out) = run_capture("netstat", &["-ano"]) {
+            listeners = parse_netstat(&out);
+        }
+    }
     build_service_assets(services, listeners)
+}
+
+/// Pure: parse `netstat -ano` LISTENING rows into listener records. Lines look
+/// like `TCP  0.0.0.0:135  0.0.0.0:0  LISTENING  1234` (or `[::]:445` for IPv6).
+fn parse_netstat(out: &str) -> Vec<WinListener> {
+    let mut listeners = Vec::new();
+    for line in out.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        // Proto Local Foreign State PID  — only TCP rows carry a LISTENING state.
+        if cols.len() < 5 || !cols[0].eq_ignore_ascii_case("TCP") {
+            continue;
+        }
+        if !cols[3].eq_ignore_ascii_case("LISTENING") {
+            continue;
+        }
+        let Ok(pid) = cols[4].parse::<u32>() else { continue };
+        // Local address is "host:port"; host may be bracketed IPv6.
+        let local = cols[1];
+        let Some((host, port_s)) = local.rsplit_once(':') else { continue };
+        let Ok(port) = port_s.parse::<u32>() else { continue };
+        let host = host.trim_start_matches('[').trim_end_matches(']').to_string();
+        listeners.push(WinListener {
+            local_address: Some(host),
+            local_port: Some(port),
+            owning_process: Some(pid),
+        });
+    }
+    listeners
 }
 
 /// Pure: join running services with their listening sockets (by PID) and build
@@ -523,6 +636,8 @@ fn build_service_assets(services: Vec<WinService>, listeners: Vec<WinListener>) 
         else {
             continue;
         };
+        // Drop any IPv6 zone index ("fe80::1%12") so the address parses.
+        let addr = addr.split('%').next().unwrap_or(&addr);
         let ep = if addr.contains(':') {
             format!("[{addr}]:{port}") // IPv6
         } else {
@@ -538,7 +653,11 @@ fn build_service_assets(services: Vec<WinService>, listeners: Vec<WinListener>) 
         if base == "svchost.exe" {
             continue;
         }
-        let display = s.display.unwrap_or_default();
+        // Prefer the friendly DisplayName; fall back to the service key name.
+        let display = match s.display.filter(|d| !d.trim().is_empty()) {
+            Some(d) => d,
+            None => s.name.unwrap_or_default(),
+        };
         if display.trim().is_empty() {
             continue;
         }
@@ -554,7 +673,7 @@ fn build_service_assets(services: Vec<WinService>, listeners: Vec<WinListener>) 
         if name.is_empty() {
             continue;
         }
-        let version = s.version.unwrap_or_default().trim().to_string();
+        let version = sanitize_version(&s.version.unwrap_or_default());
         let cpe = cpe_for_app(&name, &version);
         assets.push(Asset {
             ecosystem: Ecosystem::WinApp,
@@ -801,12 +920,14 @@ nbgv            3.6.133      nbgv";
     fn service_exposure_joins_by_pid_and_skips_svchost() {
         let services = vec![
             WinService {
+                name: Some("W3SVC".into()),
                 display: Some("World Wide Web Publishing Service".into()),
                 exe: Some(r"C:\Windows\System32\inetsrv\w3wp.exe".into()),
                 pid: Some(1234),
                 version: Some("10.0.0".into()),
             },
             WinService {
+                name: Some("SharedSvc".into()),
                 display: Some("Some Shared Svc".into()),
                 exe: Some(r"C:\Windows\System32\svchost.exe".into()),
                 pid: Some(900),
@@ -843,6 +964,42 @@ nbgv            3.6.133      nbgv";
     }
 
     #[test]
+    fn version_sanitization() {
+        assert_eq!(sanitize_version("10.0.19041.1 (WinBuild.160101.0800)"), "10.0.19041.1");
+        assert_eq!(sanitize_version("6,0,0,0"), "6.0.0.0");
+        assert_eq!(sanitize_version("  3.0.20  "), "3.0.20");
+        assert_eq!(sanitize_version("23.01"), "23.01");
+        assert_eq!(sanitize_version("1.2.3-rc1"), "1.2.3-rc1");
+        // No numeric prefix → returned as the first token, unmangled.
+        assert_eq!(sanitize_version("unknown"), "unknown");
+    }
+
+    #[test]
+    fn netstat_fallback_parsed() {
+        let out = "\
+Active Connections
+
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1234
+  TCP    [::]:445               [::]:0                LISTENING       4
+  TCP    192.168.1.5:50012      93.184.216.34:443     ESTABLISHED     5678
+  UDP    0.0.0.0:5353           *:*                                   900";
+        let l = parse_netstat(out);
+        // Only the two TCP LISTENING rows.
+        assert_eq!(l.len(), 2);
+        assert_eq!(l[0].local_port, Some(135));
+        assert_eq!(l[0].owning_process, Some(1234));
+        assert_eq!(l[1].local_address.as_deref(), Some("::"));
+        assert_eq!(l[1].local_port, Some(445));
+    }
+
+    #[test]
+    fn ansi_is_stripped() {
+        let s = "\u{1b}[2K\u{1b}[31mName\u{1b}[0m\r\nfoo";
+        assert_eq!(strip_ansi(s), "Name\nfoo");
+    }
+
+    #[test]
     fn empty_and_null_payloads_are_safe() {
         assert!(parse_registry_apps("").is_empty());
         assert!(parse_registry_apps("null").is_empty());
@@ -855,7 +1012,7 @@ nbgv            3.6.133      nbgv";
     #[test]
     fn scripts_are_nonempty() {
         for s in [
-            DETECT_OS_SCRIPT, REGISTRY_APPS_SCRIPT, APPX_SCRIPT,
+            DETECT_OS_SCRIPT, REGISTRY_APPS_SCRIPT, WINGET_SCRIPT, APPX_SCRIPT,
             SERVICES_SCRIPT, LISTENERS_SCRIPT, MISSING_UPDATES_SCRIPT,
         ] {
             assert!(!s.is_empty());

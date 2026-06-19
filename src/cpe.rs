@@ -165,11 +165,13 @@ fn is_trailing_noise(tok: &str) -> bool {
     if lower.starts_with('v') && lower[1..].chars().next().is_some_and(|c| c.is_ascii_digit()) {
         return true;
     }
+    // Only architecture / bit-width / locale tokens are trimmed here. Words like
+    // "edition"/"update"/"version" are NOT, because they are commonly part of a
+    // real product name and trimming them mangles it (and the search fallback).
     matches!(
         lower.as_str(),
         "x64" | "x86" | "x86_64" | "amd64" | "arm64" | "aarch64"
             | "32-bit" | "64-bit" | "win32" | "win64"
-            | "edition" | "version" | "setup" | "installer" | "update" | "lts" | "stable"
     ) || is_locale(&lower)
 }
 
@@ -205,7 +207,8 @@ const ALIASES: &[(&str, &str, &str)] = &[
     ("adobe acrobat", "adobe", "acrobat_dc"),
     ("oracle vm virtualbox", "oracle", "vm_virtualbox"),
     ("virtualbox", "oracle", "vm_virtualbox"),
-    ("java", "oracle", "java_se"),
+    // Note: a bare "java" alias is intentionally omitted — JRE/JDK/Temurin/
+    // OpenJDK DisplayNames are too ambiguous to map to one NVD product safely.
     ("python", "python", "python"),
     ("node.js", "nodejs", "node.js"),
     ("nodejs", "nodejs", "node.js"),
@@ -288,8 +291,11 @@ mod tests {
         assert_eq!(clean_app_name("Python 3.12.1 (64-bit)"), "Python");
         assert_eq!(clean_app_name("Google Chrome"), "Google Chrome");
         assert_eq!(clean_app_name("Microsoft Visual Studio Code"), "Microsoft Visual Studio Code");
-        assert_eq!(clean_app_name("Git version 2.43.0"), "Git");
+        assert_eq!(clean_app_name("Git 2.43.0"), "Git");
         assert_eq!(clean_app_name("VLC media player 3.0.20"), "VLC media player");
+        // "Update"/"Edition"/"version" are load-bearing words — never trimmed.
+        assert_eq!(clean_app_name("Windows 10 Update Assistant"), "Windows 10 Update Assistant");
+        assert_eq!(clean_app_name("Mozilla Firefox Update"), "Mozilla Firefox Update");
     }
 
     #[test]

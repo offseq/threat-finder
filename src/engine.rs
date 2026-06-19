@@ -12,7 +12,9 @@ use once_cell::sync::Lazy;
 use rayon::prelude::*;
 use regex::Regex;
 use serde::Serialize;
+#[cfg(target_os = "linux")]
 use zbus::blocking::Connection;
+#[cfg(target_os = "linux")]
 use zbus::zvariant::OwnedValue;
 
 #[derive(Debug, Clone)]
@@ -290,23 +292,27 @@ pub fn gather_system_info(os: &OsType) -> Option<SystemFacts> {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub struct UnitEntry {
     name: String,
     exe:  String,
     pid:  Option<u32>,
 }
 
+#[cfg(target_os = "linux")]
 pub static EXECSTART_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#""/([^"]+)""#).unwrap());
 
 // One row of systemd's Manager.ListUnits() reply:
 // (name, description, load_state, active_state, sub_state, following,
 //  unit_obj_path, job_id, job_type, job_obj_path)
+#[cfg(target_os = "linux")]
 pub type SystemdUnit = (
     String, String, String, String, String, String,
     zbus::zvariant::OwnedObjectPath, u32, String,
     zbus::zvariant::OwnedObjectPath,
 );
 
+#[cfg(target_os = "linux")]
 pub fn list_systemd_units(conn: &Connection) -> Vec<UnitEntry> {
     let proxy = match zbus::blocking::Proxy::new(
         conn,
@@ -353,6 +359,7 @@ pub fn list_systemd_units(conn: &Connection) -> Vec<UnitEntry> {
 
 /// Resolve a unit to (absolute binary, MainPID). PID is kept for exposure
 /// correlation even when the path comes from a non-PID strategy.
+#[cfg(target_os = "linux")]
 pub fn resolve_exe(conn: &Connection, obj_path: &str, unit_name: &str) -> Option<(String, Option<u32>)> {
     let svc_proxy = zbus::blocking::Proxy::new(
         conn,
@@ -1244,22 +1251,33 @@ pub fn scan_smf(os: &OsType) -> Vec<ServiceInfo> {
         .collect()
 }
 
+/// Linux service discovery: systemd over D-Bus (Linux builds only), falling back
+/// to SysV/OpenRC. The `cfg(not(linux))` body keeps the `OsType::Linux` match arm
+/// compiling on macOS/Windows (where it is never actually reached).
+#[cfg(target_os = "linux")]
+fn scan_linux(os: &OsType) -> Vec<ServiceInfo> {
+    if let Ok(conn) = Connection::system() {
+        let units = list_systemd_units(&conn);
+        if !units.is_empty() {
+            return units.into_par_iter()
+                .filter_map(|u| make_service(&u.name, &u.exe, u.pid, os))
+                .collect();
+        }
+        // D-Bus reachable but no units found — fall back to SysV/OpenRC.
+        scan_sysvinit(os)
+    } else {
+        scan_sysvinit(os)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn scan_linux(os: &OsType) -> Vec<ServiceInfo> {
+    scan_sysvinit(os)
+}
+
 pub fn scan_services(os: &OsType) -> Vec<ServiceInfo> {
     match os {
-        OsType::Linux(_) => {
-            if let Ok(conn) = Connection::system() {
-                let units = list_systemd_units(&conn);
-                if !units.is_empty() {
-                    return units.into_par_iter()
-                        .filter_map(|u| make_service(&u.name, &u.exe, u.pid, os))
-                        .collect();
-                }
-                // D-Bus reachable but no units found — fall back to SysV/OpenRC.
-                scan_sysvinit(os)
-            } else {
-                scan_sysvinit(os)
-            }
-        }
+        OsType::Linux(_)                        => scan_linux(os),
         OsType::MacOs                           => scan_launchctl(os),
         OsType::FreeBsd | OsType::DragonFlyBsd  => scan_bsd_rc(os),
         OsType::OpenBsd                          => scan_openbsd(os),
