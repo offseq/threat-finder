@@ -99,6 +99,9 @@ resolved in order:
 
 Non-interactive (`--yes` / no TTY) with no key available exits `2`.
 
+Set `OFFSEQ_CONFIG_DIR` to override where the config lives (default: the OS
+per-user config dir) — handy for containers/CI that need a deterministic path.
+
 ## How it works
 
 **Exact-coordinate matching.** Each asset becomes a purl carrying its _full_
