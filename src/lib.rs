@@ -7,9 +7,11 @@
 
 pub mod api;
 pub mod auth;
+pub mod cpe;
 pub mod engine;
 pub mod sarif;
 pub mod scan;
+pub mod windows;
 
 // Stable re-exports so `find_threats::Thing` keeps working for the binary and
 // downstream consumers regardless of internal module layout.

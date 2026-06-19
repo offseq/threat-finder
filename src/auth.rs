@@ -2,8 +2,9 @@
 
 use std::fs;
 use std::io::{self, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -87,25 +88,61 @@ fn load_config() -> Option<Config> {
 fn save_config(cfg: &Config) -> io::Result<()> {
     let path = config_path();
 
-    // Create the config directory private (0700) so the key file is never
-    // briefly exposed in a world-traversable parent.
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
-        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        harden_dir(parent);
     }
 
     let toml_str = toml::to_string(cfg).map_err(io::Error::other)?;
 
-    // Create the file with 0600 from the start (no chmod-after-write TOCTOU
-    // window), then re-assert 0600 in case it already existed.
-    let mut f = fs::OpenOptions::new()
+    let mut f = open_private(&path)?;
+    f.write_all(toml_str.as_bytes())?;
+    harden_file(&path)?;
+    Ok(())
+}
+
+/// Open the config file for writing, owner-private from the moment of creation.
+/// On Unix this means 0600 (no chmod-after-write TOCTOU window); on Windows the
+/// per-user `%APPDATA%` directory is already ACL'd to the user, so a plain
+/// create/truncate is sufficient.
+#[cfg(unix)]
+fn open_private(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(&path)?;
-    f.write_all(toml_str.as_bytes())?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_private(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+}
+
+/// Re-assert owner-only permissions on the directory (0700 on Unix; no-op
+/// elsewhere — `%APPDATA%` inherits a user-private ACL).
+#[cfg(unix)]
+fn harden_dir(dir: &Path) {
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+fn harden_dir(_dir: &Path) {}
+
+/// Re-assert owner-only permissions on the config file (0600 on Unix; no-op
+/// elsewhere) in case it already existed with looser modes.
+#[cfg(unix)]
+fn harden_file(path: &Path) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn harden_file(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 

@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **First-class Windows support.** Threat Finder now scans Windows hosts and
+  matches them against Radar, alongside the existing Linux/macOS/BSD coverage.
+  Everything is gathered by shelling out to the built-in `powershell.exe`
+  (`ConvertTo-Json`) — no extra runtime, no admin needed for the core inventory.
+  - **The OS itself → an NVD OS CPE.** The Windows edition, feature update, build
+    and UBR are read from the registry (`CurrentVersion`) and turned into a
+    feature-qualified CPE (e.g. `cpe:2.3:o:microsoft:windows_11_23h2:10.0.22631.3155:*:*:*:*:*:x64:*`),
+    trusting the build number over the `ProductName` (which still says
+    "Windows 10" on Windows 11). Client and Server SKUs are both recognised.
+  - **Installed applications → app CPEs.** Registry Uninstall keys (64-bit,
+    WOW6432Node and per-user), `winget list`, Appx/MSIX, Chocolatey and Scoop are
+    inventoried and mapped to NVD `vendor:product` via a curated alias table.
+    Unmapped apps fall back to a `?search=` lookup by cleaned name, so coverage
+    degrades gracefully rather than guessing a wrong CPE.
+  - **Language managers → purls.** Global npm, pip and `dotnet tool` packages are
+    matched by exact purl coordinate (`pkg:npm`, `pkg:pypi`, `pkg:nuget`).
+  - **Running services + network exposure.** Running Win32 services are correlated
+    with listening sockets (`Get-NetTCPConnection`) by PID, so a finding is
+    flagged loopback/private/public exactly as on Linux/macOS (svchost-hosted
+    services are skipped to avoid mis-attributing shared sockets).
+  - **`--windows-missing-updates`** (opt-in): queries the Windows Update Agent for
+    pending security updates and lists them most-severe-first. This is an online
+    scan (needs network, best run elevated), so it is off by default.
+- Windows (`x86_64-pc-windows-msvc`) is now built and tested in CI, shipped as a
+  release binary, and installable via `cargo binstall`.
+
 ## [0.1.7]
 
 ### Fixed

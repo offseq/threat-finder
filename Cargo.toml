@@ -20,6 +20,11 @@ pkg-url = "{ repo }/releases/download/v{ version }/threat-finder-v{ version }-{ 
 pkg-fmt = "tgz"
 bin-dir = "{ bin }{ binary-ext }"
 
+# Windows release archives are .zip (taiki-e/upload-rust-binary-action default).
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/threat-finder-v{ version }-{ target }.zip"
+pkg-fmt = "zip"
+
 [lib]
 name = "find_threats"
 path = "src/lib.rs"
