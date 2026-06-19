@@ -28,6 +28,16 @@ pub enum Ecosystem {
     FreeBsdPkg,
     OpenBsdPkg,
     NetBsdPkg,
+    /// Cross-ecosystem language managers present on Windows (and elsewhere).
+    /// These map to a real Package-URL type → confirmed-coordinate matching.
+    Npm,
+    PyPI,
+    NuGet,
+    /// A Windows application from the registry / winget / Appx / Chocolatey /
+    /// Scoop. No canonical purl exists, so it matches via a best-effort CPE.
+    WinApp,
+    /// The Windows operating system itself → an NVD OS CPE.
+    WindowsOs,
     Generic,
 }
 
@@ -46,6 +56,7 @@ impl Ecosystem {
             OsType::FreeBsd | OsType::DragonFlyBsd => Ecosystem::FreeBsdPkg,
             OsType::OpenBsd => Ecosystem::OpenBsdPkg,
             OsType::NetBsd => Ecosystem::NetBsdPkg,
+            OsType::Windows(_) => Ecosystem::WinApp,
             _ => Ecosystem::Generic,
         }
     }
@@ -87,6 +98,10 @@ pub struct Asset {
     pub sources: Vec<Source>,
     pub locations: Vec<String>,
     pub runtime: Option<Runtime>,
+    /// Pre-built CPE 2.3 string when the source could form one (Windows apps /
+    /// the OS). Takes precedence over a purl in `to_match_query`. `None` for
+    /// everything matched by coordinate or `?search=`.
+    pub cpe: Option<String>,
 }
 
 impl Asset {
@@ -159,6 +174,7 @@ fn service_to_asset(s: ServiceInfo, eco: Ecosystem) -> Asset {
             reachability: s.reach,
             exposed: s.exposed,
         }),
+        cpe: None,
     }
 }
 
@@ -182,6 +198,7 @@ impl Collector for OsPackageCollector {
                 sources: vec![Source::PackageDb],
                 locations: Vec::new(),
                 runtime: None,
+                cpe: None,
             })
             .collect()
     }
@@ -195,11 +212,34 @@ pub enum ScanScope {
     All,
 }
 
+/// Windows discovery, produced as `Asset`s directly (multi-ecosystem: registry/
+/// winget/Appx/Chocolatey/Scoop → CPE; npm/pip/nuget → purl; plus the OS CPE and
+/// running services with exposure). Self-gates: a no-op on every other OS, so it
+/// is always safe to include in the collector set.
+pub struct WindowsCollector {
+    /// Full inventory (every installed app) vs. running services + OS only.
+    pub full: bool,
+}
+
+impl Collector for WindowsCollector {
+    fn name(&self) -> &'static str {
+        "windows"
+    }
+    fn collect(&self, os: &OsType) -> Vec<Asset> {
+        match os {
+            OsType::Windows(w) => crate::windows::collect_windows(w, self.full),
+            _ => Vec::new(),
+        }
+    }
+}
+
 pub fn for_scope(scope: ScanScope) -> Vec<Box<dyn Collector>> {
     let mut collectors: Vec<Box<dyn Collector>> = vec![Box::new(RunningServiceCollector)];
     if scope == ScanScope::All {
         collectors.push(Box::new(OsPackageCollector));
     }
+    // Self-gating; on non-Windows hosts this yields nothing.
+    collectors.push(Box::new(WindowsCollector { full: scope == ScanScope::All }));
     collectors
 }
 
@@ -324,11 +364,25 @@ pub fn build_purl(a: &Asset, os: &OsType) -> Option<String> {
         }
         Ecosystem::Arch => Some(format!("pkg:pacman/arch/{}@{ver}", pct(&name.to_lowercase()))),
         Ecosystem::Homebrew => Some(format!("pkg:brew/{}@{ver}", pct(&name))),
-        _ => None, // BSD / Generic → search fallback
+        // Cross-ecosystem language managers (npm/pip/nuget global installs).
+        Ecosystem::Npm => Some(format!("pkg:npm/{}@{ver}", pct(&name))),
+        // PyPI: PEP 503 normalization — lowercase, `_`/`.` → `-`.
+        Ecosystem::PyPI => {
+            let norm = name.to_lowercase().replace(['_', '.'], "-");
+            Some(format!("pkg:pypi/{}@{ver}", pct(&norm)))
+        }
+        // NuGet ids are case-sensitive — preserve casing.
+        Ecosystem::NuGet => Some(format!("pkg:nuget/{}@{ver}", pct(&name))),
+        _ => None, // BSD / Generic / Windows apps+OS → CPE or search fallback
     }
 }
 
+/// Pick the strongest match query for an asset: a pre-built CPE (Windows apps /
+/// OS) wins, else a purl coordinate, else `None` so the caller uses `?search=`.
 fn to_match_query(a: &Asset, os: &OsType) -> Option<MatchQuery> {
+    if let Some(cpe) = &a.cpe {
+        return Some(MatchQuery::cpe(cpe.clone()));
+    }
     build_purl(a, os).map(MatchQuery::purl)
 }
 
@@ -425,7 +479,7 @@ mod tests {
 
     fn pkg_asset(name: &str, ver: &str) -> Asset {
         Asset { ecosystem: Ecosystem::Deb, name: name.into(), pkg_name: None, version: ver.into(),
-            sources: vec![Source::PackageDb], locations: vec![], runtime: None }
+            sources: vec![Source::PackageDb], locations: vec![], runtime: None, cpe: None }
     }
 
     #[test]
@@ -454,6 +508,7 @@ mod tests {
             sources: vec![Source::Probe], locations: vec!["/usr/sbin/nginx".into()],
             runtime: Some(Runtime { pid: Some(7), listeners: vec!["tcp 0.0.0.0:443".into()],
                 reachability: Reachability::Public, exposed: true }),
+            cpe: None,
         };
         let installed = pkg_asset("nginx", "1.24.0");
         let merged = dedup_and_merge(vec![installed, running]);
@@ -467,7 +522,7 @@ mod tests {
     fn linux(d: LinuxDistro) -> OsType { OsType::Linux(d) }
     fn asset_eco(eco: Ecosystem, name: &str, ver: &str) -> Asset {
         Asset { ecosystem: eco, name: name.into(), pkg_name: Some(name.into()), version: ver.into(),
-            sources: vec![Source::PackageDb], locations: vec![], runtime: None }
+            sources: vec![Source::PackageDb], locations: vec![], runtime: None, cpe: None }
     }
 
     #[test]

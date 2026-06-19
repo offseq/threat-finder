@@ -123,6 +123,12 @@ struct Cli {
     /// Delete this host's monitored inventory from Radar, then exit
     #[arg(long)]
     unregister: bool,
+
+    /// (Windows) Also query the Windows Update Agent for pending security
+    /// updates and list them. This is an online scan: it needs network access,
+    /// can take a while, and is best run from an elevated shell.
+    #[arg(long)]
+    windows_missing_updates: bool,
 }
 
 fn expand_tilde(path: &str) -> String {
@@ -445,14 +451,20 @@ fn register_action(
 }
 
 /// Map a scanned asset into an inventory payload entry, or None when it has no
-/// buildable purl (so a malformed coordinate is never registered).
+/// buildable coordinate (so a malformed entry is never registered). Uses the
+/// asset's CPE for Windows apps / the OS, and a purl otherwise.
 fn asset_to_inventory(a: &Asset, os: &OsType) -> Option<InventoryAsset> {
-    let purl = scan::build_purl(a, os)?;
+    let purl = scan::build_purl(a, os);
+    let cpe = a.cpe.clone();
+    if purl.is_none() && cpe.is_none() {
+        return None;
+    }
     let rt = a.runtime.as_ref();
     // Exposure mirrors the report's reachability ("none" when nothing is running).
     let exposure = rt.map(|r| r.reachability.as_str()).unwrap_or("none").to_string();
     Some(InventoryAsset {
-        purl,
+        purl: purl.unwrap_or_default(),
+        cpe,
         version: a.version.clone(),
         ecosystem: ecosystem_label(a.ecosystem).to_string(),
         name: a.coordinate_name(),
@@ -472,6 +484,11 @@ fn ecosystem_label(eco: find_threats::Ecosystem) -> &'static str {
         Alpine => "apk",
         Homebrew => "brew",
         FreeBsdPkg | OpenBsdPkg | NetBsdPkg => "bsd",
+        Npm => "npm",
+        PyPI => "pypi",
+        NuGet => "nuget",
+        WinApp => "windows",
+        WindowsOs => "windows-os",
         Generic => "generic",
     }
 }
@@ -720,7 +737,10 @@ fn main() -> ExitCode {
 
     // If we'd prompt, ask now and fold the answer back into the action.
     if action == RegisterAction::Prompt {
-        let inventory_count = assets.iter().filter(|a| scan::build_purl(a, &os).is_some()).count();
+        let inventory_count = assets
+            .iter()
+            .filter(|a| a.cpe.is_some() || scan::build_purl(a, &os).is_some())
+            .count();
         match prompt_register(inventory_count, cli.scope) {
             PromptAnswer::Yes => action = RegisterAction::Register,
             PromptAnswer::No => action = RegisterAction::Skip,
@@ -839,6 +859,23 @@ fn main() -> ExitCode {
         print_registration(resp, color);
     }
 
+    // Opt-in Windows Update Agent advisory: pending (not-installed) security
+    // updates. Independent of the Radar match (these are KB-keyed, not
+    // coordinate-keyed), so it's printed as its own section.
+    if cli.windows_missing_updates {
+        if matches!(os, OsType::Windows(_)) {
+            let pb = spinner("Querying Windows Update for pending updates…", cli.quiet);
+            let updates = find_threats::windows::gather_missing_updates();
+            if let Some(pb) = pb { pb.finish_and_clear(); }
+            let color = !cli.no_color
+                && std::env::var_os("NO_COLOR").is_none()
+                && io::stdout().is_terminal();
+            print_missing_updates(&updates, color, to_stdout);
+        } else if !cli.quiet {
+            eprintln!("[!] --windows-missing-updates is only available on Windows; ignoring.");
+        }
+    }
+
     if let Some(f) = cli.fail_on {
         if fail_triggered(&final_results, f, cli.severity) {
             return ExitCode::from(5);
@@ -846,6 +883,45 @@ fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// Print the Windows Update Agent advisory (pending updates, most severe first).
+/// Goes to stderr when stdout is reserved for the JSON report, so piping stays
+/// clean.
+fn print_missing_updates(updates: &[find_threats::windows::WinUpdate], color: bool, to_stdout: bool) {
+    macro_rules! out {
+        ($($a:tt)*) => {{ if to_stdout { eprintln!($($a)*) } else { println!($($a)*) } }};
+    }
+    out!("\n┌─────────────────────────────────────────────┐");
+    out!("│        Pending Windows Updates (WUA)        │");
+    out!("└─────────────────────────────────────────────┘");
+    if updates.is_empty() {
+        out!("No pending updates found (or the update scan was unavailable).");
+        return;
+    }
+    out!("{} pending update(s):", updates.len());
+    for u in updates {
+        let sev = if u.severity.is_empty() { "—".to_string() } else { u.severity.clone() };
+        let kbs = if u.kbs.is_empty() {
+            String::new()
+        } else {
+            format!("  [KB{}]", u.kbs.join(", KB"))
+        };
+        let tag = paint(&format!("[{sev}]"), severity_ansi(&u.severity), color);
+        out!("  {tag} {}{kbs}", u.title);
+    }
+    out!("\nApply these from Windows Update / WSUS, or: https://catalog.update.microsoft.com");
+}
+
+/// ANSI color code for an MSRC severity label.
+fn severity_ansi(sev: &str) -> &'static str {
+    match sev.to_lowercase().as_str() {
+        "critical" => "1;31",
+        "important" => "31",
+        "moderate" => "33",
+        "low" => "32",
+        _ => "0",
+    }
 }
 
 /// Scope-aware noun for the inventory being registered: under `--scope all` the
@@ -1016,6 +1092,7 @@ mod tests {
                 pid: Some(9), listeners: vec!["tcp 0.0.0.0:443".into()],
                 reachability: Reachability::Public, exposed: true,
             }),
+            cpe: None,
         };
         let inv = asset_to_inventory(&running, &os).expect("buildable purl");
         assert!(inv.purl.starts_with("pkg:deb/ubuntu/nginx@1.24.0"), "{}", inv.purl);
@@ -1028,19 +1105,31 @@ mod tests {
         let installed = Asset {
             ecosystem: Ecosystem::Deb, name: "openssl".into(), pkg_name: Some("openssl".into()),
             version: "1.1.1f".into(), sources: vec![Source::PackageDb], locations: vec![],
-            runtime: None,
+            runtime: None, cpe: None,
         };
         let inv = asset_to_inventory(&installed, &os).unwrap();
         assert_eq!(inv.exposure, "none");
         assert!(!inv.exposed && !inv.runtime);
 
-        // No buildable purl (BSD/generic) → skipped entirely.
+        // No buildable purl (BSD/generic) and no CPE → skipped entirely.
         let bsd = Asset {
             ecosystem: Ecosystem::FreeBsdPkg, name: "nginx".into(), pkg_name: Some("nginx".into()),
             version: "1.27.0".into(), sources: vec![Source::PackageDb], locations: vec![],
-            runtime: None,
+            runtime: None, cpe: None,
         };
         assert!(asset_to_inventory(&bsd, &OsType::FreeBsd).is_none());
+
+        // A Windows app carries its CPE into the inventory entry (no purl).
+        let win = Asset {
+            ecosystem: Ecosystem::WinApp, name: "Google Chrome".into(),
+            pkg_name: Some("Google Chrome".into()), version: "120.0".into(),
+            sources: vec![Source::PackageDb], locations: vec![], runtime: None,
+            cpe: Some("cpe:2.3:a:google:chrome:120.0:*:*:*:*:*:*:*".into()),
+        };
+        let inv = asset_to_inventory(&win, &OsType::Windows(Default::default())).unwrap();
+        assert!(inv.purl.is_empty());
+        assert_eq!(inv.cpe.as_deref(), Some("cpe:2.3:a:google:chrome:120.0:*:*:*:*:*:*:*"));
+        assert_eq!(inv.ecosystem, "windows");
     }
 
     #[test]

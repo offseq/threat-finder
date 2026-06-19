@@ -12,7 +12,9 @@ use once_cell::sync::Lazy;
 use rayon::prelude::*;
 use regex::Regex;
 use serde::Serialize;
+#[cfg(target_os = "linux")]
 use zbus::blocking::Connection;
+#[cfg(target_os = "linux")]
 use zbus::zvariant::OwnedValue;
 
 #[derive(Debug, Clone)]
@@ -25,7 +27,39 @@ pub enum LinuxDistro {
 pub enum OsType {
     Linux(LinuxDistro),
     MacOs, FreeBsd, OpenBsd, NetBsd, DragonFlyBsd, Solaris, Illumos,
+    Windows(WinOs),
     Unsupported(String),
+}
+
+/// Parsed Windows identity, enough to form an NVD-style OS CPE and a display
+/// label. Built from the `Windows NT\CurrentVersion` registry view (the only
+/// source that yields edition + build + UBR together). Pure data, so it is
+/// constructible and testable on any platform.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WinOs {
+    /// NVD CPE product token, e.g. `windows_11_23h2` / `windows_server_2022`.
+    pub product: String,
+    /// Human label for display, e.g. `Windows 11 Pro`.
+    pub display_name: String,
+    /// Feature update string as reported (`23H2`, `22H2`); may be empty.
+    pub feature: String,
+    /// Major build number, e.g. 22631.
+    pub build: u32,
+    /// Update Build Revision (the `.NNNN` after the build), e.g. 3155.
+    pub ubr: u32,
+    /// True for Server SKUs (changes the CPE product family).
+    pub is_server: bool,
+    /// Edition id (`Professional`, `ServerDatacenter`, …); display only.
+    pub edition: String,
+    /// CPE `target_hw`: `x64` / `arm64` / `x86`.
+    pub arch: String,
+}
+
+impl WinOs {
+    /// Full NVD version string for the CPE version field: `10.0.{build}.{ubr}`.
+    pub fn version_string(&self) -> String {
+        format!("10.0.{}.{}", self.build, self.ubr)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +167,7 @@ pub fn detect_os() -> OsType {
         "dragonfly" => OsType::DragonFlyBsd,
         "solaris"   => OsType::Solaris,
         "illumos"   => OsType::Illumos,
+        "windows"   => OsType::Windows(crate::windows::detect_win_os()),
         other       => OsType::Unsupported(other.to_string()),
     }
 }
@@ -148,11 +183,29 @@ pub fn os_label(os: &OsType) -> String {
         OsType::DragonFlyBsd => "DragonFly BSD".into(),
         OsType::Solaris => "Solaris".into(),
         OsType::Illumos => "illumos".into(),
+        OsType::Windows(w) => {
+            if w.display_name.is_empty() { "Windows".into() } else { w.display_name.clone() }
+        }
         OsType::Unsupported(s) => format!("Unsupported ({s})"),
     }
 }
 
 pub fn gather_system_info(os: &OsType) -> Option<SystemFacts> {
+    // Windows has no `uname`; build the facts from the parsed registry identity.
+    if let OsType::Windows(w) = os {
+        let distro_version = if w.feature.is_empty() {
+            w.version_string()
+        } else {
+            format!("{} ({})", w.feature, w.version_string())
+        };
+        return Some(SystemFacts {
+            kernel_name: "windows".into(),
+            kernel_version: w.version_string(),
+            distro_name: if w.display_name.is_empty() { "windows".into() } else { w.display_name.clone() },
+            distro_version,
+        });
+    }
+
     let kernel_version = run_cmd("uname", &["-r"])
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
@@ -233,27 +286,33 @@ pub fn gather_system_info(os: &OsType) -> Option<SystemFacts> {
                 distro_version: kernel_version,
             })
         }
+        // Handled by the early return above; arm present for exhaustiveness.
+        OsType::Windows(_) => None,
         OsType::Unsupported(_) => None,
     }
 }
 
+#[cfg(target_os = "linux")]
 pub struct UnitEntry {
     name: String,
     exe:  String,
     pid:  Option<u32>,
 }
 
+#[cfg(target_os = "linux")]
 pub static EXECSTART_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#""/([^"]+)""#).unwrap());
 
 // One row of systemd's Manager.ListUnits() reply:
 // (name, description, load_state, active_state, sub_state, following,
 //  unit_obj_path, job_id, job_type, job_obj_path)
+#[cfg(target_os = "linux")]
 pub type SystemdUnit = (
     String, String, String, String, String, String,
     zbus::zvariant::OwnedObjectPath, u32, String,
     zbus::zvariant::OwnedObjectPath,
 );
 
+#[cfg(target_os = "linux")]
 pub fn list_systemd_units(conn: &Connection) -> Vec<UnitEntry> {
     let proxy = match zbus::blocking::Proxy::new(
         conn,
@@ -300,6 +359,7 @@ pub fn list_systemd_units(conn: &Connection) -> Vec<UnitEntry> {
 
 /// Resolve a unit to (absolute binary, MainPID). PID is kept for exposure
 /// correlation even when the path comes from a non-PID strategy.
+#[cfg(target_os = "linux")]
 pub fn resolve_exe(conn: &Connection, obj_path: &str, unit_name: &str) -> Option<(String, Option<u32>)> {
     let svc_proxy = zbus::blocking::Proxy::new(
         conn,
@@ -481,6 +541,9 @@ pub fn package_of(exe: &str, os: &OsType) -> Option<(String, String)> {
         OsType::OpenBsd => pkg_info_of(&path, false),
         OsType::NetBsd | OsType::Illumos => pkg_info_of(&path, true),
         OsType::Solaris => None, // IPS resolution deferred; falls back to probe
+        // Windows packages aren't resolved from an exe path; the registry/winget
+        // inventory is itself the coordinate (see the windows module).
+        OsType::Windows(_) => None,
         OsType::Unsupported(_) => None,
     }
 }
@@ -1188,27 +1251,41 @@ pub fn scan_smf(os: &OsType) -> Vec<ServiceInfo> {
         .collect()
 }
 
+/// Linux service discovery: systemd over D-Bus (Linux builds only), falling back
+/// to SysV/OpenRC. The `cfg(not(linux))` body keeps the `OsType::Linux` match arm
+/// compiling on macOS/Windows (where it is never actually reached).
+#[cfg(target_os = "linux")]
+fn scan_linux(os: &OsType) -> Vec<ServiceInfo> {
+    if let Ok(conn) = Connection::system() {
+        let units = list_systemd_units(&conn);
+        if !units.is_empty() {
+            return units.into_par_iter()
+                .filter_map(|u| make_service(&u.name, &u.exe, u.pid, os))
+                .collect();
+        }
+        // D-Bus reachable but no units found — fall back to SysV/OpenRC.
+        scan_sysvinit(os)
+    } else {
+        scan_sysvinit(os)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn scan_linux(os: &OsType) -> Vec<ServiceInfo> {
+    scan_sysvinit(os)
+}
+
 pub fn scan_services(os: &OsType) -> Vec<ServiceInfo> {
     match os {
-        OsType::Linux(_) => {
-            if let Ok(conn) = Connection::system() {
-                let units = list_systemd_units(&conn);
-                if !units.is_empty() {
-                    return units.into_par_iter()
-                        .filter_map(|u| make_service(&u.name, &u.exe, u.pid, os))
-                        .collect();
-                }
-                // D-Bus reachable but no units found — fall back to SysV/OpenRC.
-                scan_sysvinit(os)
-            } else {
-                scan_sysvinit(os)
-            }
-        }
+        OsType::Linux(_)                        => scan_linux(os),
         OsType::MacOs                           => scan_launchctl(os),
         OsType::FreeBsd | OsType::DragonFlyBsd  => scan_bsd_rc(os),
         OsType::OpenBsd                          => scan_openbsd(os),
         OsType::NetBsd                           => scan_netbsd(os),
         OsType::Solaris | OsType::Illumos        => scan_smf(os),
+        // Windows discovery (services + exposure + inventory) lives in the
+        // dedicated WindowsCollector, which calls the windows module directly.
+        OsType::Windows(_)                        => vec![],
         OsType::Unsupported(name) => {
             eprintln!("Unsupported OS: {name}");
             vec![]
@@ -1219,6 +1296,7 @@ pub fn scan_services(os: &OsType) -> Vec<ServiceInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::path::Path;
     use std::time::Duration;
 
@@ -1253,10 +1331,18 @@ mod tests {
         assert_eq!(normalize_service_name(strip_instance("ssh@foo")), "openssh");
     }
 
+    // resolve_binary reads Unix $PATH ('/'-rooted, ':'-separated) and is only used
+    // by the Unix service-version probe, so the positive case is Unix-only.
+    #[cfg(unix)]
     #[test]
     fn resolve_binary_finds_real_tool_and_rejects_garbage() {
         let sh = resolve_binary("sh").expect("sh should resolve");
         assert!(sh.starts_with('/') && Path::new(&sh).is_file());
+        assert_eq!(resolve_binary("definitely-not-a-real-binary-xyz"), None);
+    }
+
+    #[test]
+    fn resolve_binary_rejects_garbage_everywhere() {
         assert_eq!(resolve_binary("definitely-not-a-real-binary-xyz"), None);
     }
 
@@ -1481,6 +1567,8 @@ pub fn list_installed(os: &OsType) -> Vec<InstalledPkg> {
             tagged("pkg_info", run_cmd("pkg_info", &["-q"]).map(|o| parse_pkg_info_list(&o)).unwrap_or_default()),
         OsType::NetBsd =>
             tagged("pkg_info", run_cmd("pkg_info", &[]).map(|o| parse_pkg_info_list(&o)).unwrap_or_default()),
+        // Windows inventory is multi-ecosystem (registry/winget/appx/lang mgrs)
+        // and is produced as Assets directly by the WindowsCollector.
         _ => Vec::new(),
     }
 }

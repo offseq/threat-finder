@@ -20,6 +20,11 @@ pkg-url = "{ repo }/releases/download/v{ version }/threat-finder-v{ version }-{ 
 pkg-fmt = "tgz"
 bin-dir = "{ bin }{ binary-ext }"
 
+# Windows release archives are .zip (taiki-e/upload-rust-binary-action default).
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/threat-finder-v{ version }-{ target }.zip"
+pkg-fmt = "zip"
+
 [lib]
 name = "find_threats"
 path = "src/lib.rs"
@@ -37,8 +42,12 @@ once_cell = "1"
 rayon = "1"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-zbus = "4"
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 rpassword = "7"
 uuid = { version = "1", features = ["v4"] }
+
+# systemd discovery is Linux-only; D-Bus (zbus) doesn't belong on macOS/Windows
+# builds (and its Windows transport deps don't build cleanly), so gate it here.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "4"

@@ -800,7 +800,12 @@ pub struct InventoryOs {
 /// so no malformed coordinate is ever sent.
 #[derive(Debug, Clone, Serialize)]
 pub struct InventoryAsset {
+    /// purl coordinate, when the asset has one (Linux/macOS/BSD pkgs, npm/pip/…).
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub purl: String,
+    /// CPE coordinate, for Windows apps / the OS that have no canonical purl.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpe: Option<String>,
     pub version: String,
     pub ecosystem: String,
     pub name: String,
@@ -1612,7 +1617,7 @@ mod tests {
             agent_version: "0.1.4",
             monitor: true,
             assets: &[InventoryAsset {
-                purl: "pkg:deb/ubuntu/openssl@1.1.1f".into(),
+                purl: "pkg:deb/ubuntu/openssl@1.1.1f".into(), cpe: None,
                 version: "1.1.1f".into(), ecosystem: "deb".into(), name: "openssl".into(),
                 exposure: "public".into(), exposed: true, runtime: true,
             }],

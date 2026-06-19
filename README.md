@@ -34,10 +34,10 @@ cargo binstall threat-finder            # prebuilt binary, no toolchain
 cargo install threat-finder             # from source
 ```
 
-Prebuilt archives for Linux/macOS (x86_64 + arm64) are also on the
-[releases page](https://github.com/offseq/threat-finder/releases/latest).
-Requires Rust ≥ 1.87 to build from source. Linux and macOS are supported;
-Windows is not (discovery relies on Unix facilities).
+Prebuilt archives for Linux/macOS (x86_64 + arm64) and Windows (x86_64) are on
+the [releases page](https://github.com/offseq/threat-finder/releases/latest).
+Requires Rust ≥ 1.87 to build from source. Linux, macOS, the BSDs, and Windows
+are all supported.
 
 ## Quickstart
 
@@ -74,6 +74,7 @@ threat-finder [OPTIONS]
 | `--no-register` | Don't register or prompt for monitoring this run |
 | `--host-name <NAME>` | Friendly hostname to send with a registration |
 | `--unregister` | Remove this host's inventory from Radar and exit |
+| `--windows-missing-updates` | (Windows) Also list pending security updates from the Windows Update Agent (online scan; run elevated) |
 | `-h, --help` / `-V, --version` | Help / version |
 
 ```sh
@@ -114,7 +115,8 @@ version can't be confirmed are surfaced separately as **unconfirmed / triage**
 **Network-exposure correlation.** Manifest scanners (Trivy, Grype, osv-scanner)
 read package lists; external scanners (Nessus, OpenVAS) need a second host. This
 tool maps each running service's process to the sockets it is **listening** on
-(`/proc/net` on Linux, `lsof` elsewhere) and classifies reachability —
+(`/proc/net` on Linux, `lsof` on the other Unixes, `Get-NetTCPConnection` /
+`netstat` on Windows) and classifies reachability —
 `loopback` / `private` / `public`. A vulnerable service on `0.0.0.0` is a very
 different risk from one on `127.0.0.1`: findings rank exposed-first and
 `--fail-on exposed` gates CI on exactly that. No packets are sent. Findings also
@@ -180,11 +182,19 @@ coordinate). The kernel is covered as its package (`linux-image…`) under
 | OpenBSD | `rcctl ls started` | `pkg_info` |
 | NetBSD | `/etc/rc.d` status | `pkg_info` |
 | Solaris / illumos | `svcs` → `svcprop` | probe (`--version`) |
+| Windows | `Win32_Service` → `Get-NetTCPConnection` / `netstat` | registry / winget / Appx / Chocolatey / Scoop → CPE; npm / pip / dotnet → purl; the OS build → CPE |
 
 Where no package owns a binary, the version falls back to a hardened `--version`
 probe (absolute path only, sanitized env). On macOS, Apple system services
 (`com.apple.*`, SIP-protected paths) are skipped — they're covered by the OS
 version, and probing hundreds of them is pointless.
+
+On **Windows**, everything is gathered via the built-in `powershell.exe`
+(no extra runtime, no admin for the core inventory). Installed apps map to NVD
+CPEs through a curated name table (unmapped apps fall back to a name search
+rather than a wrong guess); the OS edition/build becomes a feature-qualified OS
+CPE (e.g. `windows_11_23h2`); and `--windows-missing-updates` adds an opt-in
+Windows Update Agent advisory of pending security patches.
 
 ## Output
 
