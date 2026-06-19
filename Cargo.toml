@@ -50,4 +50,4 @@ uuid = { version = "1", features = ["v4"] }
 # systemd discovery is Linux-only; D-Bus (zbus) doesn't belong on macOS/Windows
 # builds (and its Windows transport deps don't build cleanly), so gate it here.
 [target.'cfg(target_os = "linux")'.dependencies]
-zbus = "4"
+zbus = "5"
