@@ -5,8 +5,27 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      # Bundle low-risk minor/patch crate bumps into a single weekly PR; leave
+      # major bumps (MSRV/API breaks) as individual PRs so each is reviewed alone.
+      cargo-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
 
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    ignore:
+      # The MSRV job pins the toolchain via Cargo.toml's `rust-version`
+      # (dtolnay/rust-toolchain@master + toolchain input). A Dependabot bump of
+      # this action's tag would change the tested Rust floor and defeat the
+      # MSRV check, so it is intentionally excluded.
+      - dependency-name: "dtolnay/rust-toolchain"

@@ -8,7 +8,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use once_cell::sync::Lazy;
+use std::sync::LazyLock as Lazy;
+
 use rayon::prelude::*;
 use regex::Regex;
 use serde::Serialize;

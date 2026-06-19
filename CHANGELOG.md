@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Dependency refresh to latest secure versions.** Bumped `indicatif`
+  0.17 → 0.18 (drops the unmaintained `number_prefix`, clearing
+  RUSTSEC-2025-0119 — the only outstanding `cargo audit` advisory), `toml`
+  0.8 → 1, `dirs` 5 → 6, `zbus` 4 → 5 (Linux-only), and `regex` to 1.12.4. A
+  fresh lockfile resolve also pruned a large block of unused WASI/wasm codegen
+  crates (`wit-*`, `wasm-encoder`, `wasmparser`, `prettyplease`, `anyhow`,
+  `thiserror` 1.x, …) that were lockfile-only noise. No API or behavior changes.
+- Dropped the `once_cell` dependency in favor of the standard library's
+  `std::sync::LazyLock` (stable since Rust 1.80; our MSRV is 1.87).
+
+### CI
+- Bumped `actions/checkout` to v7.
+- The MSRV job now reads `rust-version` from `Cargo.toml` at runtime (via
+  `dtolnay/rust-toolchain@master` + `toolchain:` input) so the floor lives in one
+  place and isn't silently raised by dependency bots.
+- `dependabot.yml`: group minor/patch crate updates and all GitHub Actions into
+  single PRs, and stop bumping the intentionally-pinned MSRV toolchain.
+
 ## [0.2.0]
 
 ### Added
