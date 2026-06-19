@@ -4,7 +4,12 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.1]
+
+### Added
+- `OFFSEQ_CONFIG_DIR` environment variable to override the config-file
+  directory (default: the OS per-user config dir) — handy for containers/CI that
+  need a deterministic, isolated config path.
 
 ### Changed
 - **Dependency refresh to latest secure versions.** Bumped `indicatif`
@@ -24,6 +29,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   place and isn't silently raised by dependency bots.
 - `dependabot.yml`: group minor/patch crate updates and all GitHub Actions into
   single PRs, and stop bumping the intentionally-pinned MSRV toolchain.
+
+### Fixed
+- Config round-trip tests are now hermetic on Windows. `dirs` 6 resolves the
+  Windows config dir via the Known Folders API (ignoring `%APPDATA%`), so the
+  tests use the new `OFFSEQ_CONFIG_DIR` override for a deterministic location —
+  fixing the spurious red CI badge on `main`.
 
 ## [0.2.0]
 
