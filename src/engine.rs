@@ -1330,10 +1330,18 @@ mod tests {
         assert_eq!(normalize_service_name(strip_instance("ssh@foo")), "openssh");
     }
 
+    // resolve_binary reads Unix $PATH ('/'-rooted, ':'-separated) and is only used
+    // by the Unix service-version probe, so the positive case is Unix-only.
+    #[cfg(unix)]
     #[test]
     fn resolve_binary_finds_real_tool_and_rejects_garbage() {
         let sh = resolve_binary("sh").expect("sh should resolve");
         assert!(sh.starts_with('/') && Path::new(&sh).is_file());
+        assert_eq!(resolve_binary("definitely-not-a-real-binary-xyz"), None);
+    }
+
+    #[test]
+    fn resolve_binary_rejects_garbage_everywhere() {
         assert_eq!(resolve_binary("definitely-not-a-real-binary-xyz"), None);
     }
 

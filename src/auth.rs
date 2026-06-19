@@ -325,6 +325,7 @@ mod tests {
         dir: PathBuf,
         prev_xdg: Option<std::ffi::OsString>,
         prev_home: Option<std::ffi::OsString>,
+        prev_appdata: Option<std::ffi::OsString>,
     }
 
     impl TempConfigHome {
@@ -333,10 +334,13 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
             let prev_home = std::env::var_os("HOME");
-            // dirs::config_dir() uses XDG_CONFIG_HOME on Linux and $HOME on macOS.
+            let prev_appdata = std::env::var_os("APPDATA");
+            // dirs::config_dir() uses XDG_CONFIG_HOME on Linux, $HOME on macOS,
+            // and %APPDATA% on Windows — redirect all three so the test is hermetic.
             std::env::set_var("XDG_CONFIG_HOME", &dir);
             std::env::set_var("HOME", &dir);
-            TempConfigHome { dir, prev_xdg, prev_home }
+            std::env::set_var("APPDATA", &dir);
+            TempConfigHome { dir, prev_xdg, prev_home, prev_appdata }
         }
     }
 
@@ -349,6 +353,10 @@ mod tests {
             match &self.prev_home {
                 Some(v) => std::env::set_var("HOME", v),
                 None => std::env::remove_var("HOME"),
+            }
+            match &self.prev_appdata {
+                Some(v) => std::env::set_var("APPDATA", v),
+                None => std::env::remove_var("APPDATA"),
             }
             let _ = fs::remove_dir_all(&self.dir);
         }
