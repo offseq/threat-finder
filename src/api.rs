@@ -1068,6 +1068,8 @@ pub struct MatchHit {
     #[serde(default)] pub references: Vec<Value>,
     /// Radar slug — drives the per-finding detail URL. Absent on older servers.
     #[serde(default)] pub slug: Option<String>,
+    /// Concrete affected version(s).
+    #[serde(rename = "affectedVersions", default)] pub affected_versions: Vec<String>,
     /// Concrete fixed version(s) for remediation output.
     #[serde(rename = "fixedVersions", default)] pub fixed_versions: Vec<String>,
     /// Free-text remediation guidance.
@@ -1137,7 +1139,11 @@ pub fn match_to_entry(m: MatchHit) -> ThreatEntry {
         // Normalize to a date-only string so the match and search paths emit ONE
         // `publishedDate` shape (the search path already runs through clean_date).
         published_date: m.published_date.as_deref().map(|s| clean_date(Some(&Value::String(s.to_string())))),
-        affected_versions: None,
+        affected_versions: if m.affected_versions.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_value(m.affected_versions).unwrap_or(Value::Null))
+        },
         patch_available: m.patch_available,
         references: refs_to_strings(&m.references),
         confirmed: m.confirmed,
