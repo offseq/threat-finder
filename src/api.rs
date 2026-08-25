@@ -472,7 +472,7 @@ pub struct ThreatClient {
 impl ThreatClient {
     pub fn new(api_key: &str) -> Self {
         let client = Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(90))
             .connect_timeout(Duration::from_secs(8))
             .user_agent(USER_AGENT)
             .use_rustls_tls()

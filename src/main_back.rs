@@ -7,10 +7,9 @@ use std::sync::Arc;
 
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use tracing::{error, warn};
 
 use find_threats::{
-    auth, logging, sarif, scan,
+    auth, sarif, scan,
     ScanScope,
     engine::*,
     ThreatClient,
@@ -130,11 +129,6 @@ struct Cli {
     /// can take a while, and is best run from an elevated shell.
     #[arg(long)]
     windows_missing_updates: bool,
-
-    /// Log at debug level to the runtime log file (~/.local/share/threat-finder/logs
-    /// on Linux). Overridden by RUST_LOG if that's set. Does not affect terminal output.
-    #[arg(short, long)]
-    verbose: bool,
 }
 
 fn expand_tilde(path: &str) -> String {
@@ -566,14 +560,8 @@ fn print_registration(resp: &RegisterResponse, color: bool) {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    // Must stay alive for the whole run — it owns the background thread that
-    // flushes log lines to disk. Dropping it early would silently truncate
-    // the log.
-    let _log_guard = logging::init(cli.verbose);
-
     let os = detect_os();
     if let OsType::Unsupported(name) = &os {
-        error!(os = %name, "unsupported OS; nothing to scan");
         eprintln!("Unsupported OS: {name}. Nothing to scan.");
         return ExitCode::from(3);
     }
@@ -583,7 +571,6 @@ fn main() -> ExitCode {
     let api_key = match auth::resolve_api_key(cli.reset, interactive) {
         Some(k) => k,
         None => {
-            error!("no API key available");
             eprintln!(
                 "No API key available. Set OFFSEQ_API_KEY, or run interactively to enter one."
             );
@@ -611,7 +598,6 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             Err(e) => {
-                error!(error = %e, host_id = %host_id, "failed to unregister host");
                 eprintln!("[!] Failed to unregister host: {e}");
                 return ExitCode::from(1);
             }
@@ -643,7 +629,6 @@ fn main() -> ExitCode {
     if let Some(pb) = scan_pb {
         pb.finish_and_clear();
     }
-    tracing::debug!(asset_count = assets.len(), scope = ?cli.scope, "asset discovery complete");
 
     if !cli.include.is_empty() || !cli.exclude.is_empty() {
         // Match against BOTH the display name and the resolved package coordinate
@@ -669,7 +654,6 @@ fn main() -> ExitCode {
         let label = if cli.scope == ScanScope::All { "asset" } else { "service" };
         println!("Found {} {label}(s){suffix}\n", assets.len());
         if assets.is_empty() {
-            warn!("discovery returned zero assets; may need elevated privileges");
             eprintln!("[!] Nothing discovered — you may need elevated privileges (try sudo) for full discovery.");
         }
         if cli.scope == ScanScope::All && assets.len() > 15 {
@@ -685,7 +669,6 @@ fn main() -> ExitCode {
         Ok(o) => o,
         Err(ThreatError::RateLimitExceeded(msg)) => {
             if let Some(pb) = lookup_pb { pb.finish_and_clear(); }
-            warn!(message = %msg, "rate limit exceeded during match lookup");
             auth::prompt_upgrade(Some(&msg));
             return ExitCode::from(4);
         }
@@ -695,7 +678,6 @@ fn main() -> ExitCode {
         // network failure.
         Err(ThreatError::AccessDenied(msg)) => {
             if let Some(pb) = lookup_pb { pb.finish_and_clear(); }
-            warn!(message = %msg, "access denied during match lookup; plan upgrade required");
             eprintln!("{msg}");
             eprintln!("Upgrade your plan: https://radar.offseq.com/pricing");
             eprintln!("Manage access:    https://radar.offseq.com/console");
@@ -703,7 +685,6 @@ fn main() -> ExitCode {
         }
         Err(e) => {
             if let Some(pb) = lookup_pb { pb.finish_and_clear(); }
-            error!(error = %e, "match lookup failed");
             eprintln!("Match lookup failed: {e}");
             return ExitCode::from(1);
         }
@@ -765,7 +746,6 @@ fn main() -> ExitCode {
             PromptAnswer::No => action = RegisterAction::Skip,
             PromptAnswer::Never => {
                 if let Err(e) = auth::set_monitoring_prompt_mode("never") {
-                    warn!(error = %e, "failed to save monitoring preference");
                     eprintln!("[!] Couldn't save monitoring preference: {e}");
                 }
                 action = RegisterAction::Skip;
@@ -792,13 +772,11 @@ fn main() -> ExitCode {
             &inventory,
         ) {
             Ok(resp) => {
-                tracing::info!(host_id = %host_id, "monitoring registration succeeded");
                 final_results.registration = Some(RegistrationReport::from(&resp));
                 registration = Some(resp);
             }
             // Non-fatal: a one-line warning, exit code unchanged.
             Err(e) => {
-                warn!(error = %e, host_id = %host_id, "monitoring registration skipped");
                 eprintln!("[!] Monitoring registration skipped: {e}");
                 if is_host_or_asset_cap(&e) {
                     eprintln!("    Your plan's host/asset cap was reached — raise it at https://radar.offseq.com/pricing (manage hosts: https://radar.offseq.com/console).");
@@ -810,7 +788,6 @@ fn main() -> ExitCode {
     let output_json = match serde_json::to_string_pretty(&final_results) {
         Ok(j) => j,
         Err(e) => {
-            error!(error = %e, "failed to serialize results");
             eprintln!("Failed to serialize results: {e}");
             return ExitCode::from(1);
         }
@@ -818,7 +795,6 @@ fn main() -> ExitCode {
 
     if let Some(ref sarif_path) = cli.sarif {
         if let Err(e) = fs::write(sarif_path, sarif::to_sarif(&final_results)) {
-            error!(error = %e, path = %sarif_path.display(), "failed to write SARIF report");
             eprintln!("[!] Couldn't write SARIF to '{}': {e}", sarif_path.display());
             return ExitCode::from(1);
         } else if !cli.quiet {
@@ -833,7 +809,6 @@ fn main() -> ExitCode {
             match fs::write(&threats_path, &output_json) {
                 Ok(_) => break,
                 Err(e) => {
-                    error!(error = %e, path = %threats_path.display(), "failed to write threats report");
                     eprintln!("\n[!] Couldn't write to '{}': {e}", threats_path.display());
                     if !interactive {
                         return ExitCode::from(1);
@@ -863,10 +838,6 @@ fn main() -> ExitCode {
     let total = final_results.total_vulns();
     let word = if total == 1 { "vulnerability" } else { "vulnerabilities" };
     if !final_results.errors.is_empty() {
-        warn!(
-            failed_count = final_results.errors.len(),
-            "one or more service lookups failed; see the errors map in the JSON report for details"
-        );
         eprintln!(
             "[!] {} service lookup(s) failed; see the \"errors\" map in the output.",
             final_results.errors.len()
@@ -901,19 +872,16 @@ fn main() -> ExitCode {
                 && io::stdout().is_terminal();
             print_missing_updates(&updates, color, to_stdout);
         } else if !cli.quiet {
-            warn!("--windows-missing-updates ignored: not running on Windows");
             eprintln!("[!] --windows-missing-updates is only available on Windows; ignoring.");
         }
     }
 
     if let Some(f) = cli.fail_on {
         if fail_triggered(&final_results, f, cli.severity) {
-            tracing::info!(threshold = ?f, "run finished; --fail-on threshold met");
             return ExitCode::from(5);
         }
     }
 
-    tracing::info!(total_vulns = total, "run finished successfully");
     ExitCode::SUCCESS
 }
 

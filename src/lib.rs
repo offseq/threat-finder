@@ -10,6 +10,7 @@ pub mod auth;
 pub mod cpe;
 pub mod engine;
 pub mod sarif;
+pub mod logging;
 pub mod scan;
 pub mod windows;
 
