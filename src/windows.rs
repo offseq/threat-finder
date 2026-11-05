@@ -750,7 +750,7 @@ fn build_service_assets(services: Vec<WinService>, listeners: Vec<WinListener>) 
             version,
             sources: vec![Source::Probe],
             locations: if exe.is_empty() { Vec::new() } else { vec![exe] },
-            runtime: Some(Runtime { pid: s.pid, listeners, reachability: reach, exposed }),
+            runtime: Some(Runtime { pid: s.pid, listeners, reachability: reach, exposed, restart_pending: false }),
             cpe,
         });
     }

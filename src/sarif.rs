@@ -16,7 +16,18 @@ fn level(sev: Option<&str>) -> &'static str {
 }
 
 
-fn push_entry(rules: &mut BTreeMap<String, Value>, results: &mut Vec<Value>, asset: &str, t: &ThreatEntry) {
+/// GitHub code scanning drops results without a physical location and resolves
+/// URIs against the repository root, so the asset's path is made relative.
+fn artifact_uri(exe: &str) -> String {
+    let path = exe.replace('\\', "/");
+    let path = match path.as_bytes() {
+        [d, b':', ..] if d.is_ascii_alphabetic() => &path[2..],
+        _ => &path,
+    };
+    path.trim_start_matches('/').to_string()
+}
+
+fn push_entry(rules: &mut BTreeMap<String, Value>, results: &mut Vec<Value>, asset: &str, exe: Option<&str>, t: &ThreatEntry) {
     let id = t.cve_id.clone().or_else(|| t.id.clone()).unwrap_or_else(|| "UNKNOWN".to_string());
 
     let rule = rules.entry(id.clone()).or_insert_with(|| {
@@ -82,13 +93,18 @@ fn push_entry(rules: &mut BTreeMap<String, Value>, results: &mut Vec<Value>, ass
         props["fixedVersions"] = json!(t.fixed_versions);
     }
 
+    let mut location = json!({ "logicalLocations": [{ "fullyQualifiedName": asset, "kind": "module" }] });
+    if let Some(exe) = exe {
+        location["physicalLocation"] = json!({
+            "artifactLocation": { "uri": artifact_uri(exe) },
+            "region": { "startLine": 1 },
+        });
+    }
     let mut result = json!({
         "ruleId": id,
         "level": level(t.severity.as_deref()),
         "message": { "text": text },
-        "locations": [{
-            "logicalLocations": [{ "fullyQualifiedName": asset, "kind": "module" }]
-        }],
+        "locations": [location],
         "properties": props,
     });
     if let Some(rem) = &t.remediation {
@@ -107,8 +123,9 @@ pub fn to_sarif(results: &BatchResults) -> String {
     let mut out: Vec<Value> = Vec::new();
 
     for (asset, entries) in &results.services {
+        let exe = results.assets.get(asset).map(|a| a.exe.as_str()).filter(|e| !e.is_empty());
         for t in entries {
-            push_entry(&mut rules, &mut out, asset, t);
+            push_entry(&mut rules, &mut out, asset, exe, t);
         }
     }
 

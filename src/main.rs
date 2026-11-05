@@ -335,6 +335,9 @@ fn signal_badges(t: &ThreatEntry, color: bool) -> String {
 
 /// Ranked, optionally-colored terminal summary — exposed and highest-risk first.
 fn print_summary(results: &BatchResults, color: bool) {
+    for key in results.assets.iter().filter(|(_, a)| a.restart_pending).map(|(k, _)| k) {
+        println!("{}", paint(&format!("[!] {key}: running binary was replaced on disk; restart to apply the update"), "1;33", color));
+    }
     let mut rows: Vec<(&String, bool, &Vec<ThreatEntry>)> = results.services.iter()
         .filter(|(_, v)| !v.is_empty())
         .map(|(k, v)| (k, results.assets.get(k).map(|a| a.exposed).unwrap_or(false), v))
@@ -833,6 +836,7 @@ fn main() -> ExitCode {
                 reachability: rt.map(|r| r.reachability.as_str()).unwrap_or("none").to_string(),
                 listeners: rt.map(|r| r.listeners.clone()).unwrap_or_default(),
                 upgrade_to: outcome.upgrades.get(&a.report_key()).cloned(),
+                restart_pending: rt.is_some_and(|r| r.restart_pending),
             })
         }).collect();
 
@@ -961,25 +965,6 @@ fn main() -> ExitCode {
         }
     };
 
-    if let Some(ref sarif_path) = cli.sarif {
-        if let Err(e) = write_private(sarif_path, sarif::to_sarif(&final_results).as_bytes()) {
-            error!(error = %e, path = %sarif_path.display(), "failed to write SARIF report");
-            eprintln!("[!] Couldn't write SARIF to '{}': {e}", sarif_path.display());
-            return ExitCode::from(1);
-        } else {
-            say!("SARIF report written to {}", sarif_path.display());
-        }
-    }
-
-    if let (Some(vex_path), Some(doc)) = (&cli.vex, &vex_doc) {
-        if let Err(e) = write_private(vex_path, doc) {
-            error!(error = %e, path = %vex_path.display(), "failed to write VEX document");
-            eprintln!("[!] Couldn't write VEX to '{}': {e}", vex_path.display());
-            return ExitCode::from(1);
-        }
-        say!("VEX document written to {}", vex_path.display());
-    }
-
     if to_stdout {
         println!("{output_json}");
     } else {
@@ -1005,6 +990,24 @@ fn main() -> ExitCode {
                 }
             }
         }
+    }
+
+    if let Some(ref sarif_path) = cli.sarif {
+        if let Err(e) = write_private(sarif_path, sarif::to_sarif(&final_results).as_bytes()) {
+            error!(error = %e, path = %sarif_path.display(), "failed to write SARIF report");
+            eprintln!("[!] Couldn't write SARIF to '{}': {e}", sarif_path.display());
+            return ExitCode::from(1);
+        }
+        say!("SARIF report written to {}", sarif_path.display());
+    }
+
+    if let (Some(vex_path), Some(doc)) = (&cli.vex, &vex_doc) {
+        if let Err(e) = write_private(vex_path, doc) {
+            error!(error = %e, path = %vex_path.display(), "failed to write VEX document");
+            eprintln!("[!] Couldn't write VEX to '{}': {e}", vex_path.display());
+            return ExitCode::from(1);
+        }
+        say!("VEX document written to {}", vex_path.display());
     }
 
     let color = !cli.no_color && std::env::var_os("NO_COLOR").is_none() && io::stdout().is_terminal();
@@ -1184,9 +1187,9 @@ fn is_host_or_asset_cap(err: &ThreatError) -> bool {
     }
 }
 
-/// Prompt the user to register N items for monitoring. Returns the parsed answer
-/// (defaulting to Yes on EOF/empty so a bare Enter accepts). The noun tracks the
-/// scan scope so `--scope all` says "packages", not "services".
+/// Prompt the user to register N items for monitoring. A bare Enter accepts;
+/// EOF answers No. The noun tracks the scan scope so `--scope all` says
+/// "packages", not "services".
 fn prompt_register(count: usize, scope: ScanScope) -> PromptAnswer {
     let noun = inventory_noun(scope, count);
     print!(
@@ -1310,7 +1313,7 @@ mod tests {
             version: "1.24.0".into(), sources: vec![Source::Probe], locations: vec![],
             runtime: Some(Runtime {
                 pid: Some(9), listeners: vec!["tcp 0.0.0.0:443".into()],
-                reachability: Reachability::Public, exposed: true,
+                reachability: Reachability::Public, exposed: true, restart_pending: false,
             }),
             cpe: None,
         };
@@ -1411,17 +1414,25 @@ mod tests {
     #[test]
     fn sarif_is_valid_json_with_runs() {
         use find_threats::*;
-        let mut services = std::collections::BTreeMap::new();
-        services.insert("nginx@1.24.0".to_string(), vec![
-            serde_json::from_value::<ThreatEntry>(serde_json::json!({
-                "cveId": "CVE-2024-0001", "title": "x", "severity": "high",
-                "kev": true, "references": ["https://e/1"], "matchBasis": "constraint"
-            })).unwrap()
+        let entry = serde_json::from_value::<ThreatEntry>(serde_json::json!({
+            "cveId": "CVE-2024-0001", "title": "x", "severity": "high",
+            "kev": true, "references": ["https://e/1"], "matchBasis": "constraint"
+        })).unwrap();
+        let services = std::collections::BTreeMap::from([
+            ("nginx@1.24.0".to_string(), vec![entry.clone()]),
+            ("zlib@1.2.11".to_string(), vec![entry]),
         ]);
+        let asset = |exe: &str| AssetInfo {
+            exe: exe.into(), version: "1".into(), version_source: "probe".into(), exposed: false,
+            reachability: "none".into(), listeners: vec![], upgrade_to: None, restart_pending: false,
+        };
         let results = BatchResults {
             meta: Meta::default(), services, by_cve: std::collections::BTreeMap::new(),
             unconfirmed: std::collections::BTreeMap::new(),
-            assets: std::collections::BTreeMap::new(),
+            assets: std::collections::BTreeMap::from([
+                ("nginx@1.24.0".to_string(), asset("/usr/sbin/nginx")),
+                ("zlib@1.2.11".to_string(), asset("")),
+            ]),
             errors: std::collections::BTreeMap::new(),
             rejected: std::collections::BTreeMap::new(),
             truncated: vec![],
@@ -1432,5 +1443,11 @@ mod tests {
         assert_eq!(v["version"], "2.1.0");
         assert_eq!(v["runs"][0]["results"][0]["ruleId"], "CVE-2024-0001");
         assert_eq!(v["runs"][0]["results"][0]["level"], "error");
+        let loc = &v["runs"][0]["results"][0]["locations"][0];
+        assert_eq!(loc["physicalLocation"]["artifactLocation"]["uri"], "usr/sbin/nginx");
+        assert_eq!(loc["physicalLocation"]["region"]["startLine"], 1);
+        let loc = &v["runs"][0]["results"][1]["locations"][0];
+        assert!(loc.get("physicalLocation").is_none());
+        assert_eq!(loc["logicalLocations"][0]["fullyQualifiedName"], "zlib@1.2.11");
     }
 }

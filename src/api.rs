@@ -368,6 +368,9 @@ pub struct AssetInfo {
     /// Smallest version Radar knows fixes every match on this asset.
     #[serde(rename = "upgradeTo", skip_serializing_if = "Option::is_none")]
     pub upgrade_to: Option<String>,
+    /// The running binary was replaced on disk; the reported version is the new one.
+    #[serde(rename = "restartPending", skip_serializing_if = "std::ops::Not::not")]
+    pub restart_pending: bool,
 }
 
 /// Report envelope metadata (stable across runs — no timestamp, so reports diff).
@@ -1378,6 +1381,7 @@ impl ScanReport {
                 reachability: "none".to_string(),
                 listeners: Vec::new(),
                 upgrade_to: r.upgrade_to,
+                restart_pending: false,
             }))
             .collect();
         BatchResults {
