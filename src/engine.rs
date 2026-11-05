@@ -2,6 +2,7 @@
 //! sourcing (package DB first, `--version` probe as fallback), and
 //! network-exposure correlation. Pure host interaction — no API types.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
@@ -13,14 +14,10 @@ use std::sync::LazyLock as Lazy;
 use rayon::prelude::*;
 use regex::Regex;
 use serde::Serialize;
-#[cfg(target_os = "linux")]
-use zbus::blocking::Connection;
-#[cfg(target_os = "linux")]
-use zbus::zvariant::OwnedValue;
 
 #[derive(Debug, Clone)]
 pub enum LinuxDistro {
-    Debian, Ubuntu, Kali, Fedora, Rhel, CentOs,
+    Debian, Ubuntu, Kali, Fedora, Rhel, CentOs, Rocky, Alma,
     Arch, Alpine, OpenSuse, Gentoo, NixOs, Unknown(String),
 }
 
@@ -69,15 +66,6 @@ pub enum VersionSource {
     Probe,
 }
 
-impl VersionSource {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            VersionSource::PackageDb => "package-db",
-            VersionSource::Probe => "probe",
-        }
-    }
-}
-
 /// How reachable a listening socket is. Ordered least → most exposed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Reachability {
@@ -120,32 +108,70 @@ pub struct SystemFacts {
     pub distro_version: String,
 }
 
+/// Parse `os-release` (`KEY=value`, optionally single- or double-quoted).
+pub fn parse_os_release(content: &str) -> HashMap<String, String> {
+    content
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| {
+            let v = v.trim();
+            let v = v
+                .strip_prefix('"').and_then(|x| x.strip_suffix('"'))
+                .or_else(|| v.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')))
+                .unwrap_or(v);
+            (k.trim().to_string(), v.to_string())
+        })
+        .collect()
+}
+
+static OS_RELEASE: Lazy<HashMap<String, String>> = Lazy::new(|| {
+    ["/etc/os-release", "/usr/lib/os-release"]
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+        .map(|c| parse_os_release(&c))
+        .unwrap_or_default()
+});
+
+/// A non-empty `os-release` field (e.g. `VERSION_CODENAME`, `VERSION_ID`).
+pub fn os_release_field(key: &str) -> Option<String> {
+    OS_RELEASE.get(key).filter(|v| !v.is_empty()).cloned()
+}
+
+/// Distro from `os-release`: an exact `ID` first, then the `ID_LIKE` family with
+/// RHEL ahead of Fedora (Rocky, Alma, Oracle and Amazon all list both).
+pub fn distro_from_os_release(f: &HashMap<String, String>) -> Option<LinuxDistro> {
+    let by_id = |id: &str| match id {
+        "kali" => Some(LinuxDistro::Kali),
+        "ubuntu" => Some(LinuxDistro::Ubuntu),
+        "debian" => Some(LinuxDistro::Debian),
+        "fedora" => Some(LinuxDistro::Fedora),
+        "rhel" | "ol" | "amzn" => Some(LinuxDistro::Rhel),
+        "centos" => Some(LinuxDistro::CentOs),
+        "rocky" => Some(LinuxDistro::Rocky),
+        "almalinux" => Some(LinuxDistro::Alma),
+        "arch" => Some(LinuxDistro::Arch),
+        "alpine" => Some(LinuxDistro::Alpine),
+        "gentoo" => Some(LinuxDistro::Gentoo),
+        "nixos" => Some(LinuxDistro::NixOs),
+        s if s.contains("suse") || s == "sles" => Some(LinuxDistro::OpenSuse),
+        _ => None,
+    };
+    let field = |k: &str| f.get(k).map(|v| v.to_ascii_lowercase()).unwrap_or_default();
+    if let Some(d) = by_id(&field("ID")) {
+        return Some(d);
+    }
+    let like = field("ID_LIKE");
+    let like: Vec<&str> = like.split_whitespace().collect();
+    ["ubuntu", "debian", "rhel", "centos", "fedora", "suse", "opensuse", "arch", "alpine"]
+        .into_iter()
+        .find(|fam| like.contains(fam))
+        .and_then(by_id)
+}
+
 pub fn detect_linux_distro() -> LinuxDistro {
-    if let Ok(content) = std::fs::read_to_string("/etc/os-release") {
-        let field = |key: &str| -> String {
-            content.lines()
-                .find(|l| l.starts_with(key))
-                .map(|l| l[key.len()..].trim_matches('"').to_lowercase())
-                .unwrap_or_default()
-        };
-        for candidate in [field("ID="), field("ID_LIKE=")] {
-            let d = match candidate.as_str() {
-                s if s.contains("kali")                         => Some(LinuxDistro::Kali),
-                s if s.contains("ubuntu")                       => Some(LinuxDistro::Ubuntu),
-                s if s.contains("debian")                       => Some(LinuxDistro::Debian),
-                s if s.contains("fedora")                       => Some(LinuxDistro::Fedora),
-                s if s.contains("rhel") || s.contains("redhat")=> Some(LinuxDistro::Rhel),
-                s if s.contains("centos")                       => Some(LinuxDistro::CentOs),
-                s if s.contains("arch")                         => Some(LinuxDistro::Arch),
-                s if s.contains("alpine")                       => Some(LinuxDistro::Alpine),
-                s if s.contains("suse")                         => Some(LinuxDistro::OpenSuse),
-                s if s.contains("gentoo")                       => Some(LinuxDistro::Gentoo),
-                s if s.contains("nix")                          => Some(LinuxDistro::NixOs),
-                _ => None,
-            };
-            if let Some(d) = d { return d; }
-        }
-        return LinuxDistro::Unknown(field("ID="));
+    if !OS_RELEASE.is_empty() {
+        return distro_from_os_release(&OS_RELEASE)
+            .unwrap_or_else(|| LinuxDistro::Unknown(os_release_field("ID").unwrap_or_default().to_lowercase()));
     }
     for (path, distro) in &[
         ("/etc/debian_version", LinuxDistro::Debian),
@@ -300,103 +326,102 @@ pub struct UnitEntry {
     pid:  Option<u32>,
 }
 
-#[cfg(target_os = "linux")]
-pub static EXECSTART_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#""/([^"]+)""#).unwrap());
+/// One unit's `MainPID` / `ExecStart` from a `systemctl show` block.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct UnitProps {
+    pub id: String,
+    pub pid: Option<u32>,
+    pub exec_path: Option<String>,
+}
 
-// One row of systemd's Manager.ListUnits() reply:
-// (name, description, load_state, active_state, sub_state, following,
-//  unit_obj_path, job_id, job_type, job_obj_path)
-#[cfg(target_os = "linux")]
-pub type SystemdUnit = (
-    String, String, String, String, String, String,
-    zbus::zvariant::OwnedObjectPath, u32, String,
-    zbus::zvariant::OwnedObjectPath,
-);
+/// Active `.service` unit names from `systemctl list-units --plain --no-legend`.
+pub fn parse_unit_list(out: &str) -> Vec<String> {
+    out.lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|u| u.ends_with(".service"))
+        .map(str::to_string)
+        .collect()
+}
 
-#[cfg(target_os = "linux")]
-pub fn list_systemd_units(conn: &Connection) -> Vec<UnitEntry> {
-    let proxy = match zbus::blocking::Proxy::new(
-        conn,
-        "org.freedesktop.systemd1",
-        "/org/freedesktop/systemd1",
-        "org.freedesktop.systemd1.Manager",
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("[!] could not open systemd manager proxy: {e}");
-            return vec![];
-        }
-    };
-
-    // A typed-decode error here used to be swallowed (`unwrap_or_default()`),
-    // turning a pure-systemd host into a silent "clean" scan. Log it and return
-    // an explicit empty list so the failure is visible rather than masked.
-    let units: Vec<SystemdUnit> = match proxy.call("ListUnits", &()) {
-        Ok(u) => u,
-        Err(e) => {
-            eprintln!("[!] systemd ListUnits failed ({e}); no services discovered via systemd.");
-            return vec![];
-        }
-    };
-
-    units.into_iter()
-        .filter(|u| u.3 == "active" && u.0.ends_with(".service"))
-        // parallel, resolve the exe path for each unit
-        .collect::<Vec<_>>()
-        .into_par_iter()
-        .filter_map(|u| {
-            let unit_name = u.0.trim_end_matches(".service").to_string();
-            let obj_path  = u.6.as_str().to_string();
-
-            let (exe, pid) = resolve_exe(conn, &obj_path, &unit_name)?;
-
-            let exe_base = exe.rsplit('/').next().unwrap_or("");
-            if exe_base == "true" || exe_base == "false" { return None; }
-
-            Some(UnitEntry { name: unit_name, exe, pid })
+/// Parse `systemctl show -p Id -p MainPID -p ExecStart a b …`: one blank-line
+/// separated block per unit; `ExecStart={ path=/usr/sbin/x ; argv[]=… }`.
+pub fn parse_unit_props(out: &str) -> Vec<UnitProps> {
+    out.split("\n\n")
+        .filter_map(|block| {
+            let mut p = UnitProps::default();
+            for line in block.lines() {
+                let Some((k, v)) = line.split_once('=') else { continue };
+                match k {
+                    "Id" => p.id = v.to_string(),
+                    "MainPID" => p.pid = v.trim().parse().ok().filter(|n| *n > 0),
+                    "ExecStart" if p.exec_path.is_none() => {
+                        p.exec_path = v.split("path=").nth(1)
+                            .and_then(|s| s.split([' ', ';']).next())
+                            .filter(|s| s.starts_with('/'))
+                            .map(str::to_string);
+                    }
+                    _ => {}
+                }
+            }
+            (!p.id.is_empty()).then_some(p)
         })
         .collect()
 }
 
-/// Resolve a unit to (absolute binary, MainPID). PID is kept for exposure
+/// systemd discovery through `systemctl` (two calls total, whatever the unit count).
+#[cfg(target_os = "linux")]
+pub fn list_systemd_units() -> Vec<UnitEntry> {
+    let Some(list) = run_cmd(
+        "systemctl",
+        &["list-units", "--type=service", "--state=running", "--plain", "--no-legend", "--no-pager"],
+    ) else {
+        return vec![];
+    };
+    let units = parse_unit_list(&list);
+    if units.is_empty() {
+        return vec![];
+    }
+    let mut args = vec!["show", "--no-pager", "-p", "Id", "-p", "MainPID", "-p", "ExecStart"];
+    args.extend(units.iter().map(String::as_str));
+    let Some(show) = run_cmd("systemctl", &args) else {
+        eprintln!("[!] systemctl show failed; no services discovered via systemd.");
+        return vec![];
+    };
+
+    parse_unit_props(&show)
+        .into_par_iter()
+        .filter_map(|u| {
+            let unit_name = u.id.trim_end_matches(".service").to_string();
+            let exe = resolve_exe(&unit_name, u.pid, u.exec_path.as_deref())?;
+            let exe_base = exe.rsplit('/').next().unwrap_or("");
+            if exe_base == "true" || exe_base == "false" { return None; }
+            Some(UnitEntry { name: unit_name, exe, pid: u.pid })
+        })
+        .collect()
+}
+
+/// Resolve a unit to its absolute binary. PID is kept by the caller for exposure
 /// correlation even when the path comes from a non-PID strategy.
 #[cfg(target_os = "linux")]
-pub fn resolve_exe(conn: &Connection, obj_path: &str, unit_name: &str) -> Option<(String, Option<u32>)> {
-    let svc_proxy = zbus::blocking::Proxy::new(
-        conn,
-        "org.freedesktop.systemd1",
-        obj_path,
-        "org.freedesktop.systemd1.Service",
-    ).ok()?;
-
-    let pid = svc_proxy.get_property::<u32>("MainPID").ok().filter(|p| *p > 0);
-
+fn resolve_exe(unit_name: &str, pid: Option<u32>, exec_path: Option<&str>) -> Option<String> {
     if let Some(pid_val) = pid {
-        let proc_exe = format!("/proc/{pid_val}/exe");
-        if let Ok(resolved) = std::fs::read_link(&proc_exe) {
-            let path = resolved.to_string_lossy().into_owned();
+        if let Ok(resolved) = std::fs::read_link(format!("/proc/{pid_val}/exe")) {
             // strip " (deleted)" suffix left when a binary is updated while running
-            let path = path.trim_end_matches(" (deleted)").to_string();
-            if !path.is_empty() && path.starts_with('/') {
-                return Some((path, pid));
+            let path = resolved.to_string_lossy().trim_end_matches(" (deleted)").to_string();
+            if path.starts_with('/') {
+                return Some(path);
             }
         }
     }
 
-    if let Ok(val) = svc_proxy.get_property::<OwnedValue>("ExecStart") {
-        let raw = format!("{val:?}");
-        if let Some(cap) = EXECSTART_RE.captures(&raw) {
-            let path = format!("/{}", &cap[1]);
-            if std::path::Path::new(&path).exists() {
-                return Some((path, pid));
-            }
-        }
+    if let Some(path) = exec_path.filter(|p| std::path::Path::new(p).exists()) {
+        return Some(path.to_string());
     }
 
     for prefix in &["/usr/lib/systemd/", "/lib/systemd/"] {
         let candidate = format!("{prefix}{unit_name}");
         if std::path::Path::new(&candidate).exists() {
-            return Some((candidate, pid));
+            return Some(candidate);
         }
     }
 
@@ -405,7 +430,7 @@ pub fn resolve_exe(conn: &Connection, obj_path: &str, unit_name: &str) -> Option
     }
 
     if unit_name.starts_with("systemd-") {
-        return Some(("/usr/lib/systemd/systemd".to_string(), pid));
+        return Some("/usr/lib/systemd/systemd".to_string());
     }
 
     None
@@ -437,6 +462,8 @@ pub fn parse_linux_distro_version(distro: &LinuxDistro) -> (String, String) {
         LinuxDistro::Fedora   => "fedora",
         LinuxDistro::Rhel     => "rhel",
         LinuxDistro::CentOs   => "centos",
+        LinuxDistro::Rocky    => "rocky",
+        LinuxDistro::Alma     => "almalinux",
         LinuxDistro::Arch     => "arch",
         LinuxDistro::Alpine   => "alpine",
         LinuxDistro::OpenSuse => "opensuse",
@@ -445,14 +472,7 @@ pub fn parse_linux_distro_version(distro: &LinuxDistro) -> (String, String) {
         LinuxDistro::Unknown(s) => s.as_str(),
     };
 
-    let version = std::fs::read_to_string("/etc/os-release")
-        .unwrap_or_default()
-        .lines()
-        .find(|l| l.starts_with("VERSION_ID="))
-        .map(|l| l["VERSION_ID=".len()..].trim_matches('"').to_string())
-        .unwrap_or_default();
-
-    (name.to_string(), version)
+    (name.to_string(), os_release_field("VERSION_ID").unwrap_or_default())
 }
 
 
@@ -529,7 +549,8 @@ pub fn package_of(exe: &str, os: &OsType) -> Option<(String, String)> {
     match os {
         OsType::Linux(distro) => match distro {
             LinuxDistro::Debian | LinuxDistro::Ubuntu | LinuxDistro::Kali => dpkg_of(&path),
-            LinuxDistro::Fedora | LinuxDistro::Rhel | LinuxDistro::CentOs | LinuxDistro::OpenSuse => rpm_of(&path),
+            LinuxDistro::Fedora | LinuxDistro::Rhel | LinuxDistro::CentOs | LinuxDistro::Rocky
+            | LinuxDistro::Alma | LinuxDistro::OpenSuse => rpm_of(&path),
             LinuxDistro::Arch => pacman_of(&path),
             LinuxDistro::Alpine => apk_of(&path),
             _ => dpkg_of(&path)
@@ -554,7 +575,9 @@ pub fn dpkg_of(path: &str) -> Option<(String, String)> {
     // preceded by "diversion by <pkg> from: /path" lines for diverted files.
     let owner = run_cmd("dpkg-query", &["-S", path])?;
     let pkg = dpkg_owner_name(&owner)?;
-    let ver = run_cmd("dpkg-query", &["-W", "-f=${Version}", &pkg])?.trim().to_string();
+    // One line per installed arch of a multiarch package; they share a version.
+    let ver = run_cmd("dpkg-query", &["-W", "-f=${Version}\\n", &pkg])?
+        .lines().next().unwrap_or_default().trim().to_string();
     (!ver.is_empty()).then_some((pkg, ver))
 }
 
@@ -731,7 +754,8 @@ pub fn lsof_listeners(pid: u32) -> Vec<String> {
 
 pub fn lsof_names(pid: u32, filter: &[&str]) -> Vec<String> {
     let pid = pid.to_string();
-    let mut args = vec!["-nP", "-p", &pid];
+    // `-a` ANDs `-p` with the `-i` filter; lsof ORs selections by default.
+    let mut args = vec!["-a", "-nP", "-p", &pid];
     args.extend_from_slice(filter);
     args.push("-Fn");
     run_cmd("lsof", &args)
@@ -915,45 +939,97 @@ pub static VERSION_EXTRACT_RE: Lazy<Regex> = Lazy::new(|| {
     ).unwrap()
 });
 
+/// Whether `path` and every ancestor are owned by root or by us and not writable
+/// by anyone else (sticky dirs excepted), so probing it cannot run someone
+/// else's code with our privileges.
+#[cfg(unix)]
+fn trusted_executable(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    path.ancestors().all(|p| {
+        let Ok(m) = fs::metadata(p) else { return p.as_os_str().is_empty() };
+        let writable_by_others = m.mode() & 0o022 != 0 && !(m.is_dir() && m.mode() & 0o1000 != 0);
+        (m.uid() == 0 || m.uid() == euid) && !writable_by_others
+    })
+}
+
+#[cfg(not(unix))]
+fn trusted_executable(_: &Path) -> bool {
+    true
+}
+
+/// Read a pipe on its own thread so a child that never closes it (a forked
+/// daemon inheriting the fd) cannot block the caller past its deadline.
+fn drain(mut r: impl Read + Send + 'static) -> std::sync::mpsc::Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = (&mut r).take(64 * 1024).read_to_end(&mut buf);
+        let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+    });
+    rx
+}
+
 pub fn run_timed(exe: &str, flag: &str, timeout: Duration) -> Option<(bool, String, String)> {
-    // Only ever execute an absolute path to a real file. This function runs
-    // discovered binaries (often as root), so a bare name resolved via PATH is
-    // refused outright to close the PATH-hijack code-execution hole.
-    if !exe.starts_with('/') || !Path::new(exe).is_file() {
+    // Only an absolute path to a real, trusted file: this runs discovered
+    // binaries, often as root.
+    if !exe.starts_with('/') {
+        return None;
+    }
+    // Check and run the resolved target so a symlink cannot swap it after the check.
+    let path = fs::canonicalize(exe).ok()?;
+    if !path.is_file() || !trusted_executable(&path) {
         return None;
     }
 
-    let mut child = Command::new(exe)
-        .arg(flag)
+    let mut cmd = Command::new(&path);
+    cmd.arg(flag)
         .env_clear()
         .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
         .env("LC_ALL", "C")
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Multi-call binaries (busybox) dispatch on argv[0], so keep the name as found.
+        cmd.arg0(exe).process_group(0);
+    }
+    let mut child = cmd.spawn().ok()?;
+    let out = drain(child.stdout.take()?);
+    let err = drain(child.stderr.take()?);
 
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(s)) => break Some(s),
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+            Ok(Some(s)) => break s,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(30)),
+            _ => {
+                kill_tree(&mut child);
                 return None;
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(30)),
-            Err(_)   => break None,
         }
-    }?;
-
-    let mut out = String::new();
-    let mut err = String::new();
-    if let Some(mut o) = child.stdout.take() { let _ = o.read_to_string(&mut out); }
-    if let Some(mut e) = child.stderr.take() { let _ = e.read_to_string(&mut err); }
+    };
+    let grace = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(100));
+    let out = out.recv_timeout(grace).unwrap_or_default();
+    let err = err.recv_timeout(Duration::from_millis(100)).unwrap_or_default();
+    // A `--version` that daemonized must not outlive the probe.
+    kill_tree(&mut child);
     Some((status.success(), out, err))
+}
+
+/// Kill the child's whole process group (it may have forked) and reap it.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(pgid) = i32::try_from(child.id()) {
+        // SAFETY: signalling our own child's process group; failure is harmless.
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 // Extract a clean version token from raw `--version` output.
@@ -963,12 +1039,10 @@ pub fn extract_version(text: &str) -> Option<String> {
         "invalid", "unknown option", "usage:", "error:",
         "must be", "superuser", "permission",
     ];
-    let bad = BAD;
-
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty()).take(10) {
         let lower = line.to_lowercase();
 
-        if bad.iter().any(|b| lower.contains(b)) {
+        if BAD.iter().any(|b| lower.contains(b)) {
             continue;
         }
 
@@ -1252,23 +1326,18 @@ pub fn scan_smf(os: &OsType) -> Vec<ServiceInfo> {
         .collect()
 }
 
-/// Linux service discovery: systemd over D-Bus (Linux builds only), falling back
-/// to SysV/OpenRC. The `cfg(not(linux))` body keeps the `OsType::Linux` match arm
-/// compiling on macOS/Windows (where it is never actually reached).
+/// Linux service discovery: systemd, falling back to SysV/OpenRC. The
+/// `cfg(not(linux))` body keeps the `OsType::Linux` match arm compiling on
+/// macOS/Windows (where it is never actually reached).
 #[cfg(target_os = "linux")]
 fn scan_linux(os: &OsType) -> Vec<ServiceInfo> {
-    if let Ok(conn) = Connection::system() {
-        let units = list_systemd_units(&conn);
-        if !units.is_empty() {
-            return units.into_par_iter()
-                .filter_map(|u| make_service(&u.name, &u.exe, u.pid, os))
-                .collect();
-        }
-        // D-Bus reachable but no units found — fall back to SysV/OpenRC.
-        scan_sysvinit(os)
-    } else {
-        scan_sysvinit(os)
+    let units = list_systemd_units();
+    if units.is_empty() {
+        return scan_sysvinit(os);
     }
+    units.into_par_iter()
+        .filter_map(|u| make_service(&u.name, &u.exe, u.pid, os))
+        .collect()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1297,6 +1366,49 @@ pub fn scan_services(os: &OsType) -> Vec<ServiceInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn os_release_detects_rhel_clones_and_derivatives() {
+        let d = |c: &str| distro_from_os_release(&parse_os_release(c));
+        assert!(matches!(d("ID=\"rocky\"\nID_LIKE=\"rhel centos fedora\""), Some(LinuxDistro::Rocky)));
+        assert!(matches!(d("ID=almalinux\nID_LIKE=\"rhel centos fedora\""), Some(LinuxDistro::Alma)));
+        assert!(matches!(d("ID=\"amzn\"\nID_LIKE=\"centos rhel fedora\""), Some(LinuxDistro::Rhel)));
+        assert!(matches!(d("ID=\"ol\"\nID_LIKE=\"fedora\""), Some(LinuxDistro::Rhel)));
+        assert!(matches!(d("ID=eurolinux\nID_LIKE=\"rhel fedora centos\""), Some(LinuxDistro::Rhel)));
+        assert!(matches!(d("ID=linuxmint\nID_LIKE=\"ubuntu debian\""), Some(LinuxDistro::Ubuntu)));
+        assert!(matches!(d("ID='opensuse-leap'\nID_LIKE='suse opensuse'"), Some(LinuxDistro::OpenSuse)));
+        assert!(matches!(d("ID=fedora"), Some(LinuxDistro::Fedora)));
+        assert!(d("ID=void").is_none());
+    }
+
+    #[test]
+    fn os_release_strips_matching_quotes_only() {
+        let f = parse_os_release("A=\"x y\"\nB='z'\nC=plain\nD=\"unterminated\n");
+        assert_eq!(f["A"], "x y");
+        assert_eq!(f["B"], "z");
+        assert_eq!(f["C"], "plain");
+        assert_eq!(f["D"], "\"unterminated");
+    }
+
+    #[test]
+    fn systemctl_unit_list_keeps_services_only() {
+        let out = "nginx.service loaded active running A high performance web server\n\
+                   ssh.service   loaded active running OpenBSD Secure Shell server\n\
+                   dbus.socket   loaded active running D-Bus System Message Bus Socket\n";
+        assert_eq!(parse_unit_list(out), vec!["nginx.service", "ssh.service"]);
+    }
+
+    #[test]
+    fn systemctl_show_blocks_parse_pid_and_exec_path() {
+        let out = "MainPID=812\nExecStart={ path=/usr/sbin/nginx ; argv[]=/usr/sbin/nginx -g daemon on; ; ignore_errors=no }\nId=nginx.service\n\n\
+                   MainPID=0\nExecStart=\nId=cron.service\n";
+        let units = parse_unit_props(out);
+        assert_eq!(units, vec![
+            UnitProps { id: "nginx.service".into(), pid: Some(812), exec_path: Some("/usr/sbin/nginx".into()) },
+            UnitProps { id: "cron.service".into(), pid: None, exec_path: None },
+        ]);
+    }
+
     #[cfg(unix)]
     use std::path::Path;
     use std::time::Duration;
@@ -1345,6 +1457,24 @@ mod tests {
     #[test]
     fn resolve_binary_rejects_garbage_everywhere() {
         assert_eq!(resolve_binary("definitely-not-a-real-binary-xyz"), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn probe_refuses_binaries_others_can_replace() {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(trusted_executable(Path::new("/bin/sh")));
+        let dir = std::env::temp_dir().join(format!("tf-probe-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("tool");
+        fs::write(&exe, "#!/bin/sh\necho tool 1.2.3\n").unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!trusted_executable(&exe), "world-writable parent");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o757)).unwrap();
+        assert!(!trusted_executable(&exe), "world-writable file");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1455,20 +1585,6 @@ fn atom_split(atom: &str) -> Option<(String, String)> {
     (!name.is_empty() && !ver.is_empty()).then_some((name, ver))
 }
 
-/// Read a single field from /etc/os-release (e.g. VERSION_CODENAME, VERSION_ID).
-pub fn os_release_field(key: &str) -> Option<String> {
-    let content = std::fs::read_to_string("/etc/os-release").ok()?;
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix(key).and_then(|r| r.strip_prefix('=')) {
-            let v = rest.trim().trim_matches('"').to_string();
-            if !v.is_empty() {
-                return Some(v);
-            }
-        }
-    }
-    None
-}
-
 pub fn parse_dpkg_list(out: &str) -> Vec<(String, String)> {
     out.lines().filter_map(|l| {
         let mut c = l.split('\t');
@@ -1552,7 +1668,8 @@ pub fn list_installed(os: &OsType) -> Vec<InstalledPkg> {
         OsType::Linux(distro) => match distro {
             LinuxDistro::Debian | LinuxDistro::Ubuntu | LinuxDistro::Kali =>
                 tagged("dpkg", run_cmd("dpkg-query", &["-W", "-f=${db:Status-Abbrev}\t${binary:Package}\t${Version}\t${Architecture}\n"]).map(|o| parse_dpkg_list(&o)).unwrap_or_default()),
-            LinuxDistro::Fedora | LinuxDistro::Rhel | LinuxDistro::CentOs | LinuxDistro::OpenSuse =>
+            LinuxDistro::Fedora | LinuxDistro::Rhel | LinuxDistro::CentOs | LinuxDistro::Rocky
+            | LinuxDistro::Alma | LinuxDistro::OpenSuse =>
                 tagged("rpm", run_cmd("rpm", &["-qa", "--qf", "%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n"]).map(|o| parse_rpm_list(&o)).unwrap_or_default()),
             LinuxDistro::Arch =>
                 tagged("pacman", run_cmd("pacman", &["-Q"]).map(|o| parse_pacman_list(&o)).unwrap_or_default()),

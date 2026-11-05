@@ -13,6 +13,7 @@ use crate::api::{
     match_to_entry, search_to_entry, severity_rank, BatchOutcome, MatchQuery, ThreatClient,
     ThreatEntry, ThreatError,
 };
+use crate::cpe::escape_cpe;
 use crate::engine::{
     enrich_exposure, list_installed, normalize_service_name, os_release_field, scan_services,
     strip_instance, LinuxDistro, OsType, Reachability, ServiceInfo, VersionSource,
@@ -47,7 +48,7 @@ impl Ecosystem {
         match os {
             OsType::Linux(d) => match d {
                 Debian | Ubuntu | Kali => Ecosystem::Deb,
-                Fedora | Rhel | CentOs | OpenSuse => Ecosystem::Rpm,
+                Fedora | Rhel | CentOs | Rocky | Alma | OpenSuse => Ecosystem::Rpm,
                 Arch => Ecosystem::Arch,
                 Alpine => Ecosystem::Alpine,
                 _ => Ecosystem::Generic,
@@ -67,15 +68,6 @@ impl Ecosystem {
 pub enum Source {
     PackageDb,
     Probe,
-}
-
-impl Source {
-    pub fn label(self) -> &'static str {
-        match self {
-            Source::PackageDb => "package-db",
-            Source::Probe => "probe",
-        }
-    }
 }
 
 /// Runtime facet — present only for assets that back a live process.
@@ -112,11 +104,6 @@ impl Asset {
         self.pkg_name
             .clone()
             .unwrap_or_else(|| normalize_service_name(strip_instance(&self.name)).to_string())
-    }
-
-    /// Name used for the `?search=` fallback (when no purl can be built).
-    pub fn lookup_key(&self) -> String {
-        self.coordinate_name()
     }
 
     /// Stable map key, shared between the coordinate and the results: name@version.
@@ -315,7 +302,8 @@ fn rpm_namespace(d: &LinuxDistro) -> &'static str {
     match d {
         LinuxDistro::Fedora => "fedora",
         LinuxDistro::OpenSuse => "opensuse",
-        LinuxDistro::CentOs => "centos",
+        LinuxDistro::Rocky => "rocky",
+        LinuxDistro::Alma => "almalinux",
         _ => "redhat",
     }
 }
@@ -334,7 +322,10 @@ pub fn build_purl(a: &Asset, os: &OsType) -> Option<String> {
                 _ => "debian",
             };
             let mut p = format!("pkg:deb/{ns}/{}@{ver}", pct(&name.to_lowercase()));
-            if let Some(c) = os_release_field("VERSION_CODENAME") {
+            // Ubuntu derivatives (Mint, Pop!_OS) carry the base release in UBUNTU_CODENAME.
+            let codename = os_release_field("UBUNTU_CODENAME").filter(|_| ns == "ubuntu")
+                .or_else(|| os_release_field("VERSION_CODENAME"));
+            if let Some(c) = codename {
                 p.push_str(&format!("?distro={}", pct(&c)));
             }
             Some(p)
@@ -346,11 +337,10 @@ pub fn build_purl(a: &Asset, os: &OsType) -> Option<String> {
                 _ => "redhat",
             };
             let mut p = format!("pkg:rpm/{ns}/{}@{ver}", pct(&name));
-            // distro qualifier uses the conventional id-version (e.g. rhel-9).
-            if let (Some(id), Some(rel)) =
-                (os_release_field("ID"), os_release_field("VERSION_ID"))
-            {
-                p.push_str(&format!("?distro={}-{}", pct(&id), pct(&rel)));
+            // Radar's release check needs a bare major (`9`); `rhel-9.4` disables it
+            // and `9.4` would conflict with advisories pinned to `9`.
+            if let Some(major) = os_release_field("VERSION_ID").as_deref().and_then(|v| v.split('.').next()) {
+                p.push_str(&format!("?distro={}", pct(major)));
             }
             Some(p)
         }
@@ -377,24 +367,68 @@ pub fn build_purl(a: &Asset, os: &OsType) -> Option<String> {
     }
 }
 
+/// Drop the epoch and the packaging revision from a native version, leaving the
+/// upstream release NVD ranges are written against.
+pub fn upstream_version(eco: Ecosystem, version: &str) -> String {
+    let v = match version.split_once(':') {
+        Some((epoch, rest)) if epoch.chars().all(|c| c.is_ascii_digit()) => rest,
+        _ => version,
+    };
+    let numeric_tail = |v: &str, sep: &str| -> usize {
+        match v.rsplit_once(sep) {
+            Some((head, tail)) if !head.is_empty() && !tail.is_empty()
+                && tail.chars().all(|c| c.is_ascii_digit() || c == '.') => head.len(),
+            _ => v.len(),
+        }
+    };
+    let end = match eco {
+        Ecosystem::Arch => numeric_tail(v, "-"),
+        Ecosystem::Homebrew => numeric_tail(v, "_"),
+        Ecosystem::FreeBsdPkg => {
+            let v = &v[..numeric_tail(v, ",")];
+            numeric_tail(v, "_")
+        }
+        Ecosystem::OpenBsdPkg => numeric_tail(v, "p"),
+        Ecosystem::NetBsdPkg => numeric_tail(v, "nb"),
+        _ => v.len(),
+    };
+    v[..end].to_string()
+}
+
+/// Wildcard-vendor CPE for package managers Radar holds no advisories for
+/// (pacman, brew, BSD pkg, generic probes), matched against upstream ranges.
+fn upstream_cpe(a: &Asset) -> Option<String> {
+    let version = upstream_version(a.ecosystem, &a.version);
+    if version.is_empty() {
+        return None;
+    }
+    let name = a.coordinate_name().to_lowercase();
+    let product = name.split('@').next().unwrap_or(&name);
+    Some(format!("cpe:2.3:a:*:{}:{}:*:*:*:*:*:*:*", escape_cpe(product), escape_cpe(&version)))
+}
+
 /// Pick the strongest match query for an asset: a pre-built CPE (Windows apps /
-/// OS) wins, else a purl coordinate, else `None` so the caller uses `?search=`.
+/// OS), a distro or language purl, an upstream CPE, else `None` (`?search=`).
 fn to_match_query(a: &Asset, os: &OsType) -> Option<MatchQuery> {
     if let Some(cpe) = &a.cpe {
         return Some(MatchQuery::cpe(cpe.clone()));
     }
-    build_purl(a, os).map(MatchQuery::purl)
+    match a.ecosystem {
+        Ecosystem::Arch | Ecosystem::Homebrew | Ecosystem::FreeBsdPkg | Ecosystem::OpenBsdPkg
+        | Ecosystem::NetBsdPkg | Ecosystem::Generic => upstream_cpe(a).map(MatchQuery::cpe),
+        _ => build_purl(a, os).map(MatchQuery::purl),
+    }
 }
 
-/// Collapse duplicate `cveId`s within one asset's already risk-sorted bucket,
-/// keeping the FIRST (highest-risk) instance. The same CVE can legitimately come
-/// back twice for one coordinate — two affected-range rows, or a coordinate+cpe
-/// double match — which otherwise inflates `total_vulns()`, the "N findings"
-/// line, the summary, and SARIF. Entries with no `cveId` are always kept.
+/// Collapse duplicate findings (by `cveId`, else Radar `id`) within one asset's
+/// already risk-sorted bucket, keeping the FIRST (highest-risk) instance. The same
+/// CVE can come back twice for one coordinate — two affected-range rows, or a
+/// coordinate+cpe double match — which would otherwise inflate every count.
+/// Entries with neither id are always kept.
 fn dedup_by_cve(entries: &mut Vec<ThreatEntry>) {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    entries.retain(|e| match e.cve_id.as_deref() {
-        Some(id) => seen.insert(id.to_string()),
+    entries.retain(|e| match e.cve_id.as_ref().or(e.id.as_ref()) {
+        Some(id) => seen.insert(id.clone()),
         None => true,
     });
 }
@@ -410,33 +444,51 @@ pub fn run_scan(
     severity_floor: u8,
 ) -> Result<BatchOutcome, ThreatError> {
     let mut queries: Vec<MatchQuery> = Vec::new();
-    let mut query_keys: Vec<String> = Vec::new();
+    // (report key, whether the query is a distro purl)
+    let mut query_keys: Vec<(String, bool)> = Vec::new();
     let mut fallback: BTreeMap<String, Vec<String>> = BTreeMap::new(); // search-name -> report_keys
 
     for a in assets {
         match to_match_query(a, os) {
             Some(q) => {
+                let distro = a.cpe.is_none() && matches!(a.ecosystem, Ecosystem::Deb | Ecosystem::Rpm | Ecosystem::Alpine);
                 queries.push(q);
-                query_keys.push(a.report_key());
+                query_keys.push((a.report_key(), distro));
             }
-            None => fallback.entry(a.lookup_key()).or_default().push(a.report_key()),
+            None => fallback.entry(a.coordinate_name()).or_default().push(a.report_key()),
         }
     }
 
     let mut results: BTreeMap<String, Vec<ThreatEntry>> = BTreeMap::new();
     let mut unconfirmed: BTreeMap<String, Vec<ThreatEntry>> = BTreeMap::new();
     let mut errors: BTreeMap<String, String> = BTreeMap::new();
+    let mut rejected: BTreeMap<String, String> = BTreeMap::new();
+    let mut upgrades: BTreeMap<String, String> = BTreeMap::new();
+    let mut truncated: Vec<String> = Vec::new();
 
-    // Known-exploited findings are never filtered out by the severity floor —
-    // dropping a KEV CVE on a severity threshold would contradict risk ranking
-    // and hide it from `--fail-on kev`.
-    let keep = |e: &ThreatEntry| e.kev || severity_rank(e.severity.as_deref()) >= severity_floor;
+    // Exploited findings (KEV, EUVD, Mirage) survive the severity floor: hiding
+    // them would contradict risk ranking and `--fail-on kev|exploited`.
+    let keep = |e: &ThreatEntry| e.exploited || severity_rank(e.severity.as_deref()) >= severity_floor;
 
     if !queries.is_empty() {
         let matched = client.match_batch(&queries, strict)?;
-        for (key, result) in query_keys.iter().zip(matched) {
+        for ((key, distro), result) in query_keys.iter().zip(matched) {
+            if let Some(e) = result.error {
+                rejected.insert(key.clone(), e);
+            }
+            if result.truncated {
+                truncated.push(key.clone());
+            }
+            if let Some(v) = result.upgrade_to {
+                upgrades.insert(key.clone(), v);
+            }
             for hit in result.matches {
-                let entry = match_to_entry(hit);
+                let mut entry = match_to_entry(hit);
+                // An upstream (NVD) range says nothing about a distro's backported
+                // build; Radar only downgrades these for some distros.
+                if *distro && entry.match_basis == "cpe" {
+                    entry.confirmed = false;
+                }
                 if !keep(&entry) {
                     continue;
                 }
@@ -448,7 +500,7 @@ pub fn run_scan(
 
     // One ?search= per unique name; apply to every asset key sharing it.
     for (name, keys) in fallback {
-        match client.search_threats(&name, 100) {
+        match client.search_threats(&name) {
             Ok(threats) => {
                 let entries: Vec<ThreatEntry> =
                     threats.iter().map(search_to_entry).filter(|e| keep(e)).collect();
@@ -470,7 +522,7 @@ pub fn run_scan(
         dedup_by_cve(v);
     }
 
-    Ok(BatchOutcome { results, unconfirmed, errors })
+    Ok(BatchOutcome { results, unconfirmed, errors, rejected, upgrades, truncated })
 }
 
 #[cfg(test)]
@@ -555,6 +607,29 @@ mod tests {
         assert_eq!(build_purl(&asset_eco(Ecosystem::Homebrew, "openssl@3", "3.3.2"), &OsType::MacOs)
             .unwrap(), "pkg:brew/openssl%403@3.3.2");
         assert_eq!(build_purl(&asset_eco(Ecosystem::FreeBsdPkg, "nginx", "1.27.0"), &OsType::FreeBsd), None);
+    }
+
+    #[test]
+    fn upstream_versions_drop_epoch_and_packaging_revision() {
+        assert_eq!(upstream_version(Ecosystem::Arch, "1:1.27.0-2"), "1.27.0");
+        assert_eq!(upstream_version(Ecosystem::Homebrew, "3.3.2_1"), "3.3.2");
+        assert_eq!(upstream_version(Ecosystem::FreeBsdPkg, "1.24.0_2,1"), "1.24.0");
+        assert_eq!(upstream_version(Ecosystem::OpenBsdPkg, "2.4.58p0"), "2.4.58");
+        assert_eq!(upstream_version(Ecosystem::NetBsdPkg, "8.5.0nb3"), "8.5.0");
+        assert_eq!(upstream_version(Ecosystem::Generic, "9.6p1"), "9.6p1");
+        assert_eq!(upstream_version(Ecosystem::OpenBsdPkg, "1.2pre"), "1.2pre");
+    }
+
+    #[test]
+    fn non_distro_package_managers_match_by_upstream_cpe() {
+        let q = |eco, name: &str, ver: &str, os: &OsType| {
+            serde_json::to_value(to_match_query(&asset_eco(eco, name, ver), os).unwrap()).unwrap()
+        };
+        assert_eq!(q(Ecosystem::Homebrew, "openssl@3", "3.3.2_1", &OsType::MacOs)["cpe"],
+            "cpe:2.3:a:*:openssl:3.3.2:*:*:*:*:*:*:*");
+        assert_eq!(q(Ecosystem::Arch, "nginx", "1.27.0-1", &linux(LinuxDistro::Arch))["cpe"],
+            "cpe:2.3:a:*:nginx:1.27.0:*:*:*:*:*:*:*");
+        assert!(q(Ecosystem::Deb, "nginx", "1.22.1-9", &linux(LinuxDistro::Debian)).get("purl").is_some());
     }
 
     #[test]

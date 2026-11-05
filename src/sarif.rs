@@ -17,7 +17,7 @@ fn level(sev: Option<&str>) -> &'static str {
 
 
 fn push_entry(rules: &mut BTreeMap<String, Value>, results: &mut Vec<Value>, asset: &str, t: &ThreatEntry) {
-    let id = t.cve_id.clone().unwrap_or_else(|| "UNKNOWN".to_string());
+    let id = t.cve_id.clone().or_else(|| t.id.clone()).unwrap_or_else(|| "UNKNOWN".to_string());
 
     let rule = rules.entry(id.clone()).or_insert_with(|| {
         let mut rule = json!({
@@ -58,6 +58,7 @@ fn push_entry(rules: &mut BTreeMap<String, Value>, results: &mut Vec<Value>, ass
 
     let mut props = json!({
         "kev": t.kev,
+        "exploited": t.exploited,
         "epss": t.epss,
         "confirmed": t.confirmed,
         "matchBasis": t.match_basis,
@@ -67,6 +68,12 @@ fn push_entry(rules: &mut BTreeMap<String, Value>, results: &mut Vec<Value>, ass
     }
     if let Some(score) = t.risk_score {
         props["riskScore"] = json!(score);
+    }
+    if let Some(m) = &t.exploit_maturity {
+        props["exploitMaturity"] = json!(m);
+    }
+    if !t.patch_links.is_empty() {
+        props["patchLinks"] = json!(t.patch_links);
     }
     if !t.cwes.is_empty() {
         props["cwe"] = json!(t.cwes);
@@ -87,6 +94,9 @@ fn push_entry(rules: &mut BTreeMap<String, Value>, results: &mut Vec<Value>, ass
     if let Some(rem) = &t.remediation {
         // A `fixes`-adjacent hint that SARIF viewers can surface as guidance.
         result["fixes"] = json!([{ "description": { "text": rem } }]);
+    }
+    if let Some(d) = t.recorded_decision.as_ref().filter(|d| d.suppressing) {
+        result["suppressions"] = json!([{ "kind": "external", "status": "accepted", "justification": d.verdict }]);
     }
     results.push(result);
 }

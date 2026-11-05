@@ -1,115 +1,171 @@
 name: Release
 
-# Tag a release to build cross-platform binaries, attach them to the GitHub
-# Release, and publish to crates.io:
-#   cargo set-version 0.1.0   # or bump Cargo.toml
-#   git tag v0.1.0 && git push origin v0.1.0
+# Bump Cargo.toml (and commit Cargo.lock), then: git tag vX.Y.Z && git push origin vX.Y.Z.
+# A tag with a pre-release suffix (vX.Y.Z-rc.1) builds and attests binaries only.
 on:
   push:
-    tags: ["v*"]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
 
-permissions:
-  contents: write
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  AWS_LC_SYS_PREBUILT_NASM: "1" # windows runners have no NASM; ignored elsewhere
 
 jobs:
+  verify:
+    name: verify tag, lockfile and package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - name: Tag is strict semver and matches Cargo.toml
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] \
+            || { echo "::error::unsupported tag name"; exit 1; }
+          ver="$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[0].version')"
+          # vX.Y.Z-rc.N rehearses the release of the Cargo.toml version X.Y.Z.
+          [ "v$ver" = "${GITHUB_REF_NAME%%-*}" ] \
+            || { echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml $ver"; exit 1; }
+      - run: cargo publish --dry-run --locked
+
   create-release:
     name: create GitHub release
+    needs: verify
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v7
-      - name: Create release (idempotent)
-        env:
+      - env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          pre=()
+          [[ "$GITHUB_REF_NAME" == *-* ]] && pre=(--prerelease)
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
             || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-                 --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+                 --title "$GITHUB_REF_NAME" --generate-notes --verify-tag "${pre[@]}"
 
   binaries:
     name: build ${{ matrix.target }}
     needs: create-release
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - { target: x86_64-unknown-linux-gnu,  os: ubuntu-latest }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
           - { target: x86_64-apple-darwin,       os: macos-latest }
           - { target: aarch64-apple-darwin,      os: macos-latest }
           - { target: x86_64-pc-windows-msvc,    os: windows-latest }
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Build and upload
-        uses: taiki-e/upload-rust-binary-action@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - id: build
+        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
         with:
           bin: threat-finder
           target: ${{ matrix.target }}
+          build-tool: cargo
+          locked: true
           archive: threat-finder-$tag-$target
           checksum: sha256
           include: README.md,LICENSE,CHANGELOG.md
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ github.token }}
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.build.outputs.tar || steps.build.outputs.zip }}
 
   publish-crate:
     name: publish to crates.io
-    needs: [create-release, binaries]  # don't publish if any archive failed to build
+    needs: binaries
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo publish
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      # Trusted Publishing once configured on crates.io; until then the stored token.
+      - id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        continue-on-error: true
+      - run: cargo publish --locked
         env:
-          TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          if [ -z "$TOKEN" ]; then
-            echo "::warning::CARGO_REGISTRY_TOKEN secret not set — skipping crates.io publish."
-            exit 0
-          fi
-          cargo publish --locked --token "$TOKEN"
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
 
   update-homebrew:
     name: bump homebrew tap
-    needs: binaries  # wait until release assets + checksums exist
+    needs: binaries
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      attestations: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Bump formula in offseq/homebrew-tap
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [ -z "${TAP_TOKEN:-}" ]; then
-            echo "::warning::HOMEBREW_TAP_TOKEN secret not set — skipping Homebrew bump."
-            exit 0
-          fi
           tag="$GITHUB_REF_NAME"; ver="${tag#v}"
-          mkdir -p sums
-          for t in aarch64-apple-darwin x86_64-apple-darwin \
-                   aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
-            gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
-              --pattern "threat-finder-$tag-$t.sha256" --dir sums --clobber
-          done
-          sha() { awk '{print $1}' "sums/threat-finder-$tag-$1.sha256"; }
-          formula="$(sed \
-            -e "s/__VERSION__/$ver/g" \
-            -e "s/__SHA_MAC_ARM__/$(sha aarch64-apple-darwin)/" \
-            -e "s/__SHA_MAC_X86__/$(sha x86_64-apple-darwin)/" \
-            -e "s/__SHA_LIN_ARM__/$(sha aarch64-unknown-linux-gnu)/" \
-            -e "s/__SHA_LIN_X86__/$(sha x86_64-unknown-linux-gnu)/" \
-            packaging/homebrew/threat-finder.rb.tmpl)"
-          git clone "https://x-access-token:${TAP_TOKEN}@github.com/offseq/homebrew-tap" tap
+          [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::refusing version '$ver'"; exit 1; }
+          # Checksums come from attested downloads, never from the release's .sha256 files.
+          sha() {
+            local f="dl/threat-finder-$tag-$1.tar.gz" s
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "${f#dl/}" --dir dl --clobber
+            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY" >/dev/null
+            s="$(sha256sum "$f" | cut -d' ' -f1)"
+            [[ "$s" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad sha256 for $1" >&2; return 1; }
+            printf '%s' "$s"
+          }
+          mac_arm="$(sha aarch64-apple-darwin)"
+          mac_x86="$(sha x86_64-apple-darwin)"
+          lin_arm="$(sha aarch64-unknown-linux-gnu)"
+          lin_x86="$(sha x86_64-unknown-linux-gnu)"
+          git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/offseq/homebrew-tap" tap
           mkdir -p tap/Formula
-          printf '%s\n' "$formula" > tap/Formula/threat-finder.rb
+          sed -e "s/__VERSION__/$ver/g" \
+              -e "s/__SHA_MAC_ARM__/$mac_arm/" -e "s/__SHA_MAC_X86__/$mac_x86/" \
+              -e "s/__SHA_LIN_ARM__/$lin_arm/" -e "s/__SHA_LIN_X86__/$lin_x86/" \
+              packaging/homebrew/threat-finder.rb.tmpl > tap/Formula/threat-finder.rb
           cd tap
           git config user.name "offseq-bot"
           git config user.email "noreply@offseq.com"
           git add Formula/threat-finder.rb
-          if git diff --cached --quiet; then
-            echo "Formula already up to date."
-            exit 0
-          fi
+          if git diff --cached --quiet; then echo "Formula already up to date."; exit 0; fi
           git commit -m "threat-finder $ver"
           git push

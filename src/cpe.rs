@@ -13,20 +13,20 @@
 use crate::engine::WinOs;
 
 /// Build an application CPE from an already-cleaned display name + version.
-/// Returns `None` when the name isn't in the curated table (caller falls back to
-/// `?search=`), so naive guesses never become false-positive CVE matches.
+/// Returns `None` when the name isn't in the curated table or the version is
+/// unknown (caller falls back to `?search=`): an ANY version would match every
+/// CVE of the product.
 pub fn cpe_for_app(clean_name: &str, version: &str) -> Option<String> {
+    let version = version.trim();
+    if version.is_empty() {
+        return None;
+    }
     let (vendor, product) = lookup_alias(clean_name)?;
-    let ver = if version.trim().is_empty() {
-        "*".to_string()
-    } else {
-        escape_cpe(&version.to_lowercase())
-    };
     Some(format!(
         "cpe:2.3:a:{}:{}:{}:*:*:*:*:*:*:*",
         escape_cpe(vendor),
         escape_cpe(product),
-        ver
+        escape_cpe(&version.to_lowercase())
     ))
 }
 
@@ -185,12 +185,12 @@ fn is_locale(s: &str) -> bool {
             && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_alphabetic())))
 }
 
-/// Curated DisplayName → (vendor, product) table. Keys are lowercase product
-/// phrases matched as a prefix of the cleaned name (longest key first), so
-/// "Mozilla Firefox" and "Mozilla Firefox ESR" both resolve correctly. Values
+/// Curated DisplayName → (vendor, product) table. Keys are lowercase cleaned
+/// names matched exactly, so companions like "Microsoft Edge Update" or
+/// "Python 3.12 Documentation" never inherit the main product's CVEs. Values
 /// are the real NVD vendor:product pairs (stored unescaped; escaped at emit).
 const ALIASES: &[(&str, &str, &str)] = &[
-    // key (lowercase prefix), vendor, product
+    // key (lowercase cleaned name), vendor, product
     ("google chrome", "google", "chrome"),
     ("mozilla firefox esr", "mozilla", "firefox_esr"),
     ("mozilla firefox", "mozilla", "firefox"),
@@ -204,6 +204,7 @@ const ALIASES: &[(&str, &str, &str)] = &[
     ("7-zip", "7-zip", "7-zip"),
     ("winrar", "rarlab", "winrar"),
     ("adobe acrobat reader", "adobe", "acrobat_reader_dc"),
+    ("adobe acrobat reader dc", "adobe", "acrobat_reader_dc"),
     ("adobe acrobat", "adobe", "acrobat_dc"),
     ("oracle vm virtualbox", "oracle", "vm_virtualbox"),
     ("virtualbox", "oracle", "vm_virtualbox"),
@@ -219,6 +220,7 @@ const ALIASES: &[(&str, &str, &str)] = &[
     ("openssl", "openssl", "openssl"),
     ("openvpn", "openvpn", "openvpn"),
     ("putty", "putty", "putty"),
+    ("putty release", "putty", "putty"),
     ("filezilla", "filezilla-project", "filezilla_client"),
     ("apache tomcat", "apache", "tomcat"),
     ("nginx", "nginx", "nginx"),
@@ -229,6 +231,7 @@ const ALIASES: &[(&str, &str, &str)] = &[
     ("audacity", "audacityteam", "audacity"),
     ("postgresql", "postgresql", "postgresql"),
     ("mysql", "oracle", "mysql"),
+    ("mysql server", "oracle", "mysql"),
     ("mariadb", "mariadb", "mariadb"),
     ("php", "php", "php"),
     ("teamviewer", "teamviewer", "teamviewer"),
@@ -237,38 +240,11 @@ const ALIASES: &[(&str, &str, &str)] = &[
     ("greenshot", "greenshot", "greenshot"),
 ];
 
-/// Resolve a cleaned display name to an NVD (vendor, product). Prefix match,
-/// longest key first, with a word boundary so "git" matches "Git" / "Git 2.x"
-/// but not "GitHub Desktop".
+/// Resolve a cleaned display name to an NVD (vendor, product) by exact,
+/// case-insensitive match.
 fn lookup_alias(clean_name: &str) -> Option<(&'static str, &'static str)> {
     let name = clean_name.trim().to_lowercase();
-    if name.is_empty() {
-        return None;
-    }
-    // ALIASES is authored roughly specific→general; pick the longest matching key
-    // to avoid a short key shadowing a more specific one.
-    let mut best: Option<(usize, &'static str, &'static str)> = None;
-    for (key, vendor, product) in ALIASES {
-        if prefix_word_match(&name, key) {
-            let klen = key.len();
-            if best.map(|(b, _, _)| klen > b).unwrap_or(true) {
-                best = Some((klen, vendor, product));
-            }
-        }
-    }
-    best.map(|(_, v, p)| (v, p))
-}
-
-/// True when `key` is a prefix of `name` ending on a word boundary (end of
-/// string or a non-alphanumeric char). Prevents "git" from matching "github".
-fn prefix_word_match(name: &str, key: &str) -> bool {
-    if !name.starts_with(key) {
-        return false;
-    }
-    match name[key.len()..].chars().next() {
-        None => true,
-        Some(c) => !c.is_alphanumeric(),
-    }
+    ALIASES.iter().find(|(key, _, _)| *key == name).map(|&(_, v, p)| (v, p))
 }
 
 #[cfg(test)]
@@ -312,23 +288,49 @@ mod tests {
             cpe_for_app("7-Zip", "23.01"),
             Some("cpe:2.3:a:7-zip:7-zip:23.01:*:*:*:*:*:*:*".into())
         );
-        // Empty version → ANY in the version field.
-        assert_eq!(
-            cpe_for_app("Wireshark", ""),
-            Some("cpe:2.3:a:wireshark:wireshark:*:*:*:*:*:*:*:*".into())
-        );
+    }
+
+    #[test]
+    fn blank_version_returns_none() {
+        assert_eq!(cpe_for_app("Wireshark", ""), None);
+        assert_eq!(cpe_for_app("Wireshark", "  "), None);
     }
 
     #[test]
     fn unmapped_app_returns_none() {
         assert_eq!(cpe_for_app("Some Internal LOB Tool", "1.0"), None);
-        // Word boundary: a more specific product must not be shadowed by "git".
         assert_eq!(cpe_for_app("GitHub Desktop", "3.3.6"), None);
     }
 
     #[test]
-    fn longest_alias_wins() {
-        // "Mozilla Firefox ESR" must beat the "Mozilla Firefox" prefix.
+    fn companion_products_do_not_inherit_alias() {
+        for raw in [
+            "Microsoft Edge Update",
+            "Microsoft Edge WebView2 Runtime",
+            "MySQL Workbench 8.0 CE",
+            "MySQL Shell 8.0.36",
+            "MySQL Connector/ODBC 8.0",
+            "Git LFS version 3.4.1",
+            "Python 3.12.1 Documentation (64-bit)",
+            "Python 3.12.1 Core Interpreter (64-bit)",
+            "Python 3.12.1 Tcl/Tk Support (64-bit)",
+            "Python Launcher",
+        ] {
+            assert_eq!(cpe_for_app(&clean_app_name(raw), "1.3.0"), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn decorated_names_still_resolve() {
+        let cpe = |raw: &str| cpe_for_app(&clean_app_name(raw), "1.0");
+        assert_eq!(cpe("Mozilla Firefox (x64 en-US)"), Some("cpe:2.3:a:mozilla:firefox:1.0:*:*:*:*:*:*:*".into()));
+        assert_eq!(cpe("7-Zip 23.01 (x64)"), Some("cpe:2.3:a:7-zip:7-zip:1.0:*:*:*:*:*:*:*".into()));
+        assert_eq!(cpe("Python 3.12.1 (64-bit)"), Some("cpe:2.3:a:python:python:1.0:*:*:*:*:*:*:*".into()));
+        assert_eq!(cpe("MySQL Server 8.0"), Some("cpe:2.3:a:oracle:mysql:1.0:*:*:*:*:*:*:*".into()));
+    }
+
+    #[test]
+    fn specific_alias_resolves() {
         assert_eq!(
             cpe_for_app("Mozilla Firefox ESR", "115.6.0"),
             Some("cpe:2.3:a:mozilla:firefox_esr:115.6.0:*:*:*:*:*:*:*".into())
