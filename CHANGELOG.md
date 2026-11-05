@@ -4,6 +4,126 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0]
+
+Brings the client in line with the current Radar API.
+
+### Added
+- Findings carry Radar's exploitation signals: `kevDueDate`, `kevOverdue`,
+  `ransomware`, `exploitMaturity` (WEAPONIZED … POC_LOW), `exploitedOutsideKev`
+  (ENISA EUVD / OffSeq Mirage) and an overall `exploited` flag, plus
+  `cvssVector`, `patchLinks` and the Radar threat `id` (used when a finding has
+  no CVE id). The summary tags them `[EXPLOITED]`, `[RANSOMWARE]`, `[OVERDUE]`,
+  `[WEAPONIZED]`.
+- `--fail-on exploited` (KEV, EUVD or Mirage) and `--fail-on act-now`.
+- `assets.*.upgradeTo`: the smallest version Radar knows fixes every finding on
+  the asset, shown in the summary as "→ upgrade to X fixes all".
+- `truncated`: assets whose matches the plan's per-query result cap cut short
+  (Free returns the 10 riskiest), with a warning.
+- A query Radar rejects is reported in `rejected` instead of reading as clean.
+- `--sbom <FILE>`: scan a CycloneDX/SPDX SBOM, purl list or lockfile (npm, yarn,
+  pnpm, Cargo, Poetry, uv, Go, Composer, Gemfile, requirements) through Radar's
+  `POST /scan` in one request, with the usual JSON/SARIF report, summary,
+  `--severity`, `--strict` and `--fail-on`. Size and line limits are checked
+  locally; a file over the plan's package cap exits 4 naming the cap.
+- `--respect-decisions`: after registration, attach the Radar decision ledger's
+  `recordedDecision` to matching findings, tag suppressed ones `[DECIDED …]`
+  (SARIF `suppressions`) and keep them out of `--fail-on`.
+- `--vex <PATH>` / `--vex-format openvex|cyclonedx`: write the host's decisions
+  as a VEX document after registration (paid plans; non-fatal otherwise).
+- New-since-last findings after registration show `[KEV]`/`[OVERDUE]`, fixed
+  versions and the Radar link.
+- Registration reports how many findings were resolved since the last scan
+  (`registration.resolvedCount`).
+- Daily quota (`X-RateLimit-*-Daily`) in the plan readout.
+
+### Changed
+- **Risk score matches the server again** (`server/utils/riskScore.js`): KEV
+  overdue +5, exploit maturity +3/+7/+10, EUVD/Mirage exploitation +15, and
+  `act-now` from a score of 74 (was 80).
+- **`kev` now means CISA KEV-listed only**; the threat's in-the-wild flag moved
+  to `exploited`. `--fail-on kev` is correspondingly stricter. Report
+  `schemaVersion` is 3.
+- Plan names and batch sizes follow the current plans (Free 50 queries per
+  batch; Individual, Lifetime and Base 200; Pro 1,000; Enterprise 4,000). The
+  first batch is no longer undersized at 25.
+- The `?search=` fallback pages by the server's `hasNext` (the server clamps
+  `limit` to the plan size, which used to end paging after one page) and stops
+  after 3 pages to bound quota use.
+- `503` responses honor `Retry-After`; a spent daily window is no longer retried.
+- systemd discovery uses `systemctl` instead of a D-Bus client, removing `zbus`
+  and its now-unmaintained `zvariant`/`zbus_names` crates
+  (RUSTSEC-2026-0370/0371/0372).
+- `reqwest` 0.12 → 0.13: rustls with the OS certificate store
+  (`rustls-platform-verifier`) instead of bundled roots, and gzip responses.
+  Minimal containers need a CA bundle (`ca-certificates`).
+- `dirs` 6 → 7, and a full lockfile refresh.
+- The runtime log keeps the newest 14 daily files, and a missing log directory
+  is only reported with `--verbose`.
+
+### Fixed
+- **macOS/BSD/Solaris exposure:** `lsof` ORed `-p` with `-i`, so every service
+  inherited every listener on the host and read as public.
+- **Arch, Homebrew, BSD and generic assets** sent coordinates Radar holds no
+  advisories for (or fell back to free-text search); they now match by a
+  wildcard-vendor CPE with the upstream version (epoch and packaging revision
+  dropped).
+- RPM `?distro=` sends the major release (`9`); `rhel-9.4` disabled Radar's
+  per-release check. CentOS uses the Red Hat namespace.
+- An upstream (`cpe`) hit on a distro package is unconfirmed: an NVD range says
+  nothing about a backported build.
+- Rocky, AlmaLinux, Oracle Linux and Amazon Linux were detected as Fedora.
+  `os-release` is parsed once (single quotes, `/usr/lib/os-release` fallback),
+  and Ubuntu derivatives send `UBUNTU_CODENAME`.
+- `--json` stdout carries only the report; status lines go to stderr.
+- `--fail-on` exits 1 instead of passing when a lookup failed.
+- SARIF rules for findings without a CVE id use the Radar threat id instead of
+  all sharing `UNKNOWN`.
+- Reports are written `0600`, also over an existing file, and never through a
+  symlink; the default path is `./threats.json` (`/tmp` does not exist on
+  Windows and is shared on Unix).
+- Version probing resolves symlinks and refuses binaries others can replace,
+  cannot hang on a forked child holding the pipe, and kills the probe's process
+  group (including anything it daemonized).
+- Findings exploited per EUVD, Mirage or the in-the-wild flag survive
+  `--severity`, like KEV ones.
+- The logger no longer panics when its directory is not writable.
+- systemd discovery lists running units only; `active (exited)` oneshots were
+  reported as services.
+- Multiarch Debian packages no longer yield concatenated versions.
+- The config is written atomically and `0600`; an unreadable config is never
+  overwritten (which erased the saved key), and a host id that cannot be saved
+  is reported instead of silently minting a new Radar host every run.
+- Windows: npm and Scoop inventory (`.cmd`/`.ps1` shims) works, `pip` runs
+  isolated, unquoted service paths with spaces resolve, winget `< x` rows are
+  skipped, app aliases match exactly ("Microsoft Edge Update" is not Edge), and
+  an app without a version gets no `*` CPE.
+- 403s are classified by Radar's `error` code; an incomplete profile exits 4
+  with a link instead of 1. 429s use `upgrade.reason` to decide whether a retry
+  can help, and only 502/503/504 are retried (a handler 500 already cost quota).
+- Free accounts are told alerts need a paid plan instead of "monitoring on".
+
+### CI and release
+- MSRV is 1.89 (the refreshed graph needs it).
+- Actions pinned by SHA, `permissions: {}` with per-job grants,
+  `persist-credentials: false`, concurrency groups, a weekly run, native arm64
+  Linux, `cargo-deny` and `zizmor` jobs, and Dependabot cooldowns.
+- Releases verify the tag matches `Cargo.toml` and the lockfile is current
+  before building (0.3.0 never reached crates.io), build `--locked`, attest
+  build provenance, publish via crates.io Trusted Publishing, and bump Homebrew
+  from attested checksums with a strict version check (the tag could inject
+  Ruby into the formula).
+
+### Removed
+- `src/main_back.rs`, a stray copy of `main.rs`.
+
+## [0.3.0]
+
+### Added
+- Runtime file logging via `tracing` (daily-rotated under the OS local data
+  dir), with `-v, --verbose` for debug level; `RUST_LOG` overrides.
+- Match results carry the advisory's `affectedVersions`.
+
 ## [0.2.1]
 
 ### Added

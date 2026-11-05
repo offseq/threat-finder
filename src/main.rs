@@ -23,7 +23,8 @@ use find_threats::{
     RegistrationReport,
     decision_rank,
     Asset,
-    print_plan_info,
+    plan_info,
+    scan_body,
     severity_rank as sev_rank,
 };
 
@@ -43,8 +44,12 @@ enum FailOn {
     High,
     Medium,
     Low,
-    /// Only CISA known-exploited findings
+    /// Only CISA KEV-listed findings
     Kev,
+    /// Findings exploited in the wild: KEV, ENISA EUVD or OffSeq Mirage
+    Exploited,
+    /// Findings whose exposure-aware decision is act-now
+    ActNow,
     /// Only findings on a network-exposed service
     Exposed,
 }
@@ -57,7 +62,7 @@ enum FailOn {
     after_help = "EXIT CODES:\n  0  success\n  1  lookup or I/O error\n  2  no API key available\n  3  unsupported OS\n  4  rate limit / quota exhausted, or API access required (upgrade needed)\n  5  --fail-on threshold met",
 )]
 struct Cli {
-    /// Write the JSON report to this path (default: prompt, or /tmp/threats.json)
+    /// Write the JSON report to this path (default: prompt, or ./threats.json)
     #[arg(short, long, value_name = "PATH")]
     output: Option<PathBuf>,
 
@@ -131,6 +136,25 @@ struct Cli {
     #[arg(long)]
     windows_missing_updates: bool,
 
+    /// Scan this SBOM or lockfile (CycloneDX, SPDX, purl list, npm/yarn/pnpm, Cargo,
+    /// Poetry, uv, Go, Composer, Gemfile, requirements) instead of the host. One request.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["register", "unregister", "respect_decisions", "vex", "scope", "include", "exclude", "windows_missing_updates"])]
+    sbom: Option<PathBuf>,
+
+    /// Exclude findings silenced by a decision recorded in Radar from --fail-on
+    /// (needs registration; one extra request)
+    #[arg(long)]
+    respect_decisions: bool,
+
+    /// Write this host's Radar decisions as a VEX document to this path (needs
+    /// registration and a paid plan; one extra request)
+    #[arg(long, value_name = "PATH")]
+    vex: Option<PathBuf>,
+
+    /// VEX document format
+    #[arg(long, value_name = "FORMAT", default_value = "openvex", value_parser = ["openvex", "cyclonedx"], requires = "vex")]
+    vex_format: String,
+
     /// Log at debug level to the runtime log file (~/.local/share/threat-finder/logs
     /// on Linux). Overridden by RUST_LOG if that's set. Does not affect terminal output.
     #[arg(short, long)]
@@ -147,7 +171,7 @@ fn expand_tilde(path: &str) -> String {
 }
 
 fn prompt_output_path() -> String {
-    let default = "/tmp/threats.json";
+    let default = DEFAULT_REPORT;
     print!("Output path [{}]: ", default);
     let _ = io::stdout().flush();
 
@@ -174,6 +198,27 @@ fn prompt_output_path() -> String {
 
         expanded
     }
+}
+
+const DEFAULT_REPORT: &str = "threats.json";
+
+/// Write a report readable by its owner only, refusing to follow a planted symlink.
+fn write_private(path: &std::path::Path, data: &[u8]) -> io::Result<()> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = opts.open(path)?;
+    // `mode` applies only on create; tighten a pre-existing report too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(data)
 }
 
 fn spinner(msg: &str, quiet: bool) -> Option<ProgressBar> {
@@ -268,6 +313,26 @@ fn decision_badge(t: &ThreatEntry, color: bool) -> String {
     format!("{} ", paint(&format!("[{} {score}]", decision.to_uppercase()), code, color))
 }
 
+/// `[KEV]`/`[EXPLOITED]`, `[RANSOMWARE]`, `[OVERDUE]` and exploit-maturity tags.
+fn signal_badges(t: &ThreatEntry, color: bool) -> String {
+    let mut tags: Vec<&str> = Vec::new();
+    if t.kev {
+        tags.push("KEV");
+    } else if t.exploited {
+        tags.push("EXPLOITED");
+    }
+    if t.ransomware {
+        tags.push("RANSOMWARE");
+    }
+    if t.kev_overdue {
+        tags.push("OVERDUE");
+    }
+    if t.exploit_maturity.as_deref() == Some("WEAPONIZED") {
+        tags.push("WEAPONIZED");
+    }
+    tags.iter().map(|tag| format!(" {}", paint(&format!("[{tag}]"), "1;31", color))).collect()
+}
+
 /// Ranked, optionally-colored terminal summary — exposed and highest-risk first.
 fn print_summary(results: &BatchResults, color: bool) {
     let mut rows: Vec<(&String, bool, &Vec<ThreatEntry>)> = results.services.iter()
@@ -290,10 +355,16 @@ fn print_summary(results: &BatchResults, color: bool) {
         } else {
             String::new()
         };
-        println!("\n  {} — {} finding(s){badge}", paint(key, "1;36", color), threats.len());
+        let upgrade = results.assets.get(*key).and_then(|a| a.upgrade_to.as_deref())
+            .map(|v| format!("  {}", paint(&format!("→ upgrade to {v} fixes all"), "32", color)))
+            .unwrap_or_default();
+        println!("\n  {} — {} finding(s){badge}{upgrade}", paint(key, "1;36", color), threats.len());
         for t in threats.iter().take(5) {
-            let cve = t.cve_id.as_deref().unwrap_or("(no id)");
-            let kev = if t.kev { format!(" {}", paint("[KEV]", "1;31", color)) } else { String::new() };
+            let cve = t.cve_id.as_deref().or(t.id.as_deref()).unwrap_or("(no id)");
+            let mut kev = signal_badges(t, color);
+            if let Some(d) = t.recorded_decision.as_ref().filter(|d| d.suppressing) {
+                kev += &format!(" {}", paint(&format!("[DECIDED {}]", d.verdict.to_uppercase()), "32", color));
+            }
             let title: String = t.title.as_deref().unwrap_or("").chars().take(72).collect();
             // Concrete fix versions turn "vulnerable" into "upgrade to X".
             let fix = if t.fixed_versions.is_empty() {
@@ -338,11 +409,15 @@ fn print_summary(results: &BatchResults, color: bool) {
 
     let total: usize = rows.iter().map(|r| r.2.len()).sum();
     let exposed_svcs = rows.iter().filter(|r| r.1).count();
-    let kev = rows.iter().flat_map(|r| r.2.iter()).filter(|t| t.kev).count();
+    let exploited = rows.iter().flat_map(|r| r.2.iter()).filter(|t| t.exploited).count();
     println!(
-        "\n{total} confirmed finding(s) across {} asset(s); {exposed_svcs} exposed, {kev} known-exploited.",
+        "\n{total} confirmed finding(s) across {} asset(s); {exposed_svcs} exposed, {exploited} exploited in the wild.",
         rows.len()
     );
+    let decided = rows.iter().flat_map(|r| r.2.iter()).filter(|t| t.suppressed()).count();
+    if decided > 0 {
+        println!("{}", paint(&format!("{decided} of them decided in the Radar ledger (not counted by --fail-on)."), "2", color));
+    }
     let unconfirmed: usize = results.unconfirmed.values().map(|v| v.len()).sum();
     if unconfirmed > 0 {
         println!(
@@ -366,11 +441,13 @@ fn fail_triggered(results: &BatchResults, fail_on: FailOn, floor: Option<Severit
         FailOn::Medium   => sev_rank(t.severity.as_deref()) >= 2,
         FailOn::Low      => sev_rank(t.severity.as_deref()) >= 1,
         FailOn::Kev      => t.kev,
+        FailOn::Exploited => t.exploited,
+        FailOn::ActNow   => t.decision.as_deref() == Some("act-now"),
         FailOn::Exposed  => exposed && sev_rank(t.severity.as_deref()) >= floor,
     };
     for (key, threats) in &results.services {
         let exposed = results.assets.get(key).map(|a| a.exposed).unwrap_or(false);
-        if threats.iter().any(|t| hit(t, exposed)) {
+        if threats.iter().any(|t| !t.suppressed() && hit(t, exposed)) {
             return true;
         }
     }
@@ -518,9 +595,13 @@ fn inventory_os(os: &OsType, sys: Option<&SystemFacts>) -> Option<InventoryOs> {
 }
 
 /// Print a concise human-readable outcome after a successful registration.
-fn print_registration(resp: &RegisterResponse, color: bool) {
+fn print_registration(resp: &RegisterResponse, alerts: bool, color: bool) {
     let state = if resp.new { "registered" } else { "updated" };
-    let mon = if resp.monitoring { "monitoring on" } else { "monitoring off" };
+    let mon = match (resp.monitoring, alerts) {
+        (false, _) => "monitoring off",
+        (true, true) => "monitoring on",
+        (true, false) => "alerts need a paid plan",
+    };
     println!(
         "\n{} Host {state}; {mon} ({} asset(s) tracked).",
         paint("✓", "32", color),
@@ -545,6 +626,13 @@ fn print_registration(resp: &RegisterResponse, color: bool) {
         s.kev,
     );
 
+    if resp.resolved_count > 0 {
+        println!(
+            "  {}",
+            paint(&format!("{} resolved since your last scan.", resp.resolved_count), "32", color)
+        );
+    }
+
     if resp.new_since_last_count > 0 {
         println!(
             "{}",
@@ -558,7 +646,19 @@ fn print_registration(resp: &RegisterResponse, color: bool) {
             let cve = f.cve_id.as_deref().unwrap_or("(no id)");
             let decision = f.decision.as_deref().unwrap_or("track");
             let coord = f.coordinate.as_deref().unwrap_or("");
-            println!("      {} {cve}  {coord}", paint(&format!("[{}]", decision.to_uppercase()), "1;33", color));
+            let kev: String = [(f.kev, "[KEV]"), (f.kev_overdue, "[OVERDUE]")].iter()
+                .filter(|(on, _)| *on)
+                .map(|(_, tag)| format!(" {}", paint(tag, "1;31", color)))
+                .collect();
+            let fix = if f.fixed_versions.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", paint(&format!("→ fix: {}", f.fixed_versions.join(", ")), "32", color))
+            };
+            println!("      {} {cve}{kev}  {coord}{fix}", paint(&format!("[{}]", decision.to_uppercase()), "1;33", color));
+            if let Some(url) = &f.radar_url {
+                println!("            {}", paint(url, "4;34", color));
+            }
         }
     }
 }
@@ -566,13 +666,11 @@ fn print_registration(resp: &RegisterResponse, color: bool) {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    // Must stay alive for the whole run — it owns the background thread that
-    // flushes log lines to disk. Dropping it early would silently truncate
-    // the log.
+    // Flushes the log on drop; must outlive the run.
     let _log_guard = logging::init(cli.verbose);
 
     let os = detect_os();
-    if let OsType::Unsupported(name) = &os {
+    if let (None, OsType::Unsupported(name)) = (&cli.sbom, &os) {
         error!(os = %name, "unsupported OS; nothing to scan");
         eprintln!("Unsupported OS: {name}. Nothing to scan.");
         return ExitCode::from(3);
@@ -627,123 +725,138 @@ fn main() -> ExitCode {
             if interactive {
                 PathBuf::from(prompt_output_path())
             } else {
-                PathBuf::from("/tmp/threats.json")
+                PathBuf::from(DEFAULT_REPORT)
             }
         })
     };
 
-    if !cli.quiet {
-        println!("\nDetected OS: {}\n", os_label(&os));
+    // With --json, stdout carries only the report.
+    macro_rules! say {
+        ($($a:tt)*) => {{ if !cli.quiet { if to_stdout { eprintln!($($a)*) } else { println!($($a)*) } } }};
     }
 
-    let scan_pb = spinner("Discovering assets…", cli.quiet);
-    let collectors = scan::for_scope(cli.scope);
-    let mut assets = scan::dedup_and_merge(scan::collect_assets(&os, &collectors));
-    let system_info = gather_system_info(&os);
-    if let Some(pb) = scan_pb {
-        pb.finish_and_clear();
-    }
-    tracing::debug!(asset_count = assets.len(), scope = ?cli.scope, "asset discovery complete");
+    let client = Arc::new(ThreatClient::new(&api_key));
+    let sev_floor = severity_floor(cli.severity);
 
-    if !cli.include.is_empty() || !cli.exclude.is_empty() {
-        // Match against BOTH the display name and the resolved package coordinate
-        // (a unit "ssh" resolves to "openssh-server"): include keeps if either
-        // matches; exclude drops if either matches.
-        assets.retain(|a| {
-            let coord = a.coordinate_name();
-            asset_allowed(&[a.name.as_str(), &coord], &cli.include, &cli.exclude)
-        });
-    }
-    assets.sort_by_key(|a| a.report_key());
+    let (mut final_results, assets, system_info) = if let Some(path) = &cli.sbom {
+        let content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[!] Couldn't read '{}': {e}", path.display());
+                return ExitCode::from(1);
+            }
+        };
+        let filename = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+        let body = match scan_body(&content, &filename, cli.strict) {
+            Ok(b) => b,
+            Err(msg) => {
+                eprintln!("[!] {msg}");
+                return ExitCode::from(1);
+            }
+        };
+        let pb = spinner(&format!("Scanning {filename} against OffSeq Radar…"), cli.quiet);
+        let scanned = client.scan(body);
+        if let Some(pb) = pb { pb.finish_and_clear(); }
+        let report = match scanned {
+            Ok(r) => r,
+            Err(ThreatError::BatchTooLarge(cap)) => {
+                let cap = cap.map(|n| format!(" ({n})")).unwrap_or_default();
+                warn!("SBOM exceeds the plan's packages-per-scan cap{cap}");
+                eprintln!("{filename} has more packages than your plan checks per scan{cap}. Split the file, or upgrade: https://radar.offseq.com/pricing");
+                return ExitCode::from(4);
+            }
+            Err(e) => return lookup_failed(e, "SBOM scan"),
+        };
+        say!("\nScanned {} package(s) from {} ({}).\n", report.packages, path.display(), report.format);
+        (report.into_results(&path.display().to_string(), sev_floor), Vec::new(), None)
+    } else {
+        say!("\nDetected OS: {}\n", os_label(&os));
 
-    if !cli.quiet {
-        if let Some(ref sys) = system_info {
-            println!("System:");
-            println!("  Kernel:  {} {}", sys.kernel_name, sys.kernel_version);
-            println!("  Distro:  {} {}", sys.distro_name, sys.distro_version);
+        let scan_pb = spinner("Discovering assets…", cli.quiet);
+        let collectors = scan::for_scope(cli.scope);
+        let mut assets = scan::dedup_and_merge(scan::collect_assets(&os, &collectors));
+        let system_info = gather_system_info(&os);
+        if let Some(pb) = scan_pb {
+            pb.finish_and_clear();
+        }
+        tracing::debug!(asset_count = assets.len(), scope = ?cli.scope, "asset discovery complete");
+
+        if !cli.include.is_empty() || !cli.exclude.is_empty() {
+            // Match against BOTH the display name and the resolved package coordinate
+            // (a unit "ssh" resolves to "openssh-server"): include keeps if either
+            // matches; exclude drops if either matches.
+            assets.retain(|a| {
+                let coord = a.coordinate_name();
+                asset_allowed(&[a.name.as_str(), &coord], &cli.include, &cli.exclude)
+            });
+        }
+        assets.sort_by_key(|a| a.report_key());
+
+        if let Some(sys) = &system_info {
+            say!("System:");
+            say!("  Kernel:  {} {}", sys.kernel_name, sys.kernel_version);
+            say!("  Distro:  {} {}", sys.distro_name, sys.distro_version);
         }
         let exposed = assets.iter()
             .filter(|a| a.runtime.as_ref().map(|r| r.exposed).unwrap_or(false))
             .count();
         let suffix = if exposed > 0 { format!(", {exposed} network-exposed") } else { String::new() };
         let label = if cli.scope == ScanScope::All { "asset" } else { "service" };
-        println!("Found {} {label}(s){suffix}\n", assets.len());
-        if assets.is_empty() {
-            warn!("discovery returned zero assets; may need elevated privileges");
-            eprintln!("[!] Nothing discovered — you may need elevated privileges (try sudo) for full discovery.");
+        say!("Found {} {label}(s){suffix}\n", assets.len());
+        if !cli.quiet {
+            if assets.is_empty() {
+                warn!("discovery returned zero assets; may need elevated privileges");
+                eprintln!("[!] Nothing discovered — you may need elevated privileges (try sudo) for full discovery.");
+            }
+            if cli.scope == ScanScope::All && assets.len() > FREE_BATCH {
+                eprintln!("{}", scope_all_budget_warning(assets.len()));
+            }
         }
-        if cli.scope == ScanScope::All && assets.len() > 15 {
-            eprintln!("{}", scope_all_budget_warning(assets.len()));
-        }
-    }
 
-    let client = Arc::new(ThreatClient::new(&api_key));
-    let lookup_pb = spinner("Matching coordinates against OffSeq Radar…", cli.quiet);
-    let sev_floor = severity_floor(cli.severity);
+        let lookup_pb = spinner("Matching coordinates against OffSeq Radar…", cli.quiet);
+        let scanned = scan::run_scan(&client, &assets, &os, cli.strict, sev_floor);
+        if let Some(pb) = lookup_pb { pb.finish_and_clear(); }
+        let outcome = match scanned {
+            Ok(o) => o,
+            Err(e) => return lookup_failed(e, "Match lookup"),
+        };
 
-    let outcome = match scan::run_scan(&client, &assets, &os, cli.strict, sev_floor) {
-        Ok(o) => o,
-        Err(ThreatError::RateLimitExceeded(msg)) => {
-            if let Some(pb) = lookup_pb { pb.finish_and_clear(); }
-            warn!(message = %msg, "rate limit exceeded during match lookup");
-            auth::prompt_upgrade(Some(&msg));
-            return ExitCode::from(4);
-        }
-        // FREE accounts (no Pro Console / no active subscription) hit this on the
-        // first /match/batch call. Surface the server's explanation plus a concrete
-        // upgrade path, and exit 4 (needs upgrade / quota) — not 1, which reads as a
-        // network failure.
-        Err(ThreatError::AccessDenied(msg)) => {
-            if let Some(pb) = lookup_pb { pb.finish_and_clear(); }
-            warn!(message = %msg, "access denied during match lookup; plan upgrade required");
-            eprintln!("{msg}");
-            eprintln!("Upgrade your plan: https://radar.offseq.com/pricing");
-            eprintln!("Manage access:    https://radar.offseq.com/console");
-            return ExitCode::from(4);
-        }
-        Err(e) => {
-            if let Some(pb) = lookup_pb { pb.finish_and_clear(); }
-            error!(error = %e, "match lookup failed");
-            eprintln!("Match lookup failed: {e}");
-            return ExitCode::from(1);
-        }
+        // Assets were already deduped/merged before lookup; map them 1:1 (report_key
+        // matches the run_batch result keys).
+        let asset_map = assets.iter().map(|a| {
+            let rt = a.runtime.as_ref();
+            (a.report_key(), find_threats::AssetInfo {
+                exe: a.locations.first().cloned().unwrap_or_default(),
+                version: a.version.clone(),
+                version_source: a.version_source_label().to_string(),
+                exposed: rt.map(|r| r.exposed).unwrap_or(false),
+                reachability: rt.map(|r| r.reachability.as_str()).unwrap_or("none").to_string(),
+                listeners: rt.map(|r| r.listeners.clone()).unwrap_or_default(),
+                upgrade_to: outcome.upgrades.get(&a.report_key()).cloned(),
+            })
+        }).collect();
+
+        let mut results = BatchResults {
+            meta: find_threats::Meta::default(),
+            services: outcome.results,
+            by_cve: std::collections::BTreeMap::new(),
+            unconfirmed: outcome.unconfirmed,
+            assets: asset_map,
+            errors:   outcome.errors,
+            rejected: outcome.rejected,
+            truncated: outcome.truncated,
+            registration: None,
+        };
+        // Exposure-aware risk score + SSVC decision per finding, computed from the
+        // OWNING asset's reachability so local scores agree with the server's.
+        score_findings(&mut results);
+        (results, assets, system_info)
     };
 
-    if let Some(pb) = lookup_pb { pb.finish_and_clear(); }
-    if !cli.quiet { print_plan_info(&client.last_rate_limit()); }
-
-    // Assets were already deduped/merged before lookup; map them 1:1 (report_key
-    // matches the run_batch result keys).
-    let mut asset_map: std::collections::BTreeMap<String, find_threats::AssetInfo> =
-        std::collections::BTreeMap::new();
-    for a in &assets {
-        let rt = a.runtime.as_ref();
-        asset_map.insert(a.report_key(), find_threats::AssetInfo {
-            exe: a.locations.first().cloned().unwrap_or_default(),
-            version: a.version.clone(),
-            version_source: a.version_source_label().to_string(),
-            exposed: rt.map(|r| r.exposed).unwrap_or(false),
-            reachability: rt.map(|r| r.reachability.as_str()).unwrap_or("none").to_string(),
-            listeners: rt.map(|r| r.listeners.clone()).unwrap_or_default(),
-        });
+    if let Some(info) = plan_info(&client.last_rate_limit()) {
+        say!("{info}");
     }
-
-    let mut final_results = BatchResults {
-        meta: find_threats::Meta::default(),
-        services: outcome.results,
-        by_cve: std::collections::BTreeMap::new(),
-        unconfirmed: outcome.unconfirmed,
-        assets: asset_map,
-        errors:   outcome.errors,
-        registration: None,
-    };
-
-    // Exposure-aware risk score + SSVC decision per finding, computed from the
-    // OWNING asset's reachability so local scores agree with the server's. Then
-    // re-sort each bucket by decision/score (risk_key now leads with those).
-    score_findings(&mut final_results);
     final_results.sort_findings();
-
     final_results.compute_cve_groups();
 
     // ── Post-scan: opt-in continuous-monitoring registration ─────────────────
@@ -752,7 +865,7 @@ fn main() -> ExitCode {
     let human_output = !to_stdout && !cli.quiet;
     let interactive_human = interactive && human_output;
     let prompt_mode = auth::monitoring_prompt_mode();
-    let mut action = register_action(cli.no_register, cli.register, &prompt_mode, interactive_human);
+    let mut action = register_action(cli.no_register || cli.sbom.is_some(), cli.register, &prompt_mode, interactive_human);
 
     // If we'd prompt, ask now and fold the answer back into the action.
     if action == RegisterAction::Prompt {
@@ -776,11 +889,12 @@ fn main() -> ExitCode {
     // Captured here so the human-readable outcome can be printed after the
     // vulnerability summary, while the JSON report below already includes it.
     let mut registration: Option<RegisterResponse> = None;
+    let mut vex_doc: Option<Vec<u8>> = None;
     if action == RegisterAction::Register {
-        let inventory: Vec<InventoryAsset> = assets
+        let (keys, inventory): (Vec<String>, Vec<InventoryAsset>) = assets
             .iter()
-            .filter_map(|a| asset_to_inventory(a, &os))
-            .collect();
+            .filter_map(|a| Some((a.report_key(), asset_to_inventory(a, &os)?)))
+            .unzip();
         let host_id = auth::get_or_create_host_id();
         let os_desc = inventory_os(&os, system_info.as_ref());
         match client.register_inventory(
@@ -795,6 +909,30 @@ fn main() -> ExitCode {
                 tracing::info!(host_id = %host_id, "monitoring registration succeeded");
                 final_results.registration = Some(RegistrationReport::from(&resp));
                 registration = Some(resp);
+                if cli.respect_decisions {
+                    let coordinates = keys.into_iter().zip(inventory.iter().map(InventoryAsset::coordinate)).collect();
+                    match client.host_findings(&host_id) {
+                        // The detail endpoint isn't plan-gated, but only paid plans can record decisions.
+                        Ok(findings) => {
+                            if final_results.apply_decisions(&coordinates, findings) == 0 && client.last_rate_limit().is_free_plan() {
+                                say!("No recorded decisions: the Radar decision ledger needs a paid plan.");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, host_id = %host_id, "decision lookup skipped");
+                            eprintln!("[!] --respect-decisions skipped: {e}");
+                        }
+                    }
+                }
+                if cli.vex.is_some() {
+                    match client.host_vex(&host_id, &cli.vex_format) {
+                        Ok(doc) => vex_doc = Some(doc),
+                        Err(e) => {
+                            warn!(error = %e, host_id = %host_id, "VEX export skipped");
+                            eprintln!("[!] VEX export skipped: {e}");
+                        }
+                    }
+                }
             }
             // Non-fatal: a one-line warning, exit code unchanged.
             Err(e) => {
@@ -803,6 +941,13 @@ fn main() -> ExitCode {
                 if is_host_or_asset_cap(&e) {
                     eprintln!("    Your plan's host/asset cap was reached — raise it at https://radar.offseq.com/pricing (manage hosts: https://radar.offseq.com/console).");
                 }
+            }
+        }
+    }
+    if registration.is_none() {
+        for (wanted, flag) in [(cli.respect_decisions, "--respect-decisions"), (cli.vex.is_some(), "--vex")] {
+            if wanted {
+                eprintln!("[!] {flag} skipped: the host was not registered this run (see --register).");
             }
         }
     }
@@ -817,20 +962,29 @@ fn main() -> ExitCode {
     };
 
     if let Some(ref sarif_path) = cli.sarif {
-        if let Err(e) = fs::write(sarif_path, sarif::to_sarif(&final_results)) {
+        if let Err(e) = write_private(sarif_path, sarif::to_sarif(&final_results).as_bytes()) {
             error!(error = %e, path = %sarif_path.display(), "failed to write SARIF report");
             eprintln!("[!] Couldn't write SARIF to '{}': {e}", sarif_path.display());
             return ExitCode::from(1);
-        } else if !cli.quiet {
-            println!("SARIF report written to {}", sarif_path.display());
+        } else {
+            say!("SARIF report written to {}", sarif_path.display());
         }
+    }
+
+    if let (Some(vex_path), Some(doc)) = (&cli.vex, &vex_doc) {
+        if let Err(e) = write_private(vex_path, doc) {
+            error!(error = %e, path = %vex_path.display(), "failed to write VEX document");
+            eprintln!("[!] Couldn't write VEX to '{}': {e}", vex_path.display());
+            return ExitCode::from(1);
+        }
+        say!("VEX document written to {}", vex_path.display());
     }
 
     if to_stdout {
         println!("{output_json}");
     } else {
         loop {
-            match fs::write(&threats_path, &output_json) {
+            match write_private(&threats_path, output_json.as_bytes()) {
                 Ok(_) => break,
                 Err(e) => {
                     error!(error = %e, path = %threats_path.display(), "failed to write threats report");
@@ -846,17 +1000,15 @@ fn main() -> ExitCode {
                     }
                     let new_path = new_path.trim();
                     threats_path = PathBuf::from(expand_tilde(
-                        if new_path.is_empty() { "/tmp/threats.json" } else { new_path },
+                        if new_path.is_empty() { DEFAULT_REPORT } else { new_path },
                     ));
                 }
             }
         }
     }
 
+    let color = !cli.no_color && std::env::var_os("NO_COLOR").is_none() && io::stdout().is_terminal();
     if !cli.quiet && !to_stdout {
-        let color = !cli.no_color
-            && std::env::var_os("NO_COLOR").is_none()
-            && io::stdout().is_terminal();
         print_summary(&final_results, color);
     }
 
@@ -872,6 +1024,18 @@ fn main() -> ExitCode {
             final_results.errors.len()
         );
     }
+    if !final_results.rejected.is_empty() {
+        eprintln!(
+            "[!] Radar could not check {} package(s); see the \"rejected\" map in the output.",
+            final_results.rejected.len()
+        );
+    }
+    if !final_results.truncated.is_empty() {
+        eprintln!(
+            "[!] {} asset(s) have more matches than your plan returns per query (riskiest kept; see \"truncated\"). Full results: https://radar.offseq.com/pricing",
+            final_results.truncated.len()
+        );
+    }
     if to_stdout {
         eprintln!("Found {total} {word}.");
     } else if !cli.quiet {
@@ -882,10 +1046,7 @@ fn main() -> ExitCode {
     // vulnerability summary. The network call itself already happened before
     // serialization so the response is captured in the JSON report too.
     if let (true, Some(resp)) = (human_output, &registration) {
-        let color = !cli.no_color
-            && std::env::var_os("NO_COLOR").is_none()
-            && io::stdout().is_terminal();
-        print_registration(resp, color);
+        print_registration(resp, !client.last_rate_limit().is_free_plan(), color);
     }
 
     // Opt-in Windows Update Agent advisory: pending (not-installed) security
@@ -896,9 +1057,6 @@ fn main() -> ExitCode {
             let pb = spinner("Querying Windows Update for pending updates…", cli.quiet);
             let updates = find_threats::windows::gather_missing_updates();
             if let Some(pb) = pb { pb.finish_and_clear(); }
-            let color = !cli.no_color
-                && std::env::var_os("NO_COLOR").is_none()
-                && io::stdout().is_terminal();
             print_missing_updates(&updates, color, to_stdout);
         } else if !cli.quiet {
             warn!("--windows-missing-updates ignored: not running on Windows");
@@ -911,10 +1069,38 @@ fn main() -> ExitCode {
             tracing::info!(threshold = ?f, "run finished; --fail-on threshold met");
             return ExitCode::from(5);
         }
+        // A gate that could not see every asset must not pass.
+        if !final_results.errors.is_empty() {
+            eprintln!("[!] --fail-on could not evaluate every asset; failing the run.");
+            return ExitCode::from(1);
+        }
     }
 
     tracing::info!(total_vulns = total, "run finished successfully");
     ExitCode::SUCCESS
+}
+
+/// Exit code for a failed Radar lookup: 4 when the plan or quota is the cause, else 1.
+fn lookup_failed(e: ThreatError, what: &str) -> ExitCode {
+    match e {
+        ThreatError::RateLimitExceeded(msg) => {
+            warn!(message = %msg, "rate limit exceeded: {what}");
+            auth::prompt_upgrade(Some(&msg));
+            ExitCode::from(4)
+        }
+        // A plan gate or incomplete profile: the server message says how to fix
+        // it (with links), and exit 4 rather than 1, which reads as a network failure.
+        ThreatError::AccessDenied(msg) => {
+            warn!(message = %msg, "access denied: {what}");
+            eprintln!("{msg}");
+            ExitCode::from(4)
+        }
+        e => {
+            error!(error = %e, "{what} failed");
+            eprintln!("{what} failed: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 /// Print the Windows Update Agent advisory (pending updates, most severe first).
@@ -968,15 +1154,17 @@ fn inventory_noun(scope: ScanScope, count: usize) -> &'static str {
     }
 }
 
-/// Warning shown when `--scope all` produced more unique packages than the free
-/// tier's hourly lookup budget. Worded conditionally — the same 15/hr cap maps to
-/// both Free and Pro Console accounts and we can't tell them apart locally — so we
-/// frame it as "on the free tier" and point at pricing rather than asserting the
-/// caller is rate-limited.
+/// Free-plan batch size and daily request quota (utils/planLimits.js).
+const FREE_BATCH: usize = 50;
+const FREE_REQUESTS_PER_DAY: usize = 30;
+
+/// Shown before matching (the plan is unknown until the first response), so it
+/// is worded for the free plan rather than asserting the caller's limits.
 fn scope_all_budget_warning(count: usize) -> String {
+    let requests = count.div_ceil(FREE_BATCH);
     format!(
-        "[!] --scope all produced {count} unique package(s). On the free tier \
-         (15 lookups/hour) this will rate-limit — higher plans lift the cap: \
+        "[!] --scope all produced {count} unique package(s): {requests} batched request(s) on the free tier \
+         ({FREE_BATCH} per request, {FREE_REQUESTS_PER_DAY}/day). Higher plans batch more per request: \
          https://radar.offseq.com/pricing"
     )
 }
@@ -1037,10 +1225,10 @@ mod tests {
     #[test]
     fn scope_all_warning_is_plan_agnostic_and_links_pricing() {
         let w = scope_all_budget_warning(2400);
-        assert!(w.contains("2400 unique package(s)"));
+        assert!(w.contains("2400 unique package(s): 48 batched request(s)"));
         // Conditional wording — never asserts the caller IS rate-limited or names
         // their plan; just points at the free-tier cap and the upgrade path.
-        assert!(w.contains("On the free tier"));
+        assert!(w.contains("on the free tier"));
         assert!(w.contains("https://radar.offseq.com/pricing"));
         assert!(!w.to_lowercase().contains("expect rate limiting"));
     }
@@ -1182,7 +1370,8 @@ mod tests {
             meta: Meta::default(), services, by_cve: std::collections::BTreeMap::new(),
             unconfirmed: std::collections::BTreeMap::new(),
             assets: std::collections::BTreeMap::new(),
-            errors: std::collections::BTreeMap::new(), registration: None,
+            errors: std::collections::BTreeMap::new(), rejected: std::collections::BTreeMap::new(),
+            truncated: vec![], registration: None,
         };
         results.sort_findings();
         let v = &results.services["svc@1"];
@@ -1194,6 +1383,29 @@ mod tests {
             .map(|e| (decision_rank(e.decision.as_deref()), e.risk_score.unwrap_or(0)))
             .collect();
         assert!(ranks.windows(2).all(|w| w[0] >= w[1]), "{ranks:?}");
+    }
+
+    #[test]
+    fn suppressed_findings_skip_fail_on_and_sarif_marks_them() {
+        use find_threats::{BatchResults, Meta, RecordedDecision, ThreatEntry};
+        let decided = ThreatEntry {
+            cve_id: Some("CVE-2024-1".into()), severity: Some("critical".into()), kev: true, confirmed: true,
+            recorded_decision: Some(RecordedDecision { verdict: "accept".into(), status: "active".into(), suppressing: true, ..Default::default() }),
+            ..Default::default()
+        };
+        let mut results = BatchResults {
+            meta: Meta::default(),
+            services: std::collections::BTreeMap::from([("svc@1".to_string(), vec![decided])]),
+            by_cve: std::collections::BTreeMap::new(), unconfirmed: std::collections::BTreeMap::new(),
+            assets: std::collections::BTreeMap::new(), errors: std::collections::BTreeMap::new(),
+            rejected: std::collections::BTreeMap::new(), truncated: vec![], registration: None,
+        };
+        assert!(!fail_triggered(&results, FailOn::Kev, None));
+        let v: serde_json::Value = serde_json::from_str(&sarif::to_sarif(&results)).unwrap();
+        assert_eq!(v["runs"][0]["results"][0]["suppressions"][0]["justification"], "accept");
+
+        results.services.get_mut("svc@1").unwrap()[0].recorded_decision.as_mut().unwrap().suppressing = false;
+        assert!(fail_triggered(&results, FailOn::Kev, None));
     }
 
     #[test]
@@ -1211,6 +1423,8 @@ mod tests {
             unconfirmed: std::collections::BTreeMap::new(),
             assets: std::collections::BTreeMap::new(),
             errors: std::collections::BTreeMap::new(),
+            rejected: std::collections::BTreeMap::new(),
+            truncated: vec![],
             registration: None,
         };
         let s = sarif::to_sarif(&results);

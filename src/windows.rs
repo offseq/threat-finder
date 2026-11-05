@@ -19,7 +19,7 @@
 //! On a non-Windows host every fetch returns nothing, so the public entry points
 //! are safe no-ops there (the collector only runs them when the OS is Windows).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -347,6 +347,10 @@ fn parse_winget_list(out: &str) -> Vec<Asset> {
         };
         let name = slice(name_col, name_end);
         let version = slice(ver_col, ver_col + 24);
+        // "< 1.2" / "> 1.2": winget only knows a bound, not the installed version.
+        if version.starts_with(['<', '>']) {
+            continue;
+        }
         // Take only the first token of the version cell (drops "Available"/source).
         let version = version.split_whitespace().next().unwrap_or("").to_string();
         if name.is_empty() || version.is_empty() || version == "Version" {
@@ -420,7 +424,7 @@ struct ScoopApp {
 }
 
 fn scoop_apps() -> Vec<Asset> {
-    match run_capture("scoop", &["export"]) {
+    match ps_capture("scoop export") {
         Some(out) => parse_scoop_export(&out),
         None => Vec::new(),
     }
@@ -463,7 +467,8 @@ struct NpmDep {
 }
 
 fn npm_global() -> Vec<Asset> {
-    match run_capture("npm", &["ls", "-g", "--json", "--depth=0"]) {
+    // npm is a .cmd shim; Command only resolves bare names to .exe.
+    match run_capture("npm.cmd", &["ls", "-g", "--json", "--depth=0"]) {
         Some(out) => parse_npm_list(&out),
         None => Vec::new(),
     }
@@ -492,8 +497,8 @@ struct PipEntry {
 }
 
 fn pip_packages() -> Vec<Asset> {
-    // Prefer the py launcher's pip, then a bare pip; both emit the same JSON.
-    let out = run_capture("python", &["-m", "pip", "list", "--format=json"])
+    // -I: isolated mode, so a pip.py planted in the CWD can't run (possibly elevated).
+    let out = run_capture("python", &["-I", "-m", "pip", "list", "--format=json"])
         .or_else(|| run_capture("pip", &["list", "--format=json"]));
     match out {
         Some(o) => parse_pip_list(&o),
@@ -556,8 +561,17 @@ fn lang_asset(eco: Ecosystem, name: &str, version: &str) -> Asset {
 struct WinService {
     name: Option<String>,
     display: Option<String>,
+    #[serde(rename = "PathName")]
     exe: Option<String>,
     pid: Option<u32>,
+    #[serde(skip)]
+    version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct FileVersion {
+    path: Option<String>,
     version: Option<String>,
 }
 
@@ -571,10 +585,14 @@ struct WinListener {
 
 const SERVICES_SCRIPT: &str = r#"$ErrorActionPreference='SilentlyContinue'
 @(Get-CimInstance Win32_Service -Filter "State='Running'" | ForEach-Object {
-  $p=$_.PathName; $exe=$null; $ver=$null
-  if ($p) { if ($p -match '^"([^"]+)"') { $exe=$matches[1] } else { $exe=($p -split ' ')[0] } }
-  if ($exe -and (Test-Path $exe)) { try { $vi=(Get-Item $exe).VersionInfo; $ver=$vi.FileVersion; if (-not $ver) { $ver=$vi.ProductVersion } } catch {} }
-  [pscustomobject]@{ Name=$_.Name; Display=$_.DisplayName; Exe=$exe; Pid=[int]$_.ProcessId; Version=$ver }
+  [pscustomobject]@{ Name=$_.Name; Display=$_.DisplayName; PathName=$_.PathName; Pid=[int]$_.ProcessId }
+}) | ConvertTo-Json -Compress"#;
+
+// `__PATHS__` is replaced with a comma-separated list of quoted PowerShell literals.
+const FILE_VERSIONS_SCRIPT: &str = r#"$ErrorActionPreference='SilentlyContinue'
+@(@(__PATHS__) | ForEach-Object {
+  $vi=(Get-Item -LiteralPath $_).VersionInfo
+  [pscustomobject]@{ Path=$_; Version=$(if ($vi.FileVersion) { $vi.FileVersion } else { $vi.ProductVersion }) }
 }) | ConvertTo-Json -Compress"#;
 
 const LISTENERS_SCRIPT: &str = r#"$ErrorActionPreference='SilentlyContinue'
@@ -582,9 +600,16 @@ const LISTENERS_SCRIPT: &str = r#"$ErrorActionPreference='SilentlyContinue'
   Select-Object LocalAddress,LocalPort,OwningProcess) | ConvertTo-Json -Compress"#;
 
 fn running_services() -> Vec<Asset> {
-    let services = ps(SERVICES_SCRIPT).map(|s| parse_json_array::<WinService>(&s)).unwrap_or_default();
+    let mut services = ps(SERVICES_SCRIPT).map(|s| parse_json_array::<WinService>(&s)).unwrap_or_default();
     if services.is_empty() {
         return Vec::new();
+    }
+    for s in &mut services {
+        s.exe = s.exe.as_deref().map(service_exe);
+    }
+    let versions = file_versions(services.iter().filter_map(|s| s.exe.as_deref()));
+    for s in &mut services {
+        s.version = s.exe.as_ref().and_then(|e| versions.get(e).cloned());
     }
     // Get-NetTCPConnection is absent on Server Core / older images; fall back to
     // `netstat -ano` (always present) so the exposure signal doesn't vanish.
@@ -595,6 +620,49 @@ fn running_services() -> Vec<Asset> {
         }
     }
     build_service_assets(services, listeners)
+}
+
+/// Pure: the executable of a service `PathName`. Unquoted paths may contain
+/// spaces, so take the shortest prefix ending in `.exe`, else the first token.
+fn service_exe(path_name: &str) -> String {
+    let p = path_name.trim();
+    if let Some(rest) = p.strip_prefix('"') {
+        return rest.split('"').next().unwrap_or(rest).to_string();
+    }
+    // ASCII lowercasing keeps byte offsets valid for slicing `p`.
+    p.to_ascii_lowercase()
+        .match_indices(".exe")
+        .map(|(i, _)| i + 4)
+        .find(|&end| p[end..].chars().next().is_none_or(char::is_whitespace))
+        .map_or_else(|| p.split_whitespace().next().unwrap_or("").to_string(), |end| p[..end].to_string())
+}
+
+/// Single-quoted PowerShell literal; PS also treats the typographic quotes as `'`.
+fn ps_quote(s: &str) -> String {
+    let mut out = String::from("'");
+    for c in s.chars() {
+        if matches!(c, '\'' | '\u{2018}'..='\u{201B}') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
+}
+
+/// Exe path → FileVersion (else ProductVersion), in one PowerShell call.
+fn file_versions<'a>(exes: impl Iterator<Item = &'a str>) -> BTreeMap<String, String> {
+    let exes: BTreeSet<&str> = exes.filter(|e| !e.is_empty()).collect();
+    if exes.is_empty() {
+        return BTreeMap::new();
+    }
+    let list = exes.into_iter().map(ps_quote).collect::<Vec<_>>().join(",");
+    ps(&FILE_VERSIONS_SCRIPT.replacen("__PATHS__", &list, 1))
+        .map(|s| parse_json_array::<FileVersion>(&s))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|f| Some((f.path?, f.version?)))
+        .collect()
 }
 
 /// Pure: parse `netstat -ano` LISTENING rows into listener records. Lines look
@@ -851,8 +919,10 @@ Name                 Id                        Version      Available  Source
 -------------------------------------------------------------------------------
 Mozilla Firefox      Mozilla.Firefox           121.0        122.0      winget
 7-Zip                7zip.7zip                 23.01                   winget
-Some Tool…           Vendor.SomeTool           1.0.0                   winget";
+Some Tool…           Vendor.SomeTool           1.0.0                   winget
+Bounded App          Vendor.Bounded            < 1.2                   winget";
         let assets = parse_winget_list(out);
+        assert!(assets.iter().all(|a| a.name != "Bounded App"));
         let ff = assets.iter().find(|a| a.name == "Mozilla Firefox").unwrap();
         assert_eq!(ff.version, "121.0");
         assert_eq!(ff.cpe.as_deref(), Some("cpe:2.3:a:mozilla:firefox:121.0:*:*:*:*:*:*:*"));
@@ -949,6 +1019,23 @@ nbgv            3.6.133      nbgv";
     }
 
     #[test]
+    fn service_exe_from_path_name() {
+        assert_eq!(service_exe(r#""C:\Program Files\X\x.exe" -k foo"#), r"C:\Program Files\X\x.exe");
+        assert_eq!(service_exe(r"C:\Program Files\X\x.exe -k foo"), r"C:\Program Files\X\x.exe");
+        assert_eq!(service_exe(r"C:\Program Files\X\X.EXE"), r"C:\Program Files\X\X.EXE");
+        assert_eq!(service_exe(r"C:\Apps\x.exe.bak\y.exe /s"), r"C:\Apps\x.exe.bak\y.exe");
+        assert_eq!(service_exe(r"C:\Windows\System32\svchost.exe -k netsvcs -p"), r"C:\Windows\System32\svchost.exe");
+        assert_eq!(service_exe(r"C:\Tools\daemon run"), r"C:\Tools\daemon");
+        assert_eq!(service_exe(""), "");
+    }
+
+    #[test]
+    fn ps_quote_escapes_all_single_quotes() {
+        assert_eq!(ps_quote(r"C:\a'b\x.exe"), r"'C:\a''b\x.exe'");
+        assert_eq!(ps_quote("a\u{2019}b"), "'a\u{2019}\u{2019}b'");
+    }
+
+    #[test]
     fn missing_updates_parsed_and_ranked() {
         let raw = r#"[
           {"Title":"2024-01 Cumulative Update","KBs":["5034441"],"Severity":"Important"},
@@ -1013,7 +1100,7 @@ Active Connections
     fn scripts_are_nonempty() {
         for s in [
             DETECT_OS_SCRIPT, REGISTRY_APPS_SCRIPT, WINGET_SCRIPT, APPX_SCRIPT,
-            SERVICES_SCRIPT, LISTENERS_SCRIPT, MISSING_UPDATES_SCRIPT,
+            SERVICES_SCRIPT, FILE_VERSIONS_SCRIPT, LISTENERS_SCRIPT, MISSING_UPDATES_SCRIPT,
         ] {
             assert!(!s.is_empty());
         }

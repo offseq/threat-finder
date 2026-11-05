@@ -5,6 +5,7 @@ use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 
 use serde::{Deserialize, Serialize};
 
@@ -60,19 +61,21 @@ pub fn resolve_api_key(reset: bool, interactive: bool) -> Option<String> {
     }
 
     if !reset {
-        if let Some(cfg) = load_config() {
-            if !cfg.api_key.is_empty() {
-                return Some(cfg.api_key);
-            }
+        if let Some(k) = saved_api_key() {
+            return Some(k);
         }
     }
 
     if interactive {
         run_initial_setup();
-        return load_config().map(|c| c.api_key).filter(|k| !k.is_empty());
+        return saved_api_key();
     }
 
     None
+}
+
+fn saved_api_key() -> Option<String> {
+    Some(load_config().api_key.trim().to_string()).filter(|k| !k.is_empty())
 }
 
 fn config_path() -> PathBuf {
@@ -86,74 +89,83 @@ fn config_path() -> PathBuf {
     base.join("offseq-rust").join("config.toml")
 }
 
-fn load_config() -> Option<Config> {
+/// The saved config; a missing file is the default, an unreadable or unparsable
+/// one is an error so callers never overwrite (and erase) it.
+fn read_config() -> io::Result<Config> {
     let path = config_path();
-    if !path.exists() {
-        return None;
-    }
-    let contents = fs::read_to_string(&path).ok()?;
-    toml::from_str(&contents).ok()
+    let contents = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
+    };
+    toml::from_str(&contents)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display())))
 }
 
+/// Read-only view of the config: an unreadable file is warned about (once) and
+/// treated as empty.
+fn load_config() -> Config {
+    static WARN: Once = Once::new();
+    read_config().unwrap_or_else(|e| {
+        WARN.call_once(|| eprintln!("[!] Ignoring unreadable config {e}"));
+        Config::default()
+    })
+}
+
+/// Read-modify-write that refuses to touch a config it can't parse.
+fn update_config(f: impl FnOnce(&mut Config)) -> io::Result<()> {
+    let mut cfg = read_config()?;
+    f(&mut cfg);
+    save_config(&cfg)
+}
+
+/// Atomic, owner-private write: a fresh 0600 temp file is fsynced, then renamed
+/// over the target, so a crash never leaves a truncated config.
 fn save_config(cfg: &Config) -> io::Result<()> {
     let path = config_path();
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-        harden_dir(parent);
-    }
+    let dir = path.parent().expect("config path has a parent");
+    create_private_dir(dir)?;
 
     let toml_str = toml::to_string(cfg).map_err(io::Error::other)?;
-
-    let mut f = open_private(&path)?;
-    f.write_all(toml_str.as_bytes())?;
-    harden_file(&path)?;
-    Ok(())
+    let tmp = dir.join(format!(".config.toml.{}.tmp", uuid::Uuid::new_v4()));
+    let res = (|| {
+        let mut f = create_private(&tmp)?;
+        f.write_all(toml_str.as_bytes())?;
+        f.sync_all()?;
+        fs::rename(&tmp, &path)
+    })();
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    res
 }
 
-/// Open the config file for writing, owner-private from the moment of creation.
-/// On Unix this means 0600 (no chmod-after-write TOCTOU window); on Windows the
-/// per-user `%APPDATA%` directory is already ACL'd to the user, so a plain
-/// create/truncate is sufficient.
 #[cfg(unix)]
-fn open_private(path: &Path) -> io::Result<fs::File> {
+fn create_private(path: &Path) -> io::Result<fs::File> {
     fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)
 }
 
+// %APPDATA% is already ACL'd to the user.
 #[cfg(not(unix))]
-fn open_private(path: &Path) -> io::Result<fs::File> {
-    fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
+fn create_private(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new().write(true).create_new(true).open(path)
 }
 
-/// Re-assert owner-only permissions on the directory (0700 on Unix; no-op
-/// elsewhere — `%APPDATA%` inherits a user-private ACL).
 #[cfg(unix)]
-fn harden_dir(dir: &Path) {
-    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    // Tighten a pre-existing directory too.
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
 }
 
 #[cfg(not(unix))]
-fn harden_dir(_dir: &Path) {}
-
-/// Re-assert owner-only permissions on the config file (0600 on Unix; no-op
-/// elsewhere) in case it already existed with looser modes.
-#[cfg(unix)]
-fn harden_file(path: &Path) -> io::Result<()> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn harden_file(_path: &Path) -> io::Result<()> {
-    Ok(())
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)
 }
 
 fn run_initial_setup() {
@@ -179,12 +191,21 @@ fn run_initial_setup() {
 
         match choice.trim() {
             "1" => {
-                let key = prompt_for_key();
+                let Some(key) = prompt_for_key() else {
+                    eprintln!("\nCouldn't read the API key; aborting setup.");
+                    return;
+                };
                 // Preserve any existing [monitoring] section when (re)writing the key.
-                let mut cfg = load_config().unwrap_or_default();
+                let mut cfg = match read_config() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("\n[!] Not overwriting unreadable config {e}\nFix or remove it, then retry.\n");
+                        return;
+                    }
+                };
                 cfg.api_key = key;
                 match save_config(&cfg) {
-                    Ok(_) => {
+                    Ok(()) => {
                         println!("\n✓  API key saved successfully.\n");
                         return;
                     }
@@ -195,7 +216,7 @@ fn run_initial_setup() {
                 }
             }
             "2" => {
-                println!("\nYour API key is available at:");
+                println!("\nAPI access is included on every plan, including Free. Your key is at:");
                 println!("  https://radar.offseq.com/console\n");
                 println!("Once you have your key, select option 1 to continue.\n");
             }
@@ -206,11 +227,11 @@ fn run_initial_setup() {
     }
 }
 
-fn prompt_for_key() -> String {
+/// None when the terminal can't be read (retrying would spin forever).
+fn prompt_for_key() -> Option<String> {
     loop {
         // Read the key with echo disabled so it isn't left on screen/scrollback.
-        let key = rpassword::prompt_password("\nPaste your API key (input hidden): ")
-            .unwrap_or_default();
+        let key = rpassword::prompt_password("\nPaste your API key (input hidden): ").ok()?;
         let key = key.trim().to_string();
 
         if key.is_empty() {
@@ -223,7 +244,7 @@ fn prompt_for_key() -> String {
             continue;
         }
 
-        return key;
+        return Some(key);
     }
 }
 
@@ -231,13 +252,15 @@ fn prompt_for_key() -> String {
 /// the server's own message — it distinguishes an hourly burst from a daily or
 /// monthly quota and carries the reset time, so we surface it verbatim above the
 /// generic upgrade line rather than guessing.
+/// Printed to stderr so it can't corrupt JSON written to stdout.
 pub fn prompt_upgrade(detail: Option<&str>) {
-    println!("\n┌─────────────────────────────────────────────┐");
-    println!("│            Rate Limit Reached               │");
-    println!("└─────────────────────────────────────────────┘\n");
-    println!("{}\n", upgrade_body_line(detail));
-    println!("To continue using OffSeq, upgrade your plan at:\n");
-    println!("  https://radar.offseq.com/pricing\n");
+    eprintln!("\n┌─────────────────────────────────────────────┐");
+    eprintln!("│            Rate Limit Reached               │");
+    eprintln!("└─────────────────────────────────────────────┘\n");
+    eprintln!("{}\n", upgrade_body_line(detail));
+    eprintln!("Upgrade your plan for higher limits:");
+    eprintln!("  https://radar.offseq.com/console?tab=billing\n");
+    eprintln!("Compare plans: https://radar.offseq.com/pricing\n");
 }
 
 /// The explanatory line shown by [`prompt_upgrade`]: the server's own message
@@ -267,39 +290,37 @@ fn read_line() -> Option<String> {
 /// read-only paths like `--unregister` that must not mint a fresh id as a side
 /// effect; use `get_or_create_host_id()` only when actually registering.
 pub fn host_id() -> Option<String> {
-    load_config()
-        .map(|cfg| cfg.monitoring.host_id)
-        .filter(|id| !id.is_empty())
+    Some(load_config().monitoring.host_id).filter(|id| !id.is_empty())
 }
 
 /// Return the stable per-host UUID, generating and persisting one on first use.
-/// On a config save failure the freshly-generated id is still returned (so a
-/// single run is consistent) — it just won't be stable across runs.
+/// On a save failure the fresh id is still returned (one run stays consistent),
+/// with a warning that it won't be stable across runs.
 pub fn get_or_create_host_id() -> String {
-    let mut cfg = load_config().unwrap_or_default();
-    if !cfg.monitoring.host_id.is_empty() {
-        return cfg.monitoring.host_id;
+    if let Some(id) = host_id() {
+        return id;
     }
     let id = uuid::Uuid::new_v4().to_string();
-    cfg.monitoring.host_id = id.clone();
-    let _ = save_config(&cfg);
+    if let Err(e) = update_config(|c| c.monitoring.host_id = id.clone()) {
+        eprintln!(
+            "[!] Couldn't save host id to {}: {e}; registration will create a new Radar host each run",
+            config_path().display()
+        );
+    }
     id
 }
 
 /// The post-scan registration prompt mode: `ask` (default) | `never` | `always`.
 pub fn monitoring_prompt_mode() -> String {
-    match load_config() {
-        Some(cfg) if !cfg.monitoring.prompt.is_empty() => cfg.monitoring.prompt,
-        _ => DEFAULT_PROMPT_MODE.to_string(),
-    }
+    Some(load_config().monitoring.prompt)
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| DEFAULT_PROMPT_MODE.to_string())
 }
 
 /// Persist the registration prompt mode (e.g. `"never"` after a user opts out).
 /// Returns the IO result so callers can warn if it didn't stick.
 pub fn set_monitoring_prompt_mode(mode: &str) -> io::Result<()> {
-    let mut cfg = load_config().unwrap_or_default();
-    cfg.monitoring.prompt = mode.to_string();
-    save_config(&cfg)
+    update_config(|c| c.monitoring.prompt = mode.to_string())
 }
 
 #[cfg(test)]
@@ -371,8 +392,7 @@ mod tests {
         assert_eq!(id1, id2, "host id must be stable once generated");
 
         // And it is readable straight from the on-disk config.
-        let cfg = load_config().expect("config persisted");
-        assert_eq!(cfg.monitoring.host_id, id1);
+        assert_eq!(read_config().unwrap().monitoring.host_id, id1);
     }
 
     #[test]
@@ -383,7 +403,7 @@ mod tests {
         // Nothing registered yet: the read-only accessor reports None …
         assert_eq!(host_id(), None, "unset host id reads back as None");
         // … and must NOT have written a config (no side-effect persistence).
-        assert!(load_config().is_none(), "host_id() must not create a config");
+        assert!(!config_path().exists(), "host_id() must not create a config");
 
         // Once a real id is minted, the read-only accessor returns it verbatim.
         let id = get_or_create_host_id();
@@ -403,5 +423,53 @@ mod tests {
         set_monitoring_prompt_mode("always").unwrap();
         assert_eq!(monitoring_prompt_mode(), "always");
         assert_eq!(get_or_create_host_id(), id, "host id preserved across prompt writes");
+    }
+
+    #[test]
+    fn corrupt_config_is_not_overwritten() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _tmp = TempConfigHome::new();
+
+        let path = config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let corrupt = "api_key = \"k\"\n[monitoring\n";
+        fs::write(&path, corrupt).unwrap();
+
+        assert!(read_config().is_err());
+        assert!(set_monitoring_prompt_mode("never").is_err());
+        get_or_create_host_id();
+        assert_eq!(fs::read_to_string(&path).unwrap(), corrupt, "config left untouched");
+    }
+
+    #[test]
+    fn saved_api_key_is_trimmed() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _tmp = TempConfigHome::new();
+
+        assert_eq!(saved_api_key(), None);
+        update_config(|c| c.api_key = "  key\n".into()).unwrap();
+        assert_eq!(saved_api_key().as_deref(), Some("key"));
+        update_config(|c| c.api_key = "   ".into()).unwrap();
+        assert_eq!(saved_api_key(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_config_is_owner_private() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _tmp = TempConfigHome::new();
+
+        let path = config_path();
+        let dir = path.parent().unwrap();
+        fs::create_dir_all(dir).unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&path, "").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        update_config(|c| c.api_key = "secret".into()).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(dir), 0o700);
+        assert_eq!(fs::read_dir(dir).unwrap().count(), 1, "no temp file left behind");
     }
 }
