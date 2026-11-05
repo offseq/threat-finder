@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
+use std::ops::RangeInclusive;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -60,6 +61,7 @@ impl WinOs {
     }
 }
 
+/// How an asset's version was sourced (a trust signal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VersionSource {
     PackageDb,
@@ -98,6 +100,8 @@ pub struct ServiceInfo {
     pub listeners: Vec<String>,
     pub reach:     Reachability,
     pub exposed:   bool,
+    /// The process still runs a binary that was replaced on disk.
+    pub restart_pending: bool,
 }
 
 #[derive(Serialize)]
@@ -262,38 +266,6 @@ pub fn gather_system_info(os: &OsType) -> Option<SystemFacts> {
                 distro_version: version,
             })
         }
-        OsType::FreeBsd => {
-            Some(SystemFacts {
-                kernel_name:    "freebsd".into(),
-                kernel_version: kernel_version.clone(),
-                distro_name:    "freebsd".into(),
-                distro_version: kernel_version,
-            })
-        }
-        OsType::DragonFlyBsd => {
-            Some(SystemFacts {
-                kernel_name:    "dragonfly".into(),
-                kernel_version: kernel_version.clone(),
-                distro_name:    "dragonfly".into(),
-                distro_version: kernel_version,
-            })
-        }
-        OsType::OpenBsd => {
-            Some(SystemFacts {
-                kernel_name:    "openbsd".into(),
-                kernel_version: kernel_version.clone(),
-                distro_name:    "openbsd".into(),
-                distro_version: kernel_version,
-            })
-        }
-        OsType::NetBsd => {
-            Some(SystemFacts {
-                kernel_name:    "netbsd".into(),
-                kernel_version: kernel_version.clone(),
-                distro_name:    "netbsd".into(),
-                distro_version: kernel_version,
-            })
-        }
         OsType::Solaris => {
             let version = run_cmd("uname", &["-v"])
                 .map(|s| s.trim().to_string())
@@ -305,11 +277,18 @@ pub fn gather_system_info(os: &OsType) -> Option<SystemFacts> {
                 distro_version: version,
             })
         }
-        OsType::Illumos => {
+        OsType::FreeBsd | OsType::DragonFlyBsd | OsType::OpenBsd | OsType::NetBsd | OsType::Illumos => {
+            let name = match os {
+                OsType::FreeBsd => "freebsd",
+                OsType::DragonFlyBsd => "dragonfly",
+                OsType::OpenBsd => "openbsd",
+                OsType::NetBsd => "netbsd",
+                _ => "illumos",
+            };
             Some(SystemFacts {
-                kernel_name:    "illumos".into(),
+                kernel_name:    name.into(),
                 kernel_version: kernel_version.clone(),
-                distro_name:    "illumos".into(),
+                distro_name:    name.into(),
                 distro_version: kernel_version,
             })
         }
@@ -711,7 +690,15 @@ pub fn make_service(name: &str, exe: &str, pid: Option<u32>, os: &OsType) -> Opt
         listeners: Vec::new(),
         reach: Reachability::None,
         exposed: false,
+        restart_pending: pid.is_some_and(exe_replaced),
     })
+}
+
+/// Linux marks `/proc/<pid>/exe` " (deleted)" once a package upgrade replaces the
+/// running binary: the version read from disk is then not what is running.
+fn exe_replaced(pid: u32) -> bool {
+    fs::read_link(format!("/proc/{pid}/exe"))
+        .is_ok_and(|p| p.to_string_lossy().ends_with(" (deleted)"))
 }
 
 /// Build a ServiceInfo from a service name by resolving its binary and version.
@@ -732,9 +719,43 @@ pub fn listening_endpoints(pid: u32) -> Vec<String> {
     } else {
         lsof_listeners(pid)
     };
+    drop_ephemeral_udp(&mut eps, &ephemeral_ports());
     eps.sort();
     eps.dedup();
     eps
+}
+
+/// Unconnected UDP clients (resolvers, NTP) sit on an auto-assigned port and
+/// would otherwise read as listeners. Dropped only beside a real listener: a
+/// process with nothing else (a VPN on 51820) may be serving on that port.
+pub fn drop_ephemeral_udp(eps: &mut Vec<String>, ephemeral: &RangeInclusive<u16>) {
+    let is_ephemeral = |ep: &String| {
+        ep.strip_prefix("udp ")
+            .and_then(|e| e.rsplit_once(':'))
+            .and_then(|(_, p)| p.parse().ok())
+            .is_some_and(|p| ephemeral.contains(&p))
+    };
+    if eps.iter().any(|ep| !is_ephemeral(ep)) {
+        eps.retain(|ep| !is_ephemeral(ep));
+    }
+}
+
+/// The port range the OS assigns to unbound client sockets.
+fn ephemeral_ports() -> RangeInclusive<u16> {
+    if cfg!(target_os = "linux") {
+        fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").ok()
+            .and_then(|s| parse_port_range(&s))
+            .unwrap_or(32768..=60999)
+    } else {
+        49152..=65535
+    }
+}
+
+/// Parse `ip_local_port_range` ("32768\t60999").
+pub fn parse_port_range(s: &str) -> Option<RangeInclusive<u16>> {
+    let mut it = s.split_whitespace().map(str::parse::<u16>);
+    let (lo, hi) = (it.next()?.ok()?, it.next()?.ok()?);
+    (lo <= hi).then_some(lo..=hi)
 }
 
 /// Listening endpoints via `lsof` (macOS/BSD/Solaris). Uses field output (`-Fn`)
@@ -832,7 +853,8 @@ pub fn linux_listeners(pid: u32) -> Vec<String> {
     out
 }
 
-/// Parse a /proc/net hex "addr:port" (little-endian) into "ip:port".
+/// Parse a /proc/net hex "addr:port" into "ip:port". The kernel prints each
+/// address word as a host-order u32, so its bytes come back in network order.
 pub fn parse_proc_addr(s: &str, v6: bool) -> Option<String> {
     let (addr, port) = s.split_once(':')?;
     let port = u16::from_str_radix(port, 16).ok()?;
@@ -843,7 +865,7 @@ pub fn parse_proc_addr(s: &str, v6: bool) -> Option<String> {
         let mut bytes = [0u8; 16];
         for i in 0..4 {
             let word = u32::from_str_radix(&addr[i * 8..i * 8 + 8], 16).ok()?;
-            bytes[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+            bytes[i * 4..i * 4 + 4].copy_from_slice(&word.to_ne_bytes());
         }
         Some(format!("[{}]:{port}", std::net::Ipv6Addr::from(bytes)))
     } else {
@@ -851,7 +873,7 @@ pub fn parse_proc_addr(s: &str, v6: bool) -> Option<String> {
             return None;
         }
         let v = u32::from_str_radix(addr, 16).ok()?;
-        Some(format!("{}:{port}", std::net::Ipv4Addr::from(v.to_le_bytes())))
+        Some(format!("{}:{port}", std::net::Ipv4Addr::from(v.to_ne_bytes())))
     }
 }
 
@@ -1520,10 +1542,34 @@ mod tests {
         assert!(Public > Private && Private > Loopback && Loopback > None);
     }
 
+    // Fixtures are little-endian kernel output.
+    #[cfg(target_endian = "little")]
     #[test]
     fn proc_addr_parsing() {
         assert_eq!(parse_proc_addr("0100007F:1F90", false).as_deref(), Some("127.0.0.1:8080"));
         assert_eq!(parse_proc_addr("00000000:01BB", false).as_deref(), Some("0.0.0.0:443"));
+        assert_eq!(
+            parse_proc_addr("00000000000000000000000001000000:0035", true).as_deref(),
+            Some("[::1]:53")
+        );
+    }
+
+    #[test]
+    fn ephemeral_udp_clients_are_not_listeners() {
+        assert_eq!(parse_port_range("32768\t60999\n"), Some(32768..=60999));
+        assert_eq!(parse_port_range("61000 32768"), None);
+        assert_eq!(parse_port_range("garbage"), None);
+
+        let mut eps: Vec<String> = [
+            "udp 0.0.0.0:53", "udp [::]:123", "udp 0.0.0.0:41234", "udp *:51000",
+            "tcp 0.0.0.0:45000",
+        ].map(String::from).to_vec();
+        drop_ephemeral_udp(&mut eps, &(32768..=60999));
+        assert_eq!(eps, ["udp 0.0.0.0:53", "udp [::]:123", "tcp 0.0.0.0:45000"]);
+
+        let mut vpn = vec!["udp 0.0.0.0:51820".to_string()];
+        drop_ephemeral_udp(&mut vpn, &(32768..=60999));
+        assert_eq!(vpn, ["udp 0.0.0.0:51820"], "a lone high-port UDP socket may be the service");
     }
 
     #[test]

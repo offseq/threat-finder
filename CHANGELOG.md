@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1]
+
+### Fixed
+- Unconnected UDP sockets on an ephemeral port (resolver, NTP clients) no
+  longer count as listeners next to a real one, so they cannot make a service
+  look exposed (a process whose only socket is one, like a VPN, keeps it). The
+  range comes from `ip_local_port_range` on Linux (default 32768-60999) and is
+  49152-65535 elsewhere.
+- A service still running a binary that an upgrade replaced on disk is flagged
+  `assets.*.restartPending`, with a summary hint to restart it: the reported
+  version is the new package's, not the running one's.
+- `/proc/net` addresses decode correctly on big-endian hosts.
+- The JSON report is written before SARIF and VEX, so a failed SARIF or VEX
+  write no longer loses it.
+- SARIF results carry a `physicalLocation` (the asset's path, relative) so
+  GitHub code scanning displays them.
+
+### Changed
+- `scan::Source` is now a re-export of `engine::VersionSource`.
+
+### CI and release
+- crates.io publishing uses Trusted Publishing only; the stored-token fallback
+  is removed.
+
 ## [0.4.0]
 
 Brings the client in line with the current Radar API.

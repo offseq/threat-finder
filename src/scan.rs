@@ -16,7 +16,7 @@ use crate::api::{
 use crate::cpe::escape_cpe;
 use crate::engine::{
     enrich_exposure, list_installed, normalize_service_name, os_release_field, scan_services,
-    strip_instance, LinuxDistro, OsType, Reachability, ServiceInfo, VersionSource,
+    strip_instance, LinuxDistro, OsType, Reachability, ServiceInfo,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -63,12 +63,7 @@ impl Ecosystem {
     }
 }
 
-/// How an asset's version was sourced (a trust signal).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Source {
-    PackageDb,
-    Probe,
-}
+pub use crate::engine::VersionSource as Source;
 
 /// Runtime facet — present only for assets that back a live process.
 #[derive(Debug, Clone)]
@@ -77,6 +72,7 @@ pub struct Runtime {
     pub listeners: Vec<String>,
     pub reachability: Reachability,
     pub exposed: bool,
+    pub restart_pending: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -144,22 +140,19 @@ impl Collector for RunningServiceCollector {
 }
 
 fn service_to_asset(s: ServiceInfo, eco: Ecosystem) -> Asset {
-    let src = match s.source {
-        VersionSource::PackageDb => Source::PackageDb,
-        VersionSource::Probe => Source::Probe,
-    };
     Asset {
         ecosystem: eco,
         name: s.name,
         pkg_name: s.pkg_name,
         version: s.version,
-        sources: vec![src],
+        sources: vec![s.source],
         locations: vec![s.exe],
         runtime: Some(Runtime {
             pid: s.pid,
             listeners: s.listeners,
             reachability: s.reach,
             exposed: s.exposed,
+            restart_pending: s.restart_pending,
         }),
         cpe: None,
     }
@@ -559,7 +552,7 @@ mod tests {
             ecosystem: Ecosystem::Deb, name: "nginx".into(), pkg_name: None, version: "1.24.0".into(),
             sources: vec![Source::Probe], locations: vec!["/usr/sbin/nginx".into()],
             runtime: Some(Runtime { pid: Some(7), listeners: vec!["tcp 0.0.0.0:443".into()],
-                reachability: Reachability::Public, exposed: true }),
+                reachability: Reachability::Public, exposed: true, restart_pending: false }),
             cpe: None,
         };
         let installed = pkg_asset("nginx", "1.24.0");
