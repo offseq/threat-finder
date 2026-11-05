@@ -8,7 +8,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 - Unconnected UDP sockets on an ephemeral port (resolver, NTP clients) no
-  longer count as listeners, so they cannot make a service look exposed. The
+  longer count as listeners next to a real one, so they cannot make a service
+  look exposed (a process whose only socket is one, like a VPN, keeps it). The
   range comes from `ip_local_port_range` on Linux (default 32768-60999) and is
   49152-65535 elsewhere.
 - A service still running a binary that an upgrade replaced on disk is flagged
