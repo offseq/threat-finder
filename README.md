@@ -308,4 +308,4 @@ The engine is a library crate (`find_threats`) with a `Collector` abstraction
 
 ## License
 
-Dual-licensed under [MIT](LICENSE) or [Apache-2.0](LICENSE), at your option.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
