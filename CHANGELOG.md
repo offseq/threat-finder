@@ -48,7 +48,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Radar's `truncated` (`candidate-cap` → `incomplete`) the same way. Report
   `schemaVersion` is 4.
 - At most 25 `?search=` fallback lookups per run; the rest are listed in
-  `errors` as not searched.
+  `rejected` as not searched (their hits would be unconfirmed, so they never
+  fail `--fail-on`).
+- Running out of quota mid-run keeps everything already matched: the report is
+  written with the rest under `errors`, registration is skipped, and the run
+  exits `4`.
 - API keys must match Radar's format (`tr_` and 64 hex characters): a malformed
   `OFFSEQ_API_KEY` or saved key exits `2` before any request, and the setup
   prompt rejects one.
@@ -461,45 +465,6 @@ Brings the client in line with the current Radar API.
 ### Removed
 - Dead `ServiceEntry` / `SystemInfo` API types left over from the match migration.
 
-## [0.1.0] Radar exact-coordinate matching
-
-### Changed
-- **Migrated to Radar exact-coordinate matching** (`POST /match/batch`). Each
-  asset becomes a Package-URL with its full version + `?distro=` and the whole
-  inventory is matched server-side with ecosystem-native version rules, in one
-  request per tier-sized chunk (replacing per-service free-text search). Removed
-  the client-side version-constraint engine and the hard-coded nginx blocklist.
-  Backported-and-fixed builds are no longer false-flagged.
-- Findings now split into `confirmed` (reported) and `unconfirmed` (triage,
-  excluded from the count / `byCve` / `--fail-on`); added `--strict`. `?search=`
-  is retained only as a fallback for assets with no buildable coordinate.
-
-### Added
-- Split into a reusable library crate (`find_threats`) + thin binary, with a
-  generic `Asset`/`Collector` abstraction (running-services is now a collector).
-- `--scope all`: a full installed-OS-package inventory collector
-  (dpkg/rpm/pacman/apk/brew/pkg/pkg_info), expanding matched coverage ~10–50×.
-  Assets are deduplicated and merged so a package backing a running, exposed
-  process keeps its runtime exposure. Defaults to `--scope running` (quota-safe),
-  with a warning when the inventory exceeds the free-tier budget.
-
-### Added (prior)
-- Reachability classification (loopback / private / public) for listeners, and
-  UDP listener coverage in addition to TCP.
-- Cross-service CVE grouping (`byCve`) — one fix mapped to every affected service.
-- SARIF 2.1.0 output (`--sarif`) and `--include`/`--exclude` service globs.
-- Output `meta` envelope with `schemaVersion`.
-
-### Fixed
-- **Critical:** `lsof`-based exposure correlation returned nothing on
-  macOS/BSD/Solaris (the `(LISTEN)` suffix defeated the parser), silently
-  disabling the headline feature off-Linux. Now uses `lsof -Fn` field output,
-  with a non-vacuous regression test.
-
-### Changed
-- `ThreatError` now implements `std::error::Error`; single canonical
-  `severity_rank`; pure per-OS parse functions extracted and unit-tested.
-
 ## [0.1.0-prev]
 
 ### Added
@@ -527,4 +492,38 @@ Brings the client in line with the current Radar API.
   API-key storage.
 
 ## [0.1.0]
+
+### Changed
+- **Migrated to Radar exact-coordinate matching** (`POST /match/batch`). Each
+  asset becomes a Package-URL with its full version + `?distro=` and the whole
+  inventory is matched server-side with ecosystem-native version rules, in one
+  request per tier-sized chunk (replacing per-service free-text search). Removed
+  the client-side version-constraint engine and the hard-coded nginx blocklist.
+  Backported-and-fixed builds are no longer false-flagged.
+- Findings now split into `confirmed` (reported) and `unconfirmed` (triage,
+  excluded from the count / `byCve` / `--fail-on`); added `--strict`. `?search=`
+  is retained only as a fallback for assets with no buildable coordinate.
+- `ThreatError` now implements `std::error::Error`; single canonical
+  `severity_rank`; pure per-OS parse functions extracted and unit-tested.
+
+### Added
+- Split into a reusable library crate (`find_threats`) + thin binary, with a
+  generic `Asset`/`Collector` abstraction (running-services is now a collector).
+- `--scope all`: a full installed-OS-package inventory collector
+  (dpkg/rpm/pacman/apk/brew/pkg/pkg_info), expanding matched coverage ~10–50×.
+  Assets are deduplicated and merged so a package backing a running, exposed
+  process keeps its runtime exposure. Defaults to `--scope running` (quota-safe),
+  with a warning when the inventory exceeds the free-tier budget.
+- Reachability classification (loopback / private / public) for listeners, and
+  UDP listener coverage in addition to TCP.
+- Cross-service CVE grouping (`byCve`) — one fix mapped to every affected service.
+- SARIF 2.1.0 output (`--sarif`) and `--include`/`--exclude` service globs.
+- Output `meta` envelope with `schemaVersion`.
+
+### Fixed
+- **Critical:** `lsof`-based exposure correlation returned nothing on
+  macOS/BSD/Solaris (the `(LISTEN)` suffix defeated the parser), silently
+  disabling the headline feature off-Linux. Now uses `lsof -Fn` field output,
+  with a non-vacuous regression test.
+
 - Initial release.

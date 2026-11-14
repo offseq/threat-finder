@@ -705,9 +705,9 @@ pub fn service_from_name(display_name: &str, os: &OsType) -> Option<ServiceInfo>
 
 /// The oldest process running `exe`: by process name, then by command line.
 fn running_pid(exe: &str) -> Option<u32> {
-    run_cmd("pgrep", &["-x", &binary_basename(exe)])
+    run_cmd("pgrep", &["-o", "-x", &binary_basename(exe)])
         .and_then(|o| first_pid(&o))
-        .or_else(|| run_cmd("pgrep", &["-f", exe]).and_then(|o| first_pid(&o)))
+        .or_else(|| run_cmd("pgrep", &["-o", "-f", &regex::escape(exe)]).and_then(|o| first_pid(&o)))
 }
 
 pub fn first_pid(out: &str) -> Option<u32> {

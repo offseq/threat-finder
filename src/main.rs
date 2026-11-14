@@ -872,7 +872,7 @@ fn main() -> ExitCode {
     let human_output = !to_stdout && !cli.quiet;
     let interactive_human = interactive && human_output;
     let prompt_mode = auth::monitoring_prompt_mode();
-    let mut action = register_action(cli.no_register || cli.sbom.is_some(), cli.register, &prompt_mode, interactive_human);
+    let mut action = register_action(cli.no_register || cli.sbom.is_some() || quota.is_some(), cli.register, &prompt_mode, interactive_human);
 
     // If we'd prompt, ask now and fold the answer back into the action.
     if action == RegisterAction::Prompt {
@@ -1078,7 +1078,7 @@ fn main() -> ExitCode {
     }
 
     if let Some(q) = quota {
-        return quota_exhausted(q, "Fallback search");
+        return quota_exhausted(q, "Lookup");
     }
 
     if let Some(f) = cli.fail_on {

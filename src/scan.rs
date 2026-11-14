@@ -466,16 +466,21 @@ pub fn run_scan(
     let keep = |e: &ThreatEntry| e.exploited || severity_rank(e.severity.as_deref()) >= severity_floor;
 
     if !queries.is_empty() {
-        let mut matched = client.match_batch(&queries, strict)?;
+        let (mut matched, stopped) = client.match_batch(&queries, strict)?;
+        for (key, _) in &query_keys[matched.len()..] {
+            errors.insert(key.clone(), "not matched (quota exhausted)".to_string());
+        }
+        quota = stopped;
         // The candidate budget is per request, so a smaller follow-up batch gets a fresh one.
         let capped: Vec<usize> = (0..matched.len()).filter(|&i| matched[i].candidate_capped()).collect();
-        if !capped.is_empty() {
+        if !capped.is_empty() && quota.is_none() {
             let retry: Vec<MatchQuery> = capped.iter().map(|&i| queries[i].clone()).collect();
             match client.match_batch(&retry, strict) {
-                Ok(again) => {
+                Ok((again, stopped)) => {
                     for (i, r) in capped.into_iter().zip(again) {
                         matched[i] = r;
                     }
+                    quota = stopped;
                 }
                 Err(ThreatError::RateLimitExceeded(q)) => quota = Some(q),
                 Err(e) => tracing::warn!(error = %e, "candidate-cap retry failed"),
@@ -533,8 +538,9 @@ pub fn run_scan(
             Err(e) => note(&mut errors, &keys, &e.to_string()),
         }
     }
+    // Search hits are unconfirmed and never trip --fail-on, so skipping them must not either.
     for (_, keys) in fallback {
-        note(&mut errors, &keys, &format!("not searched (fallback budget of {MAX_FALLBACK_SEARCHES} searches per run)"));
+        note(&mut rejected, &keys, &format!("not searched (fallback budget of {MAX_FALLBACK_SEARCHES} searches per run)"));
     }
 
     for v in results.values_mut().chain(unconfirmed.values_mut()) {

@@ -762,12 +762,13 @@ impl ThreatClient {
     }
 
     /// Match a whole inventory by exact coordinate in one POST per tier-sized
-    /// chunk. Results are positionally aligned to `queries` (guarded per chunk).
+    /// chunk. Results are positionally aligned to a prefix of `queries`; a quota
+    /// stop keeps the chunks already matched and returns why it stopped.
     pub fn match_batch(
         &self,
         queries: &[MatchQuery],
         strict: bool,
-    ) -> Result<Vec<MatchResult>, ThreatError> {
+    ) -> Result<(Vec<MatchResult>, Option<QuotaExceeded>), ThreatError> {
         let mut out: Vec<MatchResult> = Vec::with_capacity(queries.len());
         let mut cursor = 0usize;
         // The working cap can only shrink within a run (a 413 tells us the real
@@ -814,10 +815,11 @@ impl ThreatClient {
                     };
                     cap_ceiling = new_cap.max(1);
                 }
+                Err(ThreatError::RateLimitExceeded(q)) if !out.is_empty() => return Ok((out, Some(q))),
                 Err(e) => return Err(e),
             }
         }
-        Ok(out)
+        Ok((out, None))
     }
 
     /// Register (or refresh) this host's asset inventory for continuous
@@ -1478,7 +1480,8 @@ impl ScanReport {
 
 /// The version of `pkg:type/name@version?qualifiers#subpath`.
 fn purl_version(purl: &str) -> &str {
-    purl.rsplit_once('@').map_or("", |(_, v)| v.split(['?', '#']).next().unwrap_or(v))
+    let base = purl.split(['?', '#']).next().unwrap_or_default();
+    base.rsplit_once('@').map_or("", |(_, v)| v)
 }
 
 fn truthy(v: Option<&Value>) -> bool {
@@ -2381,7 +2384,7 @@ mod tests {
         let one = http(200, r#"{"data":{"results":[{"matches":[]}]}}"#);
         let (client, server) = serve(vec![too_large.clone(), one.clone(), one]);
         let q = [MatchQuery::purl("pkg:npm/a@1"), MatchQuery::purl("pkg:npm/b@1")];
-        assert_eq!(client.match_batch(&q, false).unwrap().len(), 2);
+        assert_eq!(client.match_batch(&q, false).unwrap().0.len(), 2);
         assert_eq!(server.join().unwrap().len(), 3);
 
         let (client, server) = serve(vec![too_large]);

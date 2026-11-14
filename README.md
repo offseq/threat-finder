@@ -95,8 +95,8 @@ unsupported OS · `4` rate limit/quota, or API access required (upgrade needed) 
 `5` `--fail-on` threshold met. With `--fail-on`, a run where any lookup failed or
 an asset was left `incomplete` exits `1` rather than passing; packages Radar could
 not evaluate (listed under `rejected`) don't count as failed lookups. When the
-quota runs out during the `?search=` fallback, the report is still written with
-the unsearched assets under `errors`, and the run exits `4`.
+quota runs out mid-run, the report is still written with what was matched (the
+rest under `errors`), registration is skipped, and the run exits `4`.
 
 **API key** (get one from the [Radar Console](https://radar.offseq.com/console)),
 resolved in order:
@@ -280,9 +280,10 @@ JSON, with deterministic (sorted) keys and no timestamp, so reports diff cleanly
 - **`assets`** — `pkg@version` → `{ exe, version, versionSource, exposed, reachability, listeners, upgradeTo, restartPending }`
   (`versionSource` = `package-db` | `probe`; `reachability` covers TCP **and** UDP).
 - **`byCve`** — each CVE rolled up across every affected asset ("patch once, fix many").
-- **`errors`** — per-asset lookup failures (and fallback searches skipped for
-  quota or the per-run limit), so a failure never reads as "clean".
-- **`rejected`** — packages Radar could not evaluate, and why (not a lookup failure).
+- **`errors`** — per-asset lookup failures (including assets left unmatched when
+  the quota ran out), so a failure never reads as "clean".
+- **`rejected`** — packages Radar could not evaluate, and assets past the per-run
+  `?search=` fallback limit, and why (not a lookup failure).
 - **`truncated`** — assets whose matches the plan's per-query result cap cut short.
 - **`incomplete`** — assets Radar could not fully evaluate (server candidate cap);
   they fail `--fail-on` like lookup errors.
