@@ -733,8 +733,24 @@ mod tests {
         let assets: Vec<Asset> = (0..MAX_FALLBACK_SEARCHES + 2).map(|i| win_app(&format!("app{i:02}"))).collect();
         let out = run_scan(&client, &assets, &OsType::Windows(Default::default()), false, 0).unwrap();
         assert_eq!(server.join().unwrap().len(), MAX_FALLBACK_SEARCHES);
-        assert_eq!(out.errors.len(), 2);
-        assert!(out.errors.values().all(|e| e.contains("fallback budget")), "{:?}", out.errors);
+        assert!(out.errors.is_empty(), "budget skips never fail --fail-on");
+        assert_eq!(out.rejected.len(), 2);
+        assert!(out.rejected.values().all(|e| e.contains("fallback budget")), "{:?}", out.rejected);
+    }
+
+    #[test]
+    fn quota_mid_batch_keeps_matched_chunks() {
+        use crate::api::{http, serve, FREE_BATCH};
+        let results = vec![r#"{"matches":[]}"#; FREE_BATCH].join(",");
+        let first = http(200, &format!(r#"{{"data":{{"results":[{results}]}}}}"#));
+        let quota = http(429, r#"{"message":"Daily quota reached.","upgrade":{"reason":"api-day"}}"#);
+        let (client, server) = serve(vec![first, quota]);
+        let assets: Vec<Asset> = (0..FREE_BATCH + 3).map(|i| asset_eco(Ecosystem::Deb, &format!("p{i:03}"), "1.0")).collect();
+        let out = run_scan(&client, &assets, &linux(LinuxDistro::Debian), false, 0).unwrap();
+        assert_eq!(server.join().unwrap().len(), 2);
+        assert!(out.quota.is_some());
+        assert_eq!(out.errors.len(), 3, "only the unsent chunk is unmatched");
+        assert!(out.errors.values().all(|e| e.contains("not matched (quota exhausted)")));
     }
 
     #[test]
