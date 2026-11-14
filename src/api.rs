@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use reqwest::blocking::Client;
@@ -26,6 +26,9 @@ const MAX_PAGES: u32 = 3;
 const USER_AGENT: &str = concat!("threat-finder/", env!("CARGO_PKG_VERSION"));
 
 const FREE_REQUESTS_PER_HOUR: u64 = 20;
+/// Free-plan batch size and daily request quota (utils/planLimits.js).
+pub const FREE_BATCH: usize = 50;
+pub const FREE_REQUESTS_PER_DAY: u64 = 30;
 
 /// Plan label from the hourly quota, which is unique per plan (utils/planLimits.js).
 fn plan_name(limit_hourly: u64) -> String {
@@ -48,6 +51,9 @@ pub struct RateLimitInfo {
     pub remaining_daily:   u64,
     pub limit_monthly:     u64,
     pub remaining_monthly: u64,
+    /// Window resets, in epoch seconds.
+    pub reset_hourly:      u64,
+    pub reset_daily:       u64,
 }
 
 fn parse_header(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
@@ -70,6 +76,8 @@ impl RateLimitInfo {
             ("X-RateLimit-Remaining-Daily", &mut self.remaining_daily),
             ("X-RateLimit-Limit-Monthly", &mut self.limit_monthly),
             ("X-RateLimit-Remaining-Monthly", &mut self.remaining_monthly),
+            ("X-RateLimit-Reset-Hourly", &mut self.reset_hourly),
+            ("X-RateLimit-Reset-Daily", &mut self.reset_daily),
         ] {
             if let Some(v) = parse_header(headers, name) {
                 *slot = v;
@@ -83,16 +91,24 @@ pub fn plan_info(info: &RateLimitInfo) -> Option<String> {
     if info.limit_hourly == 0 {
         return None;
     }
-    let row = |label: &str, left: u64, limit: u64| {
-        format!("{label:<9} {:>6} / {:>6} remaining\n", format_num(left), format_num(limit))
+    let row = |label: &str, left: u64, limit: u64, reset: u64| {
+        let reset = if reset > 0 { format!(", resets {} UTC", utc_hhmm(reset)) } else { String::new() };
+        format!("{label:<9} {:>6} / {:>6} remaining{reset}\n", format_num(left), format_num(limit))
     };
     let mut out = format!("Plan:     {}\n", plan_name(info.limit_hourly));
-    out += &row("Hourly:", info.remaining_hourly, info.limit_hourly);
+    out += &row("Hourly:", info.remaining_hourly, info.limit_hourly, info.reset_hourly);
     if info.limit_daily > 0 {
-        out += &row("Daily:", info.remaining_daily, info.limit_daily);
+        out += &row("Daily:", info.remaining_daily, info.limit_daily, info.reset_daily);
     }
-    out += &row("Monthly:", info.remaining_monthly, info.limit_monthly);
+    if info.limit_monthly > 0 {
+        out += &row("Monthly:", info.remaining_monthly, info.limit_monthly, 0);
+    }
     Some(out)
+}
+
+fn utc_hhmm(epoch: u64) -> String {
+    let day = epoch % 86_400;
+    format!("{:02}:{:02}", day / 3600, day % 3600 / 60)
 }
 
 fn format_num(n: u64) -> String {
@@ -107,13 +123,22 @@ fn format_num(n: u64) -> String {
     result.chars().rev().collect()
 }
 
+/// A spent quota: the server's message and its upgrade checkout link.
+#[derive(Debug, Clone)]
+pub struct QuotaExceeded {
+    pub message: String,
+    pub checkout: Option<String>,
+}
+
 #[derive(Debug)]
 pub enum ThreatError {
-    RateLimitExceeded(String),
+    RateLimitExceeded(QuotaExceeded),
     /// HTTP 413 Payload Too Large: the batch exceeded the tier cap. Carries the
     /// server-advertised `data.maxBatch`, when present, so the caller can resize
     /// and retry instead of aborting.
     BatchTooLarge(Option<usize>),
+    /// HTTP 413 from the server's body-size limit, not a plan cap.
+    PayloadTooLarge,
     /// HTTP 403 where the body indicates the account lacks API access (no active
     /// subscription / Pro Console). Distinct from a generic 403 so the caller can
     /// surface upgrade guidance and a quota exit code instead of a network-style
@@ -126,9 +151,10 @@ pub enum ThreatError {
 impl std::fmt::Display for ThreatError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ThreatError::RateLimitExceeded(msg) => write!(f, "Rate limit exceeded: {msg}"),
+            ThreatError::RateLimitExceeded(q)   => write!(f, "Rate limit exceeded: {}", q.message),
             ThreatError::BatchTooLarge(Some(n)) => write!(f, "Batch too large (max {n})"),
             ThreatError::BatchTooLarge(None)    => write!(f, "Batch too large"),
+            ThreatError::PayloadTooLarge        => write!(f, "Request body exceeds the server's size limit"),
             ThreatError::AccessDenied(msg)      => write!(f, "{msg}"),
             ThreatError::Http(e)                => write!(f, "HTTP error: {e}"),
             ThreatError::Other(msg)             => write!(f, "{msg}"),
@@ -350,10 +376,8 @@ impl ThreatEntry {
     }
 }
 
-/// Per-service asset metadata: where the version came from, and — uniquely — the
-/// network exposure of the running process (which listeners it holds and whether
-/// any is reachable off-host). This is what turns a flat CVE list into a
-/// prioritized attack-surface report.
+/// Per-asset metadata: where the version came from, and the network exposure of
+/// the running process (its listeners and whether any is reachable off-host).
 #[derive(Debug, Serialize)]
 pub struct AssetInfo {
     pub exe: String,
@@ -384,9 +408,8 @@ pub struct Meta {
 
 impl Default for Meta {
     fn default() -> Self {
-        // 3: `kev` means KEV-listed only (in-the-wild moved to `exploited`), plus
-        // exploitation/patch fields, `assets.*.upgradeTo` and `truncated`.
-        Meta { tool: "threat-finder", version: env!("CARGO_PKG_VERSION"), schema_version: 3 }
+        // 4: `truncated` is plan caps only; candidate caps moved to `incomplete`.
+        Meta { tool: "threat-finder", version: env!("CARGO_PKG_VERSION"), schema_version: 4 }
     }
 }
 
@@ -455,9 +478,13 @@ pub struct BatchResults {
     /// version), name -> reason. Unlike `errors`, these never fail --fail-on.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub rejected: BTreeMap<String, String>,
-    /// Assets whose matches the server capped; more findings exist than reported.
+    /// Assets whose matches the plan's per-query result cap cut short.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub truncated: Vec<String>,
+    /// Assets Radar could not fully evaluate (candidate cap, even on a retry).
+    /// Like `errors`, these fail --fail-on.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub incomplete: Vec<String>,
     /// Inventory-server registration outcome, present only when this run
     /// registered the host for monitoring (drift + new-since-last summary).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -492,6 +519,9 @@ impl BatchResults {
                     assets: Vec::new(),
                 });
                 g.kev |= t.kev;
+                if t.epss > g.epss {
+                    g.epss = t.epss;
+                }
                 if severity_rank(t.severity.as_deref()) > severity_rank(g.severity.as_deref()) {
                     g.severity = t.severity.clone();
                 }
@@ -544,15 +574,30 @@ pub struct BatchOutcome {
     pub rejected: BTreeMap<String, String>,
     /// Asset key -> Radar's `upgradeTo`.
     pub upgrades: BTreeMap<String, String>,
-    /// Asset keys whose matches the server capped (plan result cap or candidate cap).
+    /// Asset keys whose matches the plan's result cap cut short.
     pub truncated: Vec<String>,
+    /// Asset keys the server's candidate cap left unevaluated, even on a retry.
+    pub incomplete: Vec<String>,
+    /// Set when the quota ran out after the batch; the outcome is partial.
+    pub quota: Option<QuotaExceeded>,
+}
+
+/// Drop an unconfirmed finding when the same id is already confirmed for that asset.
+pub fn prune_unconfirmed(confirmed: &BTreeMap<String, Vec<ThreatEntry>>, unconfirmed: &mut BTreeMap<String, Vec<ThreatEntry>>) {
+    let id = |e: &ThreatEntry| e.cve_id.clone().or_else(|| e.id.clone());
+    for (key, entries) in unconfirmed.iter_mut() {
+        let Some(have) = confirmed.get(key) else { continue };
+        let have: HashSet<String> = have.iter().filter_map(id).collect();
+        entries.retain(|e| id(e).is_none_or(|i| !have.contains(&i)));
+    }
+    unconfirmed.retain(|_, v| !v.is_empty());
 }
 
 pub struct ThreatClient {
     client:         Client,
     base:           String,
     api_key:        String,
-    rate_limit:     Arc<Mutex<RateLimitInfo>>,
+    rate_limit:     Mutex<RateLimitInfo>,
 }
 
 impl ThreatClient {
@@ -560,7 +605,7 @@ impl ThreatClient {
         Self::with_base(api_key, BASE_URL)
     }
 
-    fn with_base(api_key: &str, base: &str) -> Self {
+    pub(crate) fn with_base(api_key: &str, base: &str) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(90))
             .connect_timeout(Duration::from_secs(8))
@@ -572,7 +617,7 @@ impl ThreatClient {
             client,
             base: base.to_string(),
             api_key: api_key.to_string(),
-            rate_limit: Arc::new(Mutex::new(RateLimitInfo::default())),
+            rate_limit: Mutex::new(RateLimitInfo::default()),
         }
     }
 
@@ -640,14 +685,20 @@ impl ThreatClient {
                         attempt += 1;
                         continue;
                     }
-                    _ => return Err(ThreatError::RateLimitExceeded(message)),
+                    _ => {
+                        let checkout = str_of(body.pointer("/upgrade/urls/checkout"));
+                        return Err(ThreatError::RateLimitExceeded(QuotaExceeded { message, checkout }));
+                    }
                 }
             }
 
             if status.as_u16() == 413 {
                 // Not retried: the caller resizes (match/batch) or reports the cap.
-                let cap = response.json::<Value>().ok().and_then(|b| advertised_cap(&b));
-                return Err(ThreatError::BatchTooLarge(cap));
+                let body = response.json::<Value>().unwrap_or(Value::Null);
+                if body.get("data").is_none() && body.get("error").and_then(Value::as_str) == Some("Payload too large") {
+                    return Err(ThreatError::PayloadTooLarge);
+                }
+                return Err(ThreatError::BatchTooLarge(advertised_cap(&body)));
             }
 
             // A handler 500 has already been counted against the quota; only
@@ -743,12 +794,16 @@ impl ThreatClient {
                     out.extend(parsed.data.results);
                     cursor = end;
                 }
-                Err(ThreatError::BatchTooLarge(max_batch)) => {
+                Err(e @ (ThreatError::BatchTooLarge(_) | ThreatError::PayloadTooLarge)) => {
                     // A single item can't be split further; a 413 on it is a hard
                     // error rather than something we can retry-shrink out of.
                     if chunk.len() <= 1 {
-                        return Err(ThreatError::BatchTooLarge(max_batch));
+                        return Err(e);
                     }
+                    let max_batch = match e {
+                        ThreatError::BatchTooLarge(n) => n,
+                        _ => None,
+                    };
                     // Server rejected this chunk as too large. Shrink the working
                     // cap to the advertised max (or halve it) and retry the SAME
                     // slice — do not advance the cursor or abort the run. Always
@@ -975,6 +1030,9 @@ pub struct RegisterSummary {
     pub by_severity: BTreeMap<String, u64>,
     #[serde(rename = "byDecision", default, skip_serializing_if = "BTreeMap::is_empty")]
     pub by_decision: BTreeMap<String, u64>,
+    /// The server's candidate cap cut this host's findings short.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 /// A finding in the registration's `newSinceLast`, as far as the CLI prints it.
@@ -1041,6 +1099,9 @@ pub struct RegisterResponse {
     pub host_id: String,
     #[serde(default)]
     pub monitoring: bool,
+    /// Whether the plan alerts on monitored hosts.
+    #[serde(rename = "monitoringAvailable", default)]
+    pub monitoring_available: Option<bool>,
     #[serde(default)]
     pub new: bool,
     #[serde(rename = "assetCount", default)]
@@ -1067,7 +1128,7 @@ fn tier_batch_cap(limit_hourly: u64) -> usize {
         1500 => 4000,          // enterprise
         375 => 1000,           // pro
         25 | 45 | 75 => 200,   // individual / lifetime / base
-        _ => 50,               // free / unknown
+        _ => FREE_BATCH,       // free / unknown
     }
 }
 
@@ -1157,9 +1218,24 @@ pub struct MatchResult {
     /// The candidate or per-plan result cap cut `matches` short.
     #[serde(default)]
     pub truncated: bool,
+    #[serde(rename = "totalMatches", default)]
+    pub total_matches: Option<usize>,
+    /// The server's candidate cap, rather than the plan's result cap, cut it short.
+    #[serde(rename = "candidatesTruncated", default)]
+    pub candidates_truncated: Option<bool>,
     /// The query was rejected or could not be evaluated.
     #[serde(default)]
     pub error: Option<String>,
+}
+
+impl MatchResult {
+    /// Not every candidate was evaluated. Without `candidatesTruncated`, a plan
+    /// cap is the only cap that leaves `totalMatches` above what was returned.
+    pub fn candidate_capped(&self) -> bool {
+        self.candidates_truncated.unwrap_or_else(|| {
+            self.truncated && self.total_matches.is_some_and(|t| t <= self.matches.len())
+        })
+    }
 }
 
 /// Tolerant EPSS model: the server sends `epss` as an object `{score, percentile}`
@@ -1171,8 +1247,6 @@ enum EpssField {
     Object {
         #[serde(default)]
         score: Option<f64>,
-        #[serde(default)]
-        percentile: Option<f64>,
     },
     Score(f64),
     Null,
@@ -1181,15 +1255,9 @@ enum EpssField {
 impl EpssField {
     fn score(&self) -> Option<f64> {
         match self {
-            EpssField::Object { score, .. } => *score,
+            EpssField::Object { score } => *score,
             EpssField::Score(s) => Some(*s),
             EpssField::Null => None,
-        }
-    }
-    fn percentile(&self) -> Option<f64> {
-        match self {
-            EpssField::Object { percentile, .. } => *percentile,
-            _ => None,
         }
     }
 }
@@ -1232,16 +1300,12 @@ impl MatchHit {
     pub fn epss(&self) -> Option<f64> {
         self.epss.as_ref().and_then(EpssField::score)
     }
-    /// EPSS percentile, present only in the object shape.
-    pub fn epss_percentile(&self) -> Option<f64> {
-        self.epss.as_ref().and_then(EpssField::percentile)
-    }
 }
 
 // ── Scan API (SBOM / lockfile) ───────────────────────────────────────────────
 
-/// The server's `express.json` body limit (10 MB).
-pub const MAX_SCAN_BODY: usize = 10 * 1024 * 1024;
+/// The server's `express.json` body limit for `/api/v1/scan` (16 MiB).
+pub const MAX_SCAN_BODY: usize = 16 * 1024 * 1024;
 /// `MAX_LINE` in server/utils/sbom: longer lines are rejected unless the file is JSON.
 pub const MAX_SCAN_LINE: usize = 4096;
 
@@ -1286,6 +1350,8 @@ pub struct ScanReport {
     remediation: Vec<ScanRemediation>,
     #[serde(rename = "notChecked", default)]
     not_checked: Vec<NotChecked>,
+    #[serde(default)]
+    truncated: Vec<NotChecked>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1338,7 +1404,7 @@ impl ScanFinding {
             kev_overdue: self.kev && kev_due_date.as_deref().is_some_and(is_past),
             kev_due_date,
             ransomware: self.ransomware,
-            exploited: self.exploited,
+            exploited: self.exploited || self.kev,
             exploit_maturity: self.exploit_maturity,
             confirmed: self.confirmed,
             matched_range: self.matched_range,
@@ -1362,28 +1428,39 @@ impl ScanReport {
     pub fn into_results(self, source: &str, severity_floor: u8) -> BatchResults {
         let mut services: BTreeMap<String, Vec<ThreatEntry>> = BTreeMap::new();
         let mut unconfirmed: BTreeMap<String, Vec<ThreatEntry>> = BTreeMap::new();
+        let asset = |purl: &str, version: Option<String>, upgrade_to: Option<String>| AssetInfo {
+            exe: source.to_string(),
+            version: version.unwrap_or_else(|| purl_version(purl).to_string()),
+            version_source: self.format.clone(),
+            exposed: false,
+            reachability: "none".to_string(),
+            listeners: Vec::new(),
+            upgrade_to,
+            restart_pending: false,
+        };
+        let mut assets: BTreeMap<String, AssetInfo> = self.remediation.into_iter()
+            .map(|r| (r.purl.clone(), asset(&r.purl, r.version, r.upgrade_to)))
+            .collect();
         for f in self.findings {
+            if !assets.contains_key(&f.purl) {
+                assets.insert(f.purl.clone(), asset(&f.purl, None, None));
+            }
             let key = f.purl.clone();
             let e = f.into_entry();
-            // KEV is never dropped by the severity floor, as in scan::run_scan.
-            if !e.kev && severity_rank(e.severity.as_deref()) < severity_floor {
+            // Exploited findings are never dropped by the severity floor, as in scan::run_scan.
+            if !e.exploited && severity_rank(e.severity.as_deref()) < severity_floor {
                 continue;
             }
             let bucket = if e.confirmed { &mut services } else { &mut unconfirmed };
             bucket.entry(key).or_default().push(e);
         }
-        let assets = self.remediation.into_iter()
-            .map(|r| (r.purl, AssetInfo {
-                exe: source.to_string(),
-                version: r.version.unwrap_or_default(),
-                version_source: self.format.clone(),
-                exposed: false,
-                reachability: "none".to_string(),
-                listeners: Vec::new(),
-                upgrade_to: r.upgrade_to,
-                restart_pending: false,
-            }))
-            .collect();
+        prune_unconfirmed(&services, &mut unconfirmed);
+
+        let (incomplete, truncated): (Vec<NotChecked>, Vec<NotChecked>) =
+            self.truncated.into_iter().partition(|t| t.reason == "candidate-cap");
+        let mut incomplete: Vec<String> = incomplete.into_iter().map(|t| t.purl).collect();
+        incomplete.sort();
+        incomplete.dedup();
         BatchResults {
             meta: Meta::default(),
             services,
@@ -1392,10 +1469,16 @@ impl ScanReport {
             assets,
             errors: BTreeMap::new(),
             rejected: self.not_checked.into_iter().map(|n| (n.purl, n.reason)).collect(),
-            truncated: Vec::new(),
+            truncated: truncated.into_iter().map(|t| t.purl).collect(),
+            incomplete,
             registration: None,
         }
     }
+}
+
+/// The version of `pkg:type/name@version?qualifiers#subpath`.
+fn purl_version(purl: &str) -> &str {
+    purl.rsplit_once('@').map_or("", |(_, v)| v.split(['?', '#']).next().unwrap_or(v))
 }
 
 fn truthy(v: Option<&Value>) -> bool {
@@ -1562,6 +1645,44 @@ fn clean_date(value: Option<&Value>) -> String {
     }
 }
 
+/// Loopback HTTP server answering one request per canned response, in order;
+/// the handle yields the raw requests.
+#[cfg(test)]
+pub(crate) fn serve(responses: Vec<String>) -> (ThreatClient, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = ThreatClient::with_base("k", &format!("http://{}", listener.local_addr().unwrap()));
+    let handle = std::thread::spawn(move || {
+        responses.into_iter().map(|response| {
+            let (mut sock, _) = listener.accept().unwrap();
+            let (mut req, mut buf) = (Vec::new(), [0u8; 4096]);
+            let complete = |req: &[u8]| {
+                let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n") else { return false };
+                let head = String::from_utf8_lossy(&req[..end]).to_ascii_lowercase();
+                let len = head.lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                req.len() >= end + 4 + len
+            };
+            while !complete(&req) {
+                let n = sock.read(&mut buf).unwrap();
+                if n == 0 { break; }
+                req.extend_from_slice(&buf[..n]);
+            }
+            sock.write_all(response.as_bytes()).unwrap();
+            String::from_utf8_lossy(&req).into_owned()
+        }).collect()
+    });
+    (client, handle)
+}
+
+/// A JSON response with this status and body.
+#[cfg(test)]
+pub(crate) fn http(status: u16, body: &str) -> String {
+    format!("HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1641,8 +1762,7 @@ mod tests {
         assert!(e.exploited && !e.kev, "in-the-wild is exploited, not KEV");
     }
 
-    /// A realistic server hit where `epss` and `kev` are OBJECTS (the common live
-    /// shape). Before the fix this failed the WHOLE-chunk decode.
+    /// A realistic server hit where `epss` and `kev` are objects (the live shape).
     fn realistic_hit() -> Value {
         json!({
             "id": "abc", "cveId": "CVE-2024-1", "title": "t", "slug": "cve-2024-1",
@@ -1670,7 +1790,6 @@ mod tests {
         let hit = resp.data.results.into_iter().next().unwrap()
             .matches.into_iter().next().unwrap();
         assert_eq!(hit.epss(), Some(0.42));
-        assert_eq!(hit.epss_percentile(), Some(0.97));
         assert!(hit.kev.is_some(), "object kev present");
         assert!(hit.confirmed);
         assert_eq!(hit.match_basis.as_deref(), Some("coordinate"));
@@ -1694,7 +1813,6 @@ mod tests {
         });
         let hit: MatchHit = serde_json::from_value(raw).unwrap();
         assert_eq!(hit.epss(), None);
-        assert_eq!(hit.epss_percentile(), None);
         assert!(hit.kev.is_none(), "null kev => not listed");
         let e = match_to_entry(hit);
         assert_eq!(e.epss, None);
@@ -1716,7 +1834,6 @@ mod tests {
         let raw = json!({ "cveId": "CVE-2024-4", "epss": 0.5, "kev": true });
         let hit: MatchHit = serde_json::from_value(raw).unwrap();
         assert_eq!(hit.epss(), Some(0.5));
-        assert_eq!(hit.epss_percentile(), None);
         assert!(match_to_entry(hit).kev, "bool kev => as-is");
     }
 
@@ -2109,13 +2226,14 @@ mod tests {
     }
 
     #[test]
-    fn scan_severity_floor_keeps_kev() {
+    fn scan_severity_floor_keeps_exploited() {
         let report: ScanReport = serde_json::from_value(json!({ "findings": [
             { "purl": "pkg:npm/a@1", "severity": "low", "kev": true, "confirmed": true },
             { "purl": "pkg:npm/b@1", "severity": "low", "kev": false, "confirmed": true },
+            { "purl": "pkg:npm/c@1", "severity": "low", "exploited": true, "confirmed": true },
         ] })).unwrap();
         let r = report.into_results("f", severity_rank(Some("high")));
-        assert_eq!(r.services.keys().collect::<Vec<_>>(), ["pkg:npm/a@1"]);
+        assert_eq!(r.services.keys().collect::<Vec<_>>(), ["pkg:npm/a@1", "pkg:npm/c@1"]);
     }
 
     #[test]
@@ -2171,7 +2289,7 @@ mod tests {
                 ("openssl@3.0.2".to_string(), vec![entry("CVE-2024-1")]),
             ]),
             by_cve: BTreeMap::new(), assets: BTreeMap::new(), unconfirmed: BTreeMap::new(),
-            errors: BTreeMap::new(), rejected: BTreeMap::new(), truncated: vec![], registration: None,
+            errors: BTreeMap::new(), rejected: BTreeMap::new(), truncated: vec![], incomplete: vec![], registration: None,
         };
         let coords = BTreeMap::from([
             ("nginx@1.24.0".to_string(), "pkg:deb/ubuntu/nginx@1.24.0".to_string()),
@@ -2207,34 +2325,15 @@ mod tests {
         assert_eq!(f.radar_url.as_deref(), Some("https://radar.offseq.com/threat/x"));
     }
 
-    /// Serve one canned HTTP response on loopback; the handle yields the raw request.
-    fn serve_once(response: String) -> (ThreatClient, std::thread::JoinHandle<String>) {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let client = ThreatClient::with_base("k", &format!("http://{}", listener.local_addr().unwrap()));
-        let handle = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
-            let (mut req, mut buf) = (Vec::new(), [0u8; 4096]);
-            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
-                let n = sock.read(&mut buf).unwrap();
-                if n == 0 { break; }
-                req.extend_from_slice(&buf[..n]);
-            }
-            sock.write_all(response.as_bytes()).unwrap();
-            String::from_utf8_lossy(&req).into_owned()
-        });
-        (client, handle)
-    }
-
     #[test]
     fn host_vex_returns_the_raw_document() {
-        let (client, server) = serve_once(
+        let (client, server) = serve(vec![
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 27\r\n\
              X-RateLimit-Limit-Hourly: 375\r\nConnection: close\r\n\r\n{\n  \"@context\": \"openvex\"\n}".to_string(),
-        );
+        ]);
         let doc = client.host_vex("h-1", "cyclonedx").unwrap();
         assert_eq!(doc, b"{\n  \"@context\": \"openvex\"\n}");
-        let req = server.join().unwrap();
+        let req = server.join().unwrap().remove(0);
         assert!(req.starts_with("GET /inventory/h-1/vex?format=cyclonedx "), "{req}");
         assert!(req.to_ascii_lowercase().contains("accept: */*"), "{req}");
         assert_eq!(client.last_rate_limit().limit_hourly, 375);
@@ -2243,10 +2342,7 @@ mod tests {
     #[test]
     fn host_vex_on_free_plan_is_access_denied() {
         let body = r#"{"success":false,"error":"pro_access_required","message":"The decision ledger needs a paid plan (Individual and up)."}"#;
-        let (client, server) = serve_once(format!(
-            "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        ));
+        let (client, server) = serve(vec![http(403, body)]);
         match client.host_vex("h-1", "openvex") {
             Err(ThreatError::AccessDenied(msg)) => assert!(msg.contains("paid plan"), "{msg}"),
             other => panic!("expected AccessDenied, got {other:?}"),
@@ -2266,5 +2362,110 @@ mod tests {
         assert_eq!(e.fixed_versions, vec!["1.0.1g".to_string()]);
         assert_eq!(e.cwes, vec!["CWE-125".to_string()]);
         assert_eq!(e.remediation.as_deref(), Some("Upgrade OpenSSL."));
+    }
+
+    #[test]
+    fn candidate_cap_is_told_apart_from_plan_cap() {
+        let r = |v: Value| serde_json::from_value::<MatchResult>(v).unwrap();
+        let hit = json!({ "cveId": "CVE-1" });
+        assert!(r(json!({ "truncated": true, "candidatesTruncated": true, "totalMatches": 40, "matches": [hit] })).candidate_capped());
+        assert!(!r(json!({ "truncated": true, "candidatesTruncated": false, "totalMatches": 1, "matches": [hit] })).candidate_capped());
+        assert!(r(json!({ "truncated": true, "totalMatches": 1, "matches": [hit] })).candidate_capped());
+        assert!(!r(json!({ "truncated": true, "totalMatches": 40, "matches": [hit] })).candidate_capped());
+        assert!(!r(json!({ "truncated": false, "totalMatches": 0, "matches": [] })).candidate_capped());
+    }
+
+    #[test]
+    fn body_size_413_is_not_a_plan_cap_and_still_halves() {
+        let too_large = http(413, r#"{"success":false,"error":"Payload too large","message":"Request body exceeds the maximum allowed size."}"#);
+        let one = http(200, r#"{"data":{"results":[{"matches":[]}]}}"#);
+        let (client, server) = serve(vec![too_large.clone(), one.clone(), one]);
+        let q = [MatchQuery::purl("pkg:npm/a@1"), MatchQuery::purl("pkg:npm/b@1")];
+        assert_eq!(client.match_batch(&q, false).unwrap().len(), 2);
+        assert_eq!(server.join().unwrap().len(), 3);
+
+        let (client, server) = serve(vec![too_large]);
+        assert!(matches!(client.scan(b"{}".to_vec()), Err(ThreatError::PayloadTooLarge)));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn quota_429_carries_the_checkout_link() {
+        let body = r#"{"message":"Daily quota reached.","upgrade":{"reason":"api-day","urls":{"checkout":"https://radar.offseq.com/checkout?plan=base&interval=month"}}}"#;
+        let (client, server) = serve(vec![http(429, body)]);
+        match client.search_threats("x") {
+            Err(ThreatError::RateLimitExceeded(q)) => {
+                assert_eq!(q.message, "Daily quota reached.");
+                assert_eq!(q.checkout.as_deref(), Some("https://radar.offseq.com/checkout?plan=base&interval=month"));
+            }
+            other => panic!("expected RateLimitExceeded, got {other:?}"),
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn plan_info_shows_resets_and_skips_unknown_windows() {
+        let info = RateLimitInfo {
+            limit_hourly: 75, remaining_hourly: 70, reset_hourly: 1_700_003_600, ..Default::default()
+        };
+        let out = plan_info(&info).unwrap();
+        assert!(out.contains("Hourly:       70 /     75 remaining, resets 23:13 UTC"), "{out}");
+        assert!(!out.contains("Daily") && !out.contains("Monthly"), "{out}");
+    }
+
+    #[test]
+    fn scan_report_locates_every_finding_and_reads_caps() {
+        let report: ScanReport = serde_json::from_value(json!({
+            "format": "cyclonedx-json",
+            "findings": [
+                { "purl": "pkg:npm/a@1.2.3?x=y", "cveId": "CVE-1", "severity": "high", "confirmed": true },
+                { "purl": "pkg:npm/a@1.2.3?x=y", "cveId": "CVE-1", "severity": "high", "confirmed": false },
+                { "purl": "pkg:npm/a@1.2.3?x=y", "cveId": "CVE-2", "severity": "high", "confirmed": false }
+            ],
+            "truncated": [
+                { "purl": "pkg:npm/b@1", "reason": "candidate-cap" },
+                { "purl": "pkg:npm/c@1", "reason": "plan-cap" }
+            ],
+            "gate": { "failOn": "high", "tripped": true, "incomplete": true }
+        })).unwrap();
+        let r = report.into_results("bom.json", 0);
+        assert_eq!(r.assets["pkg:npm/a@1.2.3?x=y"].version, "1.2.3");
+        assert_eq!(r.assets["pkg:npm/a@1.2.3?x=y"].exe, "bom.json");
+        let ids: Vec<_> = r.unconfirmed["pkg:npm/a@1.2.3?x=y"].iter().map(|e| e.cve_id.as_deref()).collect();
+        assert_eq!(ids, [Some("CVE-2")], "confirmed CVE-1 drops its unconfirmed copy");
+        assert_eq!(r.truncated, ["pkg:npm/c@1"]);
+        assert_eq!(r.incomplete, ["pkg:npm/b@1"]);
+
+        let bare: ScanReport = serde_json::from_value(json!({ "findings": [] })).unwrap();
+        let r = bare.into_results("f", 0);
+        assert!(r.truncated.is_empty() && r.incomplete.is_empty());
+    }
+
+    #[test]
+    fn register_response_reads_monitoring_available_and_truncation() {
+        let r: RegisterResponse = serde_json::from_value(json!({
+            "monitoringAvailable": false, "summary": { "total": 1, "truncated": true }
+        })).unwrap();
+        assert_eq!(r.monitoring_available, Some(false));
+        assert!(r.summary.truncated);
+        let r: RegisterResponse = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(r.monitoring_available, None);
+    }
+
+    #[test]
+    fn cve_groups_take_the_highest_epss() {
+        let e = |epss: Option<f64>| ThreatEntry { cve_id: Some("CVE-1".into()), epss, confirmed: true, ..Default::default() };
+        let mut r = BatchResults {
+            meta: Meta::default(),
+            services: BTreeMap::from([
+                ("a@1".to_string(), vec![e(None)]),
+                ("b@1".to_string(), vec![e(Some(0.7))]),
+                ("c@1".to_string(), vec![e(Some(0.2))]),
+            ]),
+            by_cve: BTreeMap::new(), assets: BTreeMap::new(), unconfirmed: BTreeMap::new(),
+            errors: BTreeMap::new(), rejected: BTreeMap::new(), truncated: vec![], incomplete: vec![], registration: None,
+        };
+        r.compute_cve_groups();
+        assert_eq!(r.by_cve["CVE-1"].epss, Some(0.7));
     }
 }

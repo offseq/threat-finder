@@ -454,7 +454,6 @@ pub fn parse_linux_distro_version(distro: &LinuxDistro) -> (String, String) {
     (name.to_string(), os_release_field("VERSION_ID").unwrap_or_default())
 }
 
-
 pub const SYSTEMD_ONE_SHOTS: &[&str] = &[
     "systemd-journal-flush", "systemd-tmpfiles-setup",
     "systemd-tmpfiles-setup-dev", "systemd-tmpfiles-setup-dev-early",
@@ -507,16 +506,9 @@ pub fn resolve_binary(name: &str) -> Option<String> {
     None
 }
 
-// "name-1.2.3-r0" / "nginx-1.26.2nb1" -> "1.2.3" / "1.26.2"
-pub static ATOM_VER_RE: Lazy<Regex> =
+static ATOM_VER_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"-(\d[0-9A-Za-z.+~]*)").unwrap());
 
-pub fn atom_version(atom: &str) -> Option<String> {
-    ATOM_VER_RE.captures(atom.trim()).map(|c| c[1].to_string())
-}
-
-/// Ask the OS package database for the version that owns `exe`. Returns None when
-/// no package owns it (e.g. a base-system binary) so the caller can fall back.
 /// Resolve the owning package's (name, full-version) for a binary, querying the
 /// OS package database. The package NAME is the real coordinate (e.g. a unit
 /// "ssh" resolves to "openssh-server"), so the purl is built from the true
@@ -638,10 +630,6 @@ pub fn apk_of(path: &str) -> Option<(String, String)> {
     atom_split(out.split("owned by ").nth(1)?.trim())
 }
 
-pub fn homebrew_version(path: &str) -> Option<String> {
-    homebrew_of(path).map(|(_, v)| v)
-}
-
 pub fn homebrew_of(path: &str) -> Option<(String, String)> {
     // canonicalized brew binaries live at .../Cellar/<name>/<version>/...
     let idx = path.find("/Cellar/")?;
@@ -658,15 +646,23 @@ pub fn freebsd_of(path: &str) -> Option<(String, String)> {
 }
 
 pub fn pkg_info_of(path: &str, file_flag: bool) -> Option<(String, String)> {
-    // OpenBSD: pkg_info -E <path> -> "nginx-1.26.2: /usr/local/sbin/nginx"
-    // NetBSD : pkg_info -Fe <path> -> "nginx-1.26.2nb1"
-    let out = if file_flag {
-        run_cmd("pkg_info", &["-Fe", path])?
+    if file_flag {
+        // NetBSD: pkg_info -Fe <path> -> "nginx-1.26.2nb1"
+        atom_split(run_cmd("pkg_info", &["-Fe", path])?.split_whitespace().next()?)
     } else {
-        run_cmd("pkg_info", &["-E", path])?
-    };
-    let atom = out.split(':').next().unwrap_or(&out).split_whitespace().next()?;
-    atom_split(atom)
+        atom_split(openbsd_owner(&run_cmd("pkg_info", &["-E", path])?)?)
+    }
+}
+
+/// The owning package from OpenBSD `pkg_info -E <path>`, which prints
+/// "<path>: <pkg>[,<pkg>…]" followed by the package's description.
+pub fn openbsd_owner(out: &str) -> Option<&str> {
+    out.lines()
+        .filter(|l| l.starts_with('/'))
+        .find_map(|l| l.rsplit_once(": "))
+        .and_then(|(_, pkgs)| pkgs.split(',').next())
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
 }
 
 /// Resolve (owning-package-name, version, source) for a binary: package DB
@@ -704,14 +700,21 @@ fn exe_replaced(pid: u32) -> bool {
 /// Build a ServiceInfo from a service name by resolving its binary and version.
 pub fn service_from_name(display_name: &str, os: &OsType) -> Option<ServiceInfo> {
     let exe = resolve_binary(display_name)?;
-    make_service(display_name, &exe, None, os)
+    make_service(display_name, &exe, running_pid(&exe), os)
+}
+
+/// The oldest process running `exe`: by process name, then by command line.
+fn running_pid(exe: &str) -> Option<u32> {
+    run_cmd("pgrep", &["-x", &binary_basename(exe)])
+        .and_then(|o| first_pid(&o))
+        .or_else(|| run_cmd("pgrep", &["-f", exe]).and_then(|o| first_pid(&o)))
+}
+
+pub fn first_pid(out: &str) -> Option<u32> {
+    out.split_whitespace().find_map(|t| t.parse().ok())
 }
 
 // Network-exposure correlation
-//
-// Mapping each running service to the sockets it is LISTENING on — and whether
-// any is reachable off-host — is the tool's signature capability: manifest
-// scanners can't see runtime state, and external scanners need a second host.
 
 pub fn listening_endpoints(pid: u32) -> Vec<String> {
     let mut eps = if cfg!(target_os = "linux") {
@@ -758,10 +761,7 @@ pub fn parse_port_range(s: &str) -> Option<RangeInclusive<u16>> {
     (lo <= hi).then_some(lo..=hi)
 }
 
-/// Listening endpoints via `lsof` (macOS/BSD/Solaris). Uses field output (`-Fn`)
-/// so the address is a clean `n`-prefixed line — the human format suffixes each
-/// row with "(LISTEN)", which the old `.last()` parser picked up instead of the
-/// address, leaving exposure silently dead on every non-Linux platform.
+/// Listening endpoints via `lsof -Fn` field output (macOS/BSD/Solaris).
 pub fn lsof_listeners(pid: u32) -> Vec<String> {
     let mut out = Vec::new();
     for ep in lsof_names(pid, &["-iTCP", "-sTCP:LISTEN"]) {
@@ -812,10 +812,6 @@ pub fn linux_listeners(pid: u32) -> Vec<String> {
         return Vec::new();
     }
     let mut out = Vec::new();
-
-    // Stream each /proc/net table line-by-line (BufReader) rather than slurping
-    // the whole file — peak memory is one line, not the full table, which can be
-    // large on hosts with many connections.
 
     // TCP: state 0A = LISTEN.
     for (path, v6) in [("/proc/net/tcp", false), ("/proc/net/tcp6", true)] {
@@ -1054,8 +1050,6 @@ fn kill_tree(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-// Extract a clean version token from raw `--version` output.
-
 pub fn extract_version(text: &str) -> Option<String> {
     const BAD: &[&str] = &[
         "invalid", "unknown option", "usage:", "error:",
@@ -1103,7 +1097,8 @@ pub const TIMEOUT: Duration = Duration::from_secs(2);
 pub fn probe_version(exe: &str) -> Option<String> {
     let bin_name = exe.rsplit('/').next().unwrap_or(exe);
 
-    for flag in &["--version", "-V", "-v", "version"] {
+    // `-v` and a bare `version` start some daemons instead of printing a version.
+    for flag in &["--version", "-V"] {
         let Some((success, stdout, stderr)) = run_timed(exe, flag, TIMEOUT) else { continue };
 
         let candidate = if success {
@@ -1184,9 +1179,6 @@ pub fn macos_relevant_path(exe: &str) -> bool {
 
 pub fn scan_launchctl(os: &OsType) -> Vec<ServiceInfo> {
     // `launchctl list` columns: PID  Status  Label. A numeric PID means running.
-    // Resolve the running process's absolute binary via `ps -o comm=` (the old
-    // code fed the reverse-DNS Label straight into Command::new, which never
-    // resolved a binary, so the macOS list was always empty).
     let output = run_cmd("launchctl", &["list"]).unwrap_or_default();
 
     parse_launchctl_running(&output)
@@ -1247,9 +1239,7 @@ pub fn friendly_label(label: &str) -> Option<String> {
 }
 
 pub fn scan_bsd_rc(os: &OsType) -> Vec<ServiceInfo> {
-    // `service -e` prints absolute rc.d script PATHS; the old code intersected
-    // those against the bare names from `service -l`, yielding the empty set.
-    // Take the basename of each enabled script instead.
+    // `service -e` prints the enabled rc.d scripts' paths.
     let enabled: Vec<String> = run_cmd("service", &["-e"])
         .unwrap_or_default()
         .lines()
@@ -1271,8 +1261,6 @@ pub fn scan_bsd_rc(os: &OsType) -> Vec<ServiceInfo> {
 }
 
 pub fn scan_openbsd(os: &OsType) -> Vec<ServiceInfo> {
-    // `rcctl ls started` = currently running (the old `rcctl ls on` listed
-    // merely *enabled* services, including stopped ones).
     let names: Vec<String> = run_cmd("rcctl", &["ls", "started"])
         .unwrap_or_default()
         .lines().map(|l| l.trim().to_string())
@@ -1319,8 +1307,23 @@ pub fn parse_svcs_online(output: &str) -> Vec<String> {
         .collect()
 }
 
+/// (pid, command) of each process `svcs -H -p <fmri>` lists under the service
+/// line ("STIME PID CMD").
+pub fn parse_svcs_procs(output: &str) -> Vec<(u32, String)> {
+    output.lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let _stime = it.next()?;
+            let pid = it.next()?.parse().ok()?;
+            Some((pid, it.next()?.to_string()))
+        })
+        .collect()
+}
+
+/// SMF method scripts are shell scripts that start the daemon, never the daemon.
+const SMF_METHOD_DIR: &str = "/lib/svc/method/";
+
 pub fn scan_smf(os: &OsType) -> Vec<ServiceInfo> {
-    // svcs -H -o state,fmri  (machine-readable, no header)
     let output = run_cmd("svcs", &["-H", "-o", "state,fmri"]).unwrap_or_default();
     if output.is_empty() {
         eprintln!("[!] `svcs` returned nothing; SMF may be unavailable");
@@ -1329,21 +1332,20 @@ pub fn scan_smf(os: &OsType) -> Vec<ServiceInfo> {
     parse_svcs_online(&output)
         .into_par_iter()
         .filter_map(|fmri| {
-            // svcprop start/exec gives the start method command line.
-            let exec = run_cmd("svcprop", &["-p", "start/exec", &fmri])
-                .or_else(|| run_cmd("svcprop", &["-p", "method/exec", &fmri]))?;
-            // First absolute-path token is the binary.
-            let exe = exec.split_whitespace()
-                .find(|t| t.starts_with('/'))
-                .map(|s| s.to_string())
-                .or_else(|| resolve_binary(exec.split_whitespace().next().unwrap_or("")))?;
+            let procs = run_cmd("svcs", &["-H", "-p", &fmri])?;
+            let (pid, exe) = parse_svcs_procs(&procs).into_iter().find_map(|(pid, cmd)| {
+                let exe = fs::read_link(format!("/proc/{pid}/path/a.out")).ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .or_else(|| resolve_binary(&cmd))?;
+                (!exe.starts_with(SMF_METHOD_DIR)).then_some((pid, exe))
+            })?;
 
             let display = fmri.trim_start_matches("svc:/")
                 .split(':').next().unwrap_or(&fmri)
                 .rsplit('/').next().unwrap_or(&fmri)
                 .to_string();
 
-            make_service(&display, &exe, None, os)
+            make_service(&display, &exe, Some(pid), os)
         })
         .collect()
 }
@@ -1436,19 +1438,25 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn atom_version_extraction() {
-        assert_eq!(atom_version("nginx-1.26.2-r0").as_deref(), Some("1.26.2"));
-        assert_eq!(atom_version("nginx-1.26.2nb1").as_deref(), Some("1.26.2nb1"));
-        assert_eq!(atom_version("openssl-3.0.7").as_deref(), Some("3.0.7"));
-        assert_eq!(atom_version("no-version-here"), None);
+    fn homebrew_version_from_cellar_path() {
+        let p = "/opt/homebrew/Cellar/nginx/1.27.0/bin/nginx";
+        assert_eq!(homebrew_of(p), Some(("nginx".into(), "1.27.0".into())));
+        assert_eq!(homebrew_formula(p), None); // needs a real canonicalize
+        assert_eq!(homebrew_of("/usr/sbin/sshd"), None);
     }
 
     #[test]
-    fn homebrew_version_from_cellar_path() {
-        let p = "/opt/homebrew/Cellar/nginx/1.27.0/bin/nginx";
-        assert_eq!(homebrew_version(p).as_deref(), Some("1.27.0"));
-        assert_eq!(homebrew_formula(p), None); // needs a real canonicalize
-        assert_eq!(homebrew_version("/usr/sbin/sshd"), None);
+    fn openbsd_pkg_info_e_owner() {
+        let out = "/usr/local/sbin/nginx: nginx-1.26.2p0\nInformation for inst:nginx-1.26.2p0\n\nComment:\nrobust and small HTTP server\n";
+        assert_eq!(openbsd_owner(out), Some("nginx-1.26.2p0"));
+        assert_eq!(openbsd_owner("/usr/local/lib/libx.so.1.0: a-1.0,b-2.0\n"), Some("a-1.0"));
+        assert_eq!(openbsd_owner(""), None);
+    }
+
+    #[test]
+    fn first_pid_from_pgrep() {
+        assert_eq!(first_pid("812\n913\n"), Some(812));
+        assert_eq!(first_pid(""), None);
     }
 
     #[test]
@@ -1601,6 +1609,15 @@ mod tests {
             "svc:/system/system-log:default".to_string(),
         ]);
     }
+
+    #[test]
+    fn parse_svcs_procs_fixture() {
+        let out = "online         Aug_01   svc:/network/http:apache24\n\
+                   \x20              Aug_01       1021 httpd\n\
+                   \x20              10:23:45     1044 httpd\n";
+        assert_eq!(parse_svcs_procs(out), vec![(1021, "httpd".to_string()), (1044, "httpd".to_string())]);
+        assert!(parse_svcs_procs("online  Aug_01  svc:/network/ssh:default\n").is_empty());
+    }
 }
 
 // ── Phase 1: full installed-package inventory ────────────────────────────────
@@ -1608,13 +1625,6 @@ mod tests {
 // Enumerate EVERY installed package (not just those backing a running process)
 // so the scanner can match the full Radar catalog. Each list_* shells out once
 // and parses with a pure helper (fixture-tested below).
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstalledPkg {
-    pub name: String,
-    pub version: String,
-    pub tool: &'static str,
-}
 
 /// Split a package atom like "nginx-1.26.2-r0" / "openssl-3.0.7" into
 /// (name, upstream-version). Names may contain hyphens, so anchor on the first
@@ -1635,7 +1645,7 @@ pub fn parse_dpkg_list(out: &str) -> Vec<(String, String)> {
     out.lines().filter_map(|l| {
         let mut c = l.split('\t');
         let status = c.next()?;
-        let name = c.next()?;
+        let name = strip_dpkg_arch(c.next()?);
         let ver = c.next()?;
         // 2nd status char 'i' = installed/held; drops 'rc' config-only etc.
         if status.chars().nth(1) != Some('i') || name.is_empty() || ver.is_empty() {
@@ -1703,38 +1713,28 @@ pub fn parse_pkg_info_list(out: &str) -> Vec<(String, String)> {
     out.lines().filter_map(|l| atom_split(l.split_whitespace().next()?)).collect()
 }
 
-fn tagged(tool: &'static str, pairs: Vec<(String, String)>) -> Vec<InstalledPkg> {
-    pairs.into_iter().map(|(name, version)| InstalledPkg { name, version, tool }).collect()
-}
-
-/// Enumerate all installed packages for the host's OS. Empty when no supported
-/// package manager is available (e.g. Solaris IPS — deferred).
-pub fn list_installed(os: &OsType) -> Vec<InstalledPkg> {
-    match os {
+/// Every installed package as (name, version). Empty when no supported package
+/// manager is available (e.g. Solaris IPS).
+pub fn list_installed(os: &OsType) -> Vec<(String, String)> {
+    let listed = match os {
         OsType::Linux(distro) => match distro {
             LinuxDistro::Debian | LinuxDistro::Ubuntu | LinuxDistro::Kali =>
-                tagged("dpkg", run_cmd("dpkg-query", &["-W", "-f=${db:Status-Abbrev}\t${binary:Package}\t${Version}\t${Architecture}\n"]).map(|o| parse_dpkg_list(&o)).unwrap_or_default()),
+                run_cmd("dpkg-query", &["-W", "-f=${db:Status-Abbrev}\t${binary:Package}\t${Version}\n"]).map(|o| parse_dpkg_list(&o)),
             LinuxDistro::Fedora | LinuxDistro::Rhel | LinuxDistro::CentOs | LinuxDistro::Rocky
             | LinuxDistro::Alma | LinuxDistro::OpenSuse =>
-                tagged("rpm", run_cmd("rpm", &["-qa", "--qf", "%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n"]).map(|o| parse_rpm_list(&o)).unwrap_or_default()),
-            LinuxDistro::Arch =>
-                tagged("pacman", run_cmd("pacman", &["-Q"]).map(|o| parse_pacman_list(&o)).unwrap_or_default()),
-            LinuxDistro::Alpine =>
-                tagged("apk", run_cmd("apk", &["info", "-v"]).map(|o| parse_apk_list(&o)).unwrap_or_default()),
-            _ => Vec::new(),
+                run_cmd("rpm", &["-qa", "--qf", "%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\n"]).map(|o| parse_rpm_list(&o)),
+            LinuxDistro::Arch => run_cmd("pacman", &["-Q"]).map(|o| parse_pacman_list(&o)),
+            LinuxDistro::Alpine => run_cmd("apk", &["info", "-v"]).map(|o| parse_apk_list(&o)),
+            _ => None,
         },
-        OsType::MacOs =>
-            tagged("brew", run_cmd("brew", &["list", "--versions"]).map(|o| parse_brew_list(&o)).unwrap_or_default()),
-        OsType::FreeBsd | OsType::DragonFlyBsd =>
-            tagged("pkg", run_cmd("pkg", &["query", "%n %v"]).map(|o| parse_pkg_query_list(&o)).unwrap_or_default()),
-        OsType::OpenBsd =>
-            tagged("pkg_info", run_cmd("pkg_info", &["-q"]).map(|o| parse_pkg_info_list(&o)).unwrap_or_default()),
-        OsType::NetBsd =>
-            tagged("pkg_info", run_cmd("pkg_info", &[]).map(|o| parse_pkg_info_list(&o)).unwrap_or_default()),
-        // Windows inventory is multi-ecosystem (registry/winget/appx/lang mgrs)
-        // and is produced as Assets directly by the WindowsCollector.
-        _ => Vec::new(),
-    }
+        OsType::MacOs => run_cmd("brew", &["list", "--versions"]).map(|o| parse_brew_list(&o)),
+        OsType::FreeBsd | OsType::DragonFlyBsd => run_cmd("pkg", &["query", "%n %v"]).map(|o| parse_pkg_query_list(&o)),
+        OsType::OpenBsd => run_cmd("pkg_info", &["-q"]).map(|o| parse_pkg_info_list(&o)),
+        OsType::NetBsd => run_cmd("pkg_info", &[]).map(|o| parse_pkg_info_list(&o)),
+        // Windows inventory is produced as Assets by the WindowsCollector.
+        _ => None,
+    };
+    listed.unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1743,11 +1743,13 @@ mod inventory_tests {
 
     #[test]
     fn dpkg_parse() {
-        let out = "ii \topenssl\t3.0.11-1~deb12u2\tamd64\n\
-                   rc \toldpkg\t1.0\tamd64\n\
-                   ii \tnginx\t1.22.1-9\tall\n";
+        let out = "ii \topenssl\t3.0.11-1~deb12u2\n\
+                   rc \toldpkg\t1.0\n\
+                   ii \tlibssl3:amd64\t3.0.11-1~deb12u2\n\
+                   ii \tnginx\t1.22.1-9\n";
         assert_eq!(parse_dpkg_list(out), vec![
             ("openssl".into(), "3.0.11-1~deb12u2".into()),
+            ("libssl3".into(), "3.0.11-1~deb12u2".into()),
             ("nginx".into(), "1.22.1-9".into()),
         ]);
     }

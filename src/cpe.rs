@@ -10,6 +10,10 @@
 //! when there's no confident mapping. A wrong CPE produces wrong CVE
 //! attributions, which is worse than a gap the caller fills with `?search=`.
 
+use std::sync::LazyLock;
+
+use regex::Regex;
+
 use crate::engine::WinOs;
 
 /// Build an application CPE from an already-cleaned display name + version.
@@ -127,26 +131,33 @@ pub fn escape_cpe(value: &str) -> String {
     out
 }
 
-/// Strip version / architecture / locale / edition / marketing noise from a raw
-/// registry or winget DisplayName, leaving a stable product phrase to look up
-/// (and to use as the `?search=` term when unmapped). Conservative: only trims
-/// trailing noise tokens, never interior words, so "7-Zip 23.01 (x64)" → "7-Zip"
-/// but "Visual Studio Code" is untouched.
-pub fn clean_app_name(raw: &str) -> String {
-    // Drop any parenthesised suffix: "(x64)", "(64-bit)", "(en-US)", "(KB...)".
-    let mut s = raw.trim();
-    if let Some(idx) = s.find('(') {
-        s = s[..idx].trim();
-    }
+static TRADEMARKS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\((?:r|tm)\)|[®™]").unwrap());
 
-    let tokens: Vec<&str> = s.split_whitespace().collect();
-    // Trim trailing noise tokens (version-like, arch, locale, edition words).
-    let mut end = tokens.len();
-    while end > 0 && is_trailing_noise(tokens[end - 1]) {
-        end -= 1;
+/// Strip trademark marks and trailing version / architecture / locale noise from
+/// a raw registry or winget DisplayName, leaving a stable product phrase to look
+/// up (and to use as the `?search=` term when unmapped). Conservative: only
+/// trailing tokens and parenthesised groups go, so "7-Zip 23.01 (x64)" → "7-Zip"
+/// and "Intel(R) Management Engine" → "Intel Management Engine".
+pub fn clean_app_name(raw: &str) -> String {
+    let unmarked = TRADEMARKS.replace_all(raw, "");
+    let mut s = unmarked.trim();
+    loop {
+        let before = s.len();
+        // "(x64)", "(64-bit)", "(en-US)", "(KB...)"
+        if let Some(i) = s.strip_suffix(')').and_then(|h| h.rfind('(')) {
+            s = s[..i].trim_end();
+        }
+        while let Some((head, last)) = s.rsplit_once(char::is_whitespace) {
+            if !is_trailing_noise(last) {
+                break;
+            }
+            s = head.trim_end();
+        }
+        if s.len() == before {
+            break;
+        }
     }
-    let kept = if end == 0 { &tokens[..] } else { &tokens[..end] };
-    kept.join(" ").trim().to_string()
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn is_trailing_noise(tok: &str) -> bool {
@@ -272,6 +283,17 @@ mod tests {
         // "Update"/"Edition"/"version" are load-bearing words — never trimmed.
         assert_eq!(clean_app_name("Windows 10 Update Assistant"), "Windows 10 Update Assistant");
         assert_eq!(clean_app_name("Mozilla Firefox Update"), "Mozilla Firefox Update");
+    }
+
+    #[test]
+    fn cleans_trademarks_and_only_trailing_groups() {
+        assert_eq!(clean_app_name("Intel(R) Management Engine Components 2406.5.5.0"), "Intel Management Engine Components");
+        assert_eq!(clean_app_name("Intel® Graphics Driver"), "Intel Graphics Driver");
+        assert_eq!(clean_app_name("Microsoft Office(TM) 2019 (x64)"), "Microsoft Office");
+        assert_eq!(clean_app_name("NVIDIA™ Control Panel (tm)"), "NVIDIA Control Panel");
+        assert_eq!(clean_app_name("Foo (Beta) Tool"), "Foo (Beta) Tool");
+        assert_eq!(clean_app_name("Foo 1.2 (x64) (en-US)"), "Foo");
+        assert_eq!(clean_app_name("x64"), "x64");
     }
 
     #[test]

@@ -2,8 +2,7 @@ use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 use std::fs;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -25,6 +24,9 @@ use find_threats::{
     Asset,
     plan_info,
     scan_body,
+    QuotaExceeded,
+    FREE_BATCH,
+    FREE_REQUESTS_PER_DAY,
     severity_rank as sev_rank,
 };
 
@@ -67,7 +69,7 @@ struct Cli {
     output: Option<PathBuf>,
 
     /// Print the JSON report to stdout instead of writing a file
-    #[arg(long)]
+    #[arg(long, conflicts_with = "output")]
     json: bool,
 
     /// What to scan: running services only, or every installed OS package
@@ -272,7 +274,6 @@ fn asset_allowed(names: &[&str], include: &[String], exclude: &[String]) -> bool
     let hits = |globs: &[String]| globs.iter().any(|g| names.iter().any(|n| glob_match(g, n)));
     !hits(exclude) && (include.is_empty() || hits(include))
 }
-
 
 fn severity_floor(s: Option<Severity>) -> u8 {
     match s {
@@ -628,6 +629,9 @@ fn print_registration(resp: &RegisterResponse, alerts: bool, color: bool) {
         s.exposed,
         s.kev,
     );
+    if s.truncated {
+        println!("  {}", paint("Radar could not evaluate every asset of this host; the summary may be incomplete.", "33", color));
+    }
 
     if resp.resolved_count > 0 {
         println!(
@@ -682,12 +686,10 @@ fn main() -> ExitCode {
     let interactive = !cli.yes && io::stdin().is_terminal();
 
     let api_key = match auth::resolve_api_key(cli.reset, interactive) {
-        Some(k) => k,
-        None => {
-            error!("no API key available");
-            eprintln!(
-                "No API key available. Set OFFSEQ_API_KEY, or run interactively to enter one."
-            );
+        Ok(k) => k,
+        Err(msg) => {
+            error!("{msg}");
+            eprintln!("{msg}");
             return ExitCode::from(2);
         }
     };
@@ -738,10 +740,10 @@ fn main() -> ExitCode {
         ($($a:tt)*) => {{ if !cli.quiet { if to_stdout { eprintln!($($a)*) } else { println!($($a)*) } } }};
     }
 
-    let client = Arc::new(ThreatClient::new(&api_key));
+    let client = ThreatClient::new(&api_key);
     let sev_floor = severity_floor(cli.severity);
 
-    let (mut final_results, assets, system_info) = if let Some(path) = &cli.sbom {
+    let (mut final_results, assets, system_info, quota) = if let Some(path) = &cli.sbom {
         let content = match fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) => {
@@ -771,7 +773,7 @@ fn main() -> ExitCode {
             Err(e) => return lookup_failed(e, "SBOM scan"),
         };
         say!("\nScanned {} package(s) from {} ({}).\n", report.packages, path.display(), report.format);
-        (report.into_results(&path.display().to_string(), sev_floor), Vec::new(), None)
+        (report.into_results(&sbom_location(path), sev_floor), Vec::new(), None, None)
     } else {
         say!("\nDetected OS: {}\n", os_label(&os));
 
@@ -849,12 +851,13 @@ fn main() -> ExitCode {
             errors:   outcome.errors,
             rejected: outcome.rejected,
             truncated: outcome.truncated,
+            incomplete: outcome.incomplete,
             registration: None,
         };
         // Exposure-aware risk score + SSVC decision per finding, computed from the
         // OWNING asset's reachability so local scores agree with the server's.
         score_findings(&mut results);
-        (results, assets, system_info)
+        (results, assets, system_info, outcome.quota)
     };
 
     if let Some(info) = plan_info(&client.last_rate_limit()) {
@@ -1039,6 +1042,12 @@ fn main() -> ExitCode {
             final_results.truncated.len()
         );
     }
+    if !final_results.incomplete.is_empty() {
+        eprintln!(
+            "[!] {} asset(s) were not fully evaluated: Radar's candidate cap was hit even on a retry (see \"incomplete\").",
+            final_results.incomplete.len()
+        );
+    }
     if to_stdout {
         eprintln!("Found {total} {word}.");
     } else if !cli.quiet {
@@ -1049,7 +1058,8 @@ fn main() -> ExitCode {
     // vulnerability summary. The network call itself already happened before
     // serialization so the response is captured in the JSON report too.
     if let (true, Some(resp)) = (human_output, &registration) {
-        print_registration(resp, !client.last_rate_limit().is_free_plan(), color);
+        let alerts = resp.monitoring_available.unwrap_or_else(|| !client.last_rate_limit().is_free_plan());
+        print_registration(resp, alerts, color);
     }
 
     // Opt-in Windows Update Agent advisory: pending (not-installed) security
@@ -1067,13 +1077,17 @@ fn main() -> ExitCode {
         }
     }
 
+    if let Some(q) = quota {
+        return quota_exhausted(q, "Fallback search");
+    }
+
     if let Some(f) = cli.fail_on {
         if fail_triggered(&final_results, f, cli.severity) {
             tracing::info!(threshold = ?f, "run finished; --fail-on threshold met");
             return ExitCode::from(5);
         }
         // A gate that could not see every asset must not pass.
-        if !final_results.errors.is_empty() {
+        if !final_results.errors.is_empty() || !final_results.incomplete.is_empty() {
             eprintln!("[!] --fail-on could not evaluate every asset; failing the run.");
             return ExitCode::from(1);
         }
@@ -1086,11 +1100,7 @@ fn main() -> ExitCode {
 /// Exit code for a failed Radar lookup: 4 when the plan or quota is the cause, else 1.
 fn lookup_failed(e: ThreatError, what: &str) -> ExitCode {
     match e {
-        ThreatError::RateLimitExceeded(msg) => {
-            warn!(message = %msg, "rate limit exceeded: {what}");
-            auth::prompt_upgrade(Some(&msg));
-            ExitCode::from(4)
-        }
+        ThreatError::RateLimitExceeded(q) => quota_exhausted(q, what),
         // A plan gate or incomplete profile: the server message says how to fix
         // it (with links), and exit 4 rather than 1, which reads as a network failure.
         ThreatError::AccessDenied(msg) => {
@@ -1104,6 +1114,24 @@ fn lookup_failed(e: ThreatError, what: &str) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn quota_exhausted(q: QuotaExceeded, what: &str) -> ExitCode {
+    warn!(message = %q.message, "rate limit exceeded: {what}");
+    auth::prompt_upgrade(Some(&q.message), q.checkout.as_deref());
+    ExitCode::from(4)
+}
+
+/// Where SARIF locates SBOM findings: the path relative to the current directory
+/// when the file is inside it, else its file name.
+fn sbom_location(path: &Path) -> String {
+    if path.is_relative() {
+        return path.display().to_string();
+    }
+    std::env::current_dir().ok()
+        .and_then(|cwd| path.strip_prefix(cwd).ok().map(|p| p.display().to_string()))
+        .or_else(|| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 /// Print the Windows Update Agent advisory (pending updates, most severe first).
@@ -1156,10 +1184,6 @@ fn inventory_noun(scope: ScanScope, count: usize) -> &'static str {
         (_, _) => "services",
     }
 }
-
-/// Free-plan batch size and daily request quota (utils/planLimits.js).
-const FREE_BATCH: usize = 50;
-const FREE_REQUESTS_PER_DAY: usize = 30;
 
 /// Shown before matching (the plan is unknown until the first response), so it
 /// is worded for the free plan rather than asserting the caller's limits.
@@ -1250,7 +1274,23 @@ mod tests {
         )));
         // Unrelated registration failures don't get the upgrade hint.
         assert!(!is_host_or_asset_cap(&ThreatError::Other("decode error".into())));
-        assert!(!is_host_or_asset_cap(&ThreatError::RateLimitExceeded("slow down".into())));
+        assert!(!is_host_or_asset_cap(&ThreatError::PayloadTooLarge));
+    }
+
+    #[test]
+    fn json_conflicts_with_output() {
+        assert!(Cli::try_parse_from(["threat-finder", "--json", "-o", "r.json"]).is_err());
+    }
+
+    #[test]
+    fn sbom_location_is_relative_to_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(sbom_location(&cwd.join("deps").join("bom.json")), Path::new("deps").join("bom.json").display().to_string());
+        assert_eq!(sbom_location(Path::new("deps/bom.json")), "deps/bom.json");
+        let outside = std::env::temp_dir().join("tf-elsewhere").join("bom.json");
+        if !outside.starts_with(&cwd) {
+            assert_eq!(sbom_location(&outside), "bom.json");
+        }
     }
 
     #[test]
@@ -1374,7 +1414,7 @@ mod tests {
             unconfirmed: std::collections::BTreeMap::new(),
             assets: std::collections::BTreeMap::new(),
             errors: std::collections::BTreeMap::new(), rejected: std::collections::BTreeMap::new(),
-            truncated: vec![], registration: None,
+            truncated: vec![], incomplete: vec![], registration: None,
         };
         results.sort_findings();
         let v = &results.services["svc@1"];
@@ -1401,7 +1441,7 @@ mod tests {
             services: std::collections::BTreeMap::from([("svc@1".to_string(), vec![decided])]),
             by_cve: std::collections::BTreeMap::new(), unconfirmed: std::collections::BTreeMap::new(),
             assets: std::collections::BTreeMap::new(), errors: std::collections::BTreeMap::new(),
-            rejected: std::collections::BTreeMap::new(), truncated: vec![], registration: None,
+            rejected: std::collections::BTreeMap::new(), truncated: vec![], incomplete: vec![], registration: None,
         };
         assert!(!fail_triggered(&results, FailOn::Kev, None));
         let v: serde_json::Value = serde_json::from_str(&sarif::to_sarif(&results)).unwrap();
@@ -1436,6 +1476,7 @@ mod tests {
             errors: std::collections::BTreeMap::new(),
             rejected: std::collections::BTreeMap::new(),
             truncated: vec![],
+            incomplete: vec![],
             registration: None,
         };
         let s = sarif::to_sarif(&results);

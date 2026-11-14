@@ -59,7 +59,7 @@ threat-finder [OPTIONS]
 | Flag | Description |
 |------|-------------|
 | `-o, --output <PATH>` | Write the JSON report to `PATH` (default: prompt, or `./threats.json`) |
-| `--json` | Print the JSON report to stdout instead of a file |
+| `--json` | Print the JSON report to stdout instead of a file (conflicts with `-o`) |
 | `--scope <SCOPE>` | `running` (default) or `all` (+ every installed OS package) |
 | `--severity <LEVEL>` | Only report findings at/above `critical\|high\|medium\|low` |
 | `--strict` | Drop coordinate-unconfirmed findings (report only confirmed) |
@@ -90,11 +90,13 @@ OFFSEQ_API_KEY=… threat-finder --yes --json --severity high > report.json
 OFFSEQ_API_KEY=… threat-finder --yes --quiet --fail-on act-now
 ```
 
-**Exit codes:** `0` ok · `1` lookup/IO error · `2` no API key · `3` unsupported
-OS · `4` rate limit/quota, or API access required (upgrade needed) · `5`
-`--fail-on` threshold met. With `--fail-on`, a run where any lookup failed exits
-`1` rather than passing; packages Radar could not evaluate (listed under
-`rejected`) don't count as failed lookups.
+**Exit codes:** `0` ok · `1` lookup/IO error · `2` no or malformed API key · `3`
+unsupported OS · `4` rate limit/quota, or API access required (upgrade needed) ·
+`5` `--fail-on` threshold met. With `--fail-on`, a run where any lookup failed or
+an asset was left `incomplete` exits `1` rather than passing; packages Radar could
+not evaluate (listed under `rejected`) don't count as failed lookups. When the
+quota runs out during the `?search=` fallback, the report is still written with
+the unsearched assets under `errors`, and the run exits `4`.
 
 **API key** (get one from the [Radar Console](https://radar.offseq.com/console)),
 resolved in order:
@@ -104,6 +106,8 @@ resolved in order:
    unless `--reset` is given.
 3. An interactive, hidden prompt on a TTY — then saved for next time.
 
+Keys have Radar's format, `tr_` followed by 64 hex characters; a malformed
+`OFFSEQ_API_KEY` or saved key exits `2` before any request is made.
 Non-interactive (`--yes` / no TTY) with no key available exits `2`.
 
 Set `OFFSEQ_CONFIG_DIR` to override where the config lives (default: the OS
@@ -121,6 +125,8 @@ there's no client-side version guessing. Findings are split by the API's
 `confirmed` flag: confirmed matches are reported; coordinate matches whose
 version can't be confirmed are surfaced separately as **unconfirmed / triage**
 (excluded from the count, `byCve`, and `--fail-on`; drop them with `--strict`).
+Assets with no buildable coordinate fall back to a name search, at most 25 per
+run; the rest are listed under `errors`.
 
 **Network-exposure correlation.** Manifest scanners (Trivy, Grype, osv-scanner)
 read package lists; external scanners (Nessus, OpenVAS) need a second host. This
@@ -167,7 +173,8 @@ default in CI), `--no-register` opts out, `--host-name <NAME>` labels the host, 
 `--unregister` removes it. A stable per-host id and your prompt preference live in
 `$XDG_CONFIG_HOME/offseq-rust/config.toml`. Registration never changes the exit
 code — a monitoring hiccup won't fail your scan. Every plan can register hosts
-(Free: 2); alerts need a paid plan.
+(Free: 2); alerts need a paid plan, and the confirmation says whether yours has
+them.
 
 ## SBOM and lockfile scanning
 
@@ -183,11 +190,13 @@ threat-finder --sbom package-lock.json --yes --fail-on high --sarif deps.sarif
 
 The report has the usual shape, keyed by purl; `assets.*.upgradeTo` comes from
 Radar's remediation and packages it couldn't check (no version, unsupported
-ecosystem) are listed under `rejected`. A file has no network exposure, so
+ecosystem) are listed under `rejected`, and capped packages Radar reports go to
+`truncated` or `incomplete` as for a host scan. A file has no network exposure, so
 `riskScore`/`decision` are Radar's exposure-free score. `--severity`, `--strict`,
 `--fail-on`, `--json` and `--sarif` work as for a host scan; registration and
-the monitoring prompt are skipped. The file must stay under 10 MB once
-JSON-encoded, and non-JSON files can't have lines over 4,096 characters (checked
+the monitoring prompt are skipped. SARIF locates findings at the file's path
+relative to the current directory (or its name when it is elsewhere). The file
+must stay under 16 MiB once JSON-encoded, and non-JSON files can't have lines over 4,096 characters (checked
 locally before sending). Packages per scan are capped by plan (the same as the
 batch size); a larger file exits `4` with the cap named.
 
@@ -227,23 +236,26 @@ coordinate). The kernel is covered as its package (`linux-image…`) under
 > per plan (Free 50 per request at 20 requests/hour and 30/day; Base 200; Pro
 > 1,000; Enterprise 4,000), and the tool warns when an inventory needs many free
 > requests. Free plans also see at most 10 matches per package (riskiest first);
-> capped assets are listed under `truncated`.
+> capped assets are listed under `truncated`. Assets the server's per-request
+> candidate cap cut short are re-queried once in a smaller batch; any still cut
+> short are listed under `incomplete`.
 
 ## Per-OS support
 
 | OS | Discovery | Coordinate source |
 |----|-----------|-------------------|
 | Linux (systemd) | `systemctl list-units` / `show` → `/proc/<pid>/exe` | dpkg / rpm / pacman / apk |
-| Linux (SysV/OpenRC) | `service --status-all` / `rc-status` | package DB |
+| Linux (SysV/OpenRC) | `service --status-all` / `rc-status` → `pgrep` | package DB |
 | macOS | `launchctl list` → `ps` (third-party only) | Homebrew |
-| FreeBSD / DragonFly | `service -e` | `pkg` |
-| OpenBSD | `rcctl ls started` | `pkg_info` |
-| NetBSD | `/etc/rc.d` status | `pkg_info` |
-| Solaris / illumos | `svcs` → `svcprop` | probe (`--version`) |
+| FreeBSD / DragonFly | `service -e` → `pgrep` | `pkg` |
+| OpenBSD | `rcctl ls started` → `pgrep` | `pkg_info` |
+| NetBSD | `/etc/rc.d` status → `pgrep` | `pkg_info` |
+| Solaris / illumos | `svcs` → `svcs -p` (process binary and PID) | probe (`--version`) |
 | Windows | `Win32_Service` → `Get-NetTCPConnection` / `netstat` | registry / winget / Appx / Chocolatey / Scoop → CPE; npm / pip / dotnet → purl; the OS build → CPE |
 
 Where no package owns a binary, the version falls back to a hardened `--version`
-probe (absolute path only, sanitized env). On macOS, Apple system services
+/ `-V` probe (absolute path only, sanitized env, trusted owner); SMF method
+scripts are never probed. On macOS, Apple system services
 (`com.apple.*`, SIP-protected paths) are skipped — they're covered by the OS
 version, and probing hundreds of them is pointless.
 
@@ -265,17 +277,21 @@ JSON, with deterministic (sorted) keys and no timestamp, so reports diff cleanly
   `remediation`, `cwes`, `references`, `radarUrl`, and with `--respect-decisions`
   `recordedDecision`), highest-risk first.
 - **`unconfirmed`** — coordinate matches whose version couldn't be confirmed (triage).
-- **`assets`** — `pkg@version` → `{ exe, versionSource, exposed, reachability, listeners, upgradeTo }`
+- **`assets`** — `pkg@version` → `{ exe, version, versionSource, exposed, reachability, listeners, upgradeTo, restartPending }`
   (`versionSource` = `package-db` | `probe`; `reachability` covers TCP **and** UDP).
 - **`byCve`** — each CVE rolled up across every affected asset ("patch once, fix many").
-- **`errors`** — per-asset lookup failures, so a failure never reads as "clean".
+- **`errors`** — per-asset lookup failures (and fallback searches skipped for
+  quota or the per-run limit), so a failure never reads as "clean".
 - **`rejected`** — packages Radar could not evaluate, and why (not a lookup failure).
 - **`truncated`** — assets whose matches the plan's per-query result cap cut short.
+- **`incomplete`** — assets Radar could not fully evaluate (server candidate cap);
+  they fail `--fail-on` like lookup errors.
 - **`registration`** — present when the run registered the host: `hostId`,
   `monitoring`, `assetCount`, `drift`, `summary`, `newSinceLastCount`, `resolvedCount`.
-- **`meta`** — `{ tool, version, schemaVersion }` (`schemaVersion` 3).
+- **`meta`** — `{ tool, version, schemaVersion }` (`schemaVersion` 4).
 
-A SARIF 2.1.0 report (`--sarif`) is also available for code-scanning UIs.
+A SARIF 2.1.0 report (`--sarif`) is also available for code-scanning UIs; each
+result's `properties` carry the risk fields and Radar's `remediation`.
 
 ## The OffSeq ecosystem
 

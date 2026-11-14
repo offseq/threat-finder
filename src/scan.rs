@@ -10,8 +10,8 @@
 use std::collections::BTreeMap;
 
 use crate::api::{
-    match_to_entry, search_to_entry, severity_rank, BatchOutcome, MatchQuery, ThreatClient,
-    ThreatEntry, ThreatError,
+    match_to_entry, prune_unconfirmed, search_to_entry, severity_rank, BatchOutcome, MatchQuery,
+    ThreatClient, ThreatEntry, ThreatError,
 };
 use crate::cpe::escape_cpe;
 use crate::engine::{
@@ -118,7 +118,6 @@ impl Asset {
 }
 
 pub trait Collector: Sync {
-    fn name(&self) -> &'static str;
     /// Never panics; returns an empty Vec on an unhandled OS.
     fn collect(&self, os: &OsType) -> Vec<Asset>;
 }
@@ -128,9 +127,6 @@ pub trait Collector: Sync {
 pub struct RunningServiceCollector;
 
 impl Collector for RunningServiceCollector {
-    fn name(&self) -> &'static str {
-        "running-services"
-    }
     fn collect(&self, os: &OsType) -> Vec<Asset> {
         let mut services = scan_services(os);
         enrich_exposure(&mut services);
@@ -163,18 +159,15 @@ fn service_to_asset(s: ServiceInfo, eco: Ecosystem) -> Asset {
 pub struct OsPackageCollector;
 
 impl Collector for OsPackageCollector {
-    fn name(&self) -> &'static str {
-        "os-packages"
-    }
     fn collect(&self, os: &OsType) -> Vec<Asset> {
         let eco = Ecosystem::for_os(os);
         list_installed(os)
             .into_iter()
-            .map(|p| Asset {
+            .map(|(name, version)| Asset {
                 ecosystem: eco,
-                name: p.name.clone(),
-                pkg_name: Some(p.name), // inventory names ARE the package coordinate
-                version: p.version,
+                name: name.clone(),
+                pkg_name: Some(name), // inventory names ARE the package coordinate
+                version,
                 sources: vec![Source::PackageDb],
                 locations: Vec::new(),
                 runtime: None,
@@ -202,9 +195,6 @@ pub struct WindowsCollector {
 }
 
 impl Collector for WindowsCollector {
-    fn name(&self) -> &'static str {
-        "windows"
-    }
     fn collect(&self, os: &OsType) -> Vec<Asset> {
         match os {
             OsType::Windows(w) => crate::windows::collect_windows(w, self.full),
@@ -426,9 +416,19 @@ fn dedup_by_cve(entries: &mut Vec<ThreatEntry>) {
     });
 }
 
+/// `?search=` lookups per run; each costs up to `MAX_PAGES` requests of quota.
+pub const MAX_FALLBACK_SEARCHES: usize = 25;
+
+fn note(errors: &mut BTreeMap<String, String>, keys: &[String], msg: &str) {
+    for k in keys {
+        errors.insert(k.clone(), msg.to_string());
+    }
+}
+
 /// Match a host inventory against Radar by exact coordinate (purl) in batched
 /// POSTs, falling back to `?search=` for assets with no buildable coordinate.
 /// Confirmed matches go to `results`; coordinate-unconfirmed to `unconfirmed`.
+/// A quota exhausted after the batch keeps what was matched and sets `quota`.
 pub fn run_scan(
     client: &ThreatClient,
     assets: &[Asset],
@@ -458,18 +458,36 @@ pub fn run_scan(
     let mut rejected: BTreeMap<String, String> = BTreeMap::new();
     let mut upgrades: BTreeMap<String, String> = BTreeMap::new();
     let mut truncated: Vec<String> = Vec::new();
+    let mut incomplete: Vec<String> = Vec::new();
+    let mut quota = None;
 
     // Exploited findings (KEV, EUVD, Mirage) survive the severity floor: hiding
     // them would contradict risk ranking and `--fail-on kev|exploited`.
     let keep = |e: &ThreatEntry| e.exploited || severity_rank(e.severity.as_deref()) >= severity_floor;
 
     if !queries.is_empty() {
-        let matched = client.match_batch(&queries, strict)?;
-        for ((key, distro), result) in query_keys.iter().zip(matched) {
-            if let Some(e) = result.error {
-                rejected.insert(key.clone(), e);
+        let mut matched = client.match_batch(&queries, strict)?;
+        // The candidate budget is per request, so a smaller follow-up batch gets a fresh one.
+        let capped: Vec<usize> = (0..matched.len()).filter(|&i| matched[i].candidate_capped()).collect();
+        if !capped.is_empty() {
+            let retry: Vec<MatchQuery> = capped.iter().map(|&i| queries[i].clone()).collect();
+            match client.match_batch(&retry, strict) {
+                Ok(again) => {
+                    for (i, r) in capped.into_iter().zip(again) {
+                        matched[i] = r;
+                    }
+                }
+                Err(ThreatError::RateLimitExceeded(q)) => quota = Some(q),
+                Err(e) => tracing::warn!(error = %e, "candidate-cap retry failed"),
             }
-            if result.truncated {
+        }
+        for ((key, distro), result) in query_keys.iter().zip(matched) {
+            if let Some(e) = &result.error {
+                rejected.insert(key.clone(), e.clone());
+            }
+            if result.candidate_capped() {
+                incomplete.push(key.clone());
+            } else if result.truncated {
                 truncated.push(key.clone());
             }
             if let Some(v) = result.upgrade_to {
@@ -492,30 +510,40 @@ pub fn run_scan(
     }
 
     // One ?search= per unique name; apply to every asset key sharing it.
-    for (name, keys) in fallback {
+    let mut fallback = fallback.into_iter();
+    for (name, keys) in fallback.by_ref().take(MAX_FALLBACK_SEARCHES) {
+        if quota.is_some() {
+            note(&mut errors, &keys, "not searched (quota exhausted)");
+            continue;
+        }
         match client.search_threats(&name) {
             Ok(threats) => {
                 let entries: Vec<ThreatEntry> =
                     threats.iter().map(search_to_entry).filter(|e| keep(e)).collect();
-                for key in keys {
-                    if !entries.is_empty() {
+                if !entries.is_empty() {
+                    for key in keys {
                         unconfirmed.entry(key).or_default().extend(entries.iter().cloned());
                     }
                 }
             }
-            Err(ThreatError::RateLimitExceeded(m)) => return Err(ThreatError::RateLimitExceeded(m)),
-            Err(e) => {
-                errors.insert(name, e.to_string());
+            Err(ThreatError::RateLimitExceeded(q)) => {
+                note(&mut errors, &keys, "not searched (quota exhausted)");
+                quota = Some(q);
             }
+            Err(e) => note(&mut errors, &keys, &e.to_string()),
         }
+    }
+    for (_, keys) in fallback {
+        note(&mut errors, &keys, &format!("not searched (fallback budget of {MAX_FALLBACK_SEARCHES} searches per run)"));
     }
 
     for v in results.values_mut().chain(unconfirmed.values_mut()) {
         v.sort_by_key(|e| std::cmp::Reverse(e.risk_key()));
         dedup_by_cve(v);
     }
+    prune_unconfirmed(&results, &mut unconfirmed);
 
-    Ok(BatchOutcome { results, unconfirmed, errors, rejected, upgrades, truncated })
+    Ok(BatchOutcome { results, unconfirmed, errors, rejected, upgrades, truncated, incomplete, quota })
 }
 
 #[cfg(test)]
@@ -669,5 +697,68 @@ mod tests {
         ];
         dedup_by_cve(&mut v);
         assert_eq!(v.len(), 2, "id-less entries are never collapsed");
+    }
+
+    fn win_app(name: &str) -> Asset {
+        Asset { ecosystem: Ecosystem::WinApp, name: name.into(), pkg_name: Some(name.into()), version: "1.0".into(),
+            sources: vec![Source::PackageDb], locations: vec![], runtime: None, cpe: None }
+    }
+
+    #[test]
+    fn quota_in_fallback_keeps_batch_results() {
+        use crate::api::{http, serve};
+        let batch = http(200, r#"{"data":{"results":[{"matches":[{"cveId":"CVE-1","severity":"high","confirmed":true}]}]}}"#);
+        let quota = http(429, r#"{"message":"Daily quota reached.","upgrade":{"reason":"api-day","urls":{"checkout":"https://c/o"}}}"#);
+        let (client, server) = serve(vec![batch, quota]);
+        let assets = [asset_eco(Ecosystem::Deb, "nginx", "1.0"), win_app("Alpha"), win_app("Beta")];
+        let out = run_scan(&client, &assets, &linux(LinuxDistro::Debian), false, 0).unwrap();
+        assert_eq!(server.join().unwrap().len(), 2, "no search after the quota ran out");
+        assert_eq!(out.results["nginx@1.0"][0].cve_id.as_deref(), Some("CVE-1"));
+        assert_eq!(out.quota.unwrap().checkout.as_deref(), Some("https://c/o"));
+        assert_eq!(out.errors.keys().collect::<Vec<_>>(), ["Alpha@1.0", "Beta@1.0"]);
+        assert!(out.errors.values().all(|e| e.contains("quota")));
+    }
+
+    #[test]
+    fn fallback_searches_are_bounded_per_run() {
+        use crate::api::{http, serve};
+        let empty = http(200, r#"{"data":{"threats":[]}}"#);
+        let (client, server) = serve(vec![empty; MAX_FALLBACK_SEARCHES]);
+        let assets: Vec<Asset> = (0..MAX_FALLBACK_SEARCHES + 2).map(|i| win_app(&format!("app{i:02}"))).collect();
+        let out = run_scan(&client, &assets, &OsType::Windows(Default::default()), false, 0).unwrap();
+        assert_eq!(server.join().unwrap().len(), MAX_FALLBACK_SEARCHES);
+        assert_eq!(out.errors.len(), 2);
+        assert!(out.errors.values().all(|e| e.contains("fallback budget")), "{:?}", out.errors);
+    }
+
+    #[test]
+    fn candidate_capped_results_are_retried_once() {
+        use crate::api::{http, serve};
+        let first = http(200, r#"{"data":{"results":[
+            {"truncated":true,"candidatesTruncated":true,"totalMatches":1,"matches":[{"cveId":"CVE-1","confirmed":true}]},
+            {"truncated":true,"totalMatches":40,"matches":[{"cveId":"CVE-2","confirmed":true}]},
+            {"truncated":true,"totalMatches":1,"matches":[{"cveId":"CVE-3","confirmed":true}]}]}}"#);
+        let retry = http(200, r#"{"data":{"results":[
+            {"truncated":false,"candidatesTruncated":false,"totalMatches":2,"matches":[{"cveId":"CVE-1","confirmed":true},{"cveId":"CVE-4","confirmed":true}]},
+            {"truncated":true,"candidatesTruncated":true,"totalMatches":1,"matches":[{"cveId":"CVE-3","confirmed":true}]}]}}"#);
+        let (client, server) = serve(vec![first, retry]);
+        let assets = ["a", "b", "c"].map(|n| asset_eco(Ecosystem::Deb, n, "1.0"));
+        let out = run_scan(&client, &assets, &linux(LinuxDistro::Debian), false, 0).unwrap();
+        assert_eq!(server.join().unwrap().len(), 2);
+        assert_eq!(out.results["a@1.0"].len(), 2, "retry replaced the capped result");
+        assert_eq!(out.truncated, ["b@1.0"]);
+        assert_eq!(out.incomplete, ["c@1.0"]);
+    }
+
+    #[test]
+    fn confirmed_finding_drops_its_unconfirmed_copy() {
+        use crate::api::{http, serve};
+        let batch = http(200, r#"{"data":{"results":[{"matches":[
+            {"cveId":"CVE-1","confirmed":true},{"cveId":"CVE-1","confirmed":false},{"cveId":"CVE-2","confirmed":false}]}]}}"#);
+        let (client, server) = serve(vec![batch]);
+        let out = run_scan(&client, &[asset_eco(Ecosystem::Deb, "a", "1.0")], &linux(LinuxDistro::Debian), false, 0).unwrap();
+        server.join().unwrap();
+        let ids: Vec<_> = out.unconfirmed["a@1.0"].iter().map(|e| e.cve_id.as_deref()).collect();
+        assert_eq!(ids, [Some("CVE-2")]);
     }
 }

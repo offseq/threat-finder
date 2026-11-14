@@ -49,29 +49,43 @@ const ENV_KEY: &str = "OFFSEQ_API_KEY";
 /// of the OS's per-user directory resolution.
 const CONFIG_DIR_ENV: &str = "OFFSEQ_CONFIG_DIR";
 
+const MALFORMED: &str = "malformed API key (expected tr_ followed by 64 hex characters)";
+
+/// Radar's key format, `^tr_[0-9a-f]{64}$`.
+pub fn is_key_format(key: &str) -> bool {
+    key.strip_prefix("tr_")
+        .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
 /// Resolve an API key from, in order: the OFFSEQ_API_KEY env var, the saved
 /// config (unless `reset`), then interactive setup (only if `interactive`).
-/// Returns None when no key can be obtained without prompting.
-pub fn resolve_api_key(reset: bool, interactive: bool) -> Option<String> {
+/// Errs, before any request is made, when no well-formed key is available.
+pub fn resolve_api_key(reset: bool, interactive: bool) -> Result<String, String> {
     if let Ok(k) = std::env::var(ENV_KEY) {
         let k = k.trim().to_string();
         if !k.is_empty() {
-            return Some(k);
+            return if is_key_format(&k) { Ok(k) } else { Err(format!("{ENV_KEY}: {MALFORMED}")) };
         }
     }
 
     if !reset {
         if let Some(k) = saved_api_key() {
-            return Some(k);
+            return if is_key_format(&k) {
+                Ok(k)
+            } else {
+                Err(format!("{}: {MALFORMED}; re-run with --reset to re-enter it", config_path().display()))
+            };
         }
     }
 
     if interactive {
         run_initial_setup();
-        return saved_api_key();
+        if let Some(k) = saved_api_key() {
+            return Ok(k);
+        }
     }
 
-    None
+    Err("No API key available. Set OFFSEQ_API_KEY, or run interactively to enter one.".to_string())
 }
 
 fn saved_api_key() -> Option<String> {
@@ -239,8 +253,8 @@ fn prompt_for_key() -> Option<String> {
             continue;
         }
 
-        if key.len() < 48 {
-            println!("That doesn't look like a valid API key (too short). Please try again.");
+        if !is_key_format(&key) {
+            println!("That is a {MALFORMED}. Please try again.");
             continue;
         }
 
@@ -252,14 +266,15 @@ fn prompt_for_key() -> Option<String> {
 /// the server's own message — it distinguishes an hourly burst from a daily or
 /// monthly quota and carries the reset time, so we surface it verbatim above the
 /// generic upgrade line rather than guessing.
+/// `checkout` is the server's direct upgrade link, when it sent one.
 /// Printed to stderr so it can't corrupt JSON written to stdout.
-pub fn prompt_upgrade(detail: Option<&str>) {
+pub fn prompt_upgrade(detail: Option<&str>, checkout: Option<&str>) {
     eprintln!("\n┌─────────────────────────────────────────────┐");
     eprintln!("│            Rate Limit Reached               │");
     eprintln!("└─────────────────────────────────────────────┘\n");
     eprintln!("{}\n", upgrade_body_line(detail));
     eprintln!("Upgrade your plan for higher limits:");
-    eprintln!("  https://radar.offseq.com/console?tab=billing\n");
+    eprintln!("  {}\n", checkout.unwrap_or("https://radar.offseq.com/console?tab=billing"));
     eprintln!("Compare plans: https://radar.offseq.com/pricing\n");
 }
 
@@ -439,6 +454,42 @@ mod tests {
         assert!(set_monitoring_prompt_mode("never").is_err());
         get_or_create_host_id();
         assert_eq!(fs::read_to_string(&path).unwrap(), corrupt, "config left untouched");
+    }
+
+    #[test]
+    fn key_format_matches_the_server() {
+        let hex = "0123456789abcdef".repeat(4);
+        assert!(is_key_format(&format!("tr_{hex}")));
+        assert!(!is_key_format(&format!("tr_{}", hex.to_uppercase())));
+        assert!(!is_key_format(&format!("tr_{}", &hex[1..])));
+        assert!(!is_key_format(&format!("tr_{hex}0")));
+        assert!(!is_key_format(&format!("tk_{hex}")));
+        assert!(!is_key_format(""));
+    }
+
+    #[test]
+    fn malformed_keys_are_rejected_before_use() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _tmp = TempConfigHome::new();
+        let prev = std::env::var_os(ENV_KEY);
+        let good = format!("tr_{}", "ab".repeat(32));
+
+        std::env::set_var(ENV_KEY, "not-a-key");
+        assert!(resolve_api_key(false, false).unwrap_err().contains("malformed API key"));
+        std::env::set_var(ENV_KEY, format!(" {good}\n"));
+        assert_eq!(resolve_api_key(false, false), Ok(good.clone()));
+
+        std::env::remove_var(ENV_KEY);
+        assert!(resolve_api_key(false, false).unwrap_err().starts_with("No API key"));
+        update_config(|c| c.api_key = "short".into()).unwrap();
+        assert!(resolve_api_key(false, false).unwrap_err().contains("--reset"));
+        update_config(|c| c.api_key = good.clone()).unwrap();
+        assert_eq!(resolve_api_key(false, false), Ok(good));
+
+        match prev {
+            Some(v) => std::env::set_var(ENV_KEY, v),
+            None => std::env::remove_var(ENV_KEY),
+        }
     }
 
     #[test]

@@ -15,16 +15,23 @@ fn level(sev: Option<&str>) -> &'static str {
     }
 }
 
-
 /// GitHub code scanning drops results without a physical location and resolves
-/// URIs against the repository root, so the asset's path is made relative.
+/// URIs against the repository root, so the asset's path is made relative and
+/// percent-encoded into a valid uri-reference.
 fn artifact_uri(exe: &str) -> String {
     let path = exe.replace('\\', "/");
     let path = match path.as_bytes() {
         [d, b':', ..] if d.is_ascii_alphabetic() => &path[2..],
         _ => &path,
     };
-    path.trim_start_matches('/').to_string()
+    let mut uri = String::with_capacity(path.len());
+    for b in path.trim_start_matches('/').bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => uri.push(b as char),
+            _ => uri.push_str(&format!("%{b:02X}")),
+        }
+    }
+    uri
 }
 
 fn push_entry(rules: &mut BTreeMap<String, Value>, results: &mut Vec<Value>, asset: &str, exe: Option<&str>, t: &ThreatEntry) {
@@ -92,6 +99,9 @@ fn push_entry(rules: &mut BTreeMap<String, Value>, results: &mut Vec<Value>, ass
     if !t.fixed_versions.is_empty() {
         props["fixedVersions"] = json!(t.fixed_versions);
     }
+    if let Some(rem) = &t.remediation {
+        props["remediation"] = json!(rem);
+    }
 
     let mut location = json!({ "logicalLocations": [{ "fullyQualifiedName": asset, "kind": "module" }] });
     if let Some(exe) = exe {
@@ -107,10 +117,6 @@ fn push_entry(rules: &mut BTreeMap<String, Value>, results: &mut Vec<Value>, ass
         "locations": [location],
         "properties": props,
     });
-    if let Some(rem) = &t.remediation {
-        // A `fixes`-adjacent hint that SARIF viewers can surface as guidance.
-        result["fixes"] = json!([{ "description": { "text": rem } }]);
-    }
     if let Some(d) = t.recorded_decision.as_ref().filter(|d| d.suppressing) {
         result["suppressions"] = json!([{ "kind": "external", "status": "accepted", "justification": d.verdict }]);
     }
@@ -144,4 +150,17 @@ pub fn to_sarif(results: &BatchResults) -> String {
     });
 
     serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::artifact_uri;
+
+    #[test]
+    fn artifact_uri_is_a_relative_uri_reference() {
+        assert_eq!(artifact_uri("/usr/sbin/nginx"), "usr/sbin/nginx");
+        assert_eq!(artifact_uri("C:\\Program Files\\App (x86)\\a#b.exe"), "Program%20Files/App%20%28x86%29/a%23b.exe");
+        assert_eq!(artifact_uri("deps/pkg:lock?.json"), "deps/pkg%3Alock%3F.json");
+        assert_eq!(artifact_uri("/opt/caf\u{e9}/x"), "opt/caf%C3%A9/x");
+    }
 }
