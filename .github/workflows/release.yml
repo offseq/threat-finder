@@ -84,6 +84,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
+      # Pinned: the action otherwise pip-installs the latest zigbuild and zig at release time.
+      - if: matrix.build-tool == 'cargo-zigbuild'
+        run: pip3 install cargo-zigbuild==0.24.1 ziglang==0.17.1
       - id: build
         uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
         with:
