@@ -4,11 +4,72 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.2]
 
 ### Fixed
+- Debian `--scope all` inventory strips the multiarch suffix (`libssl3:amd64`
+  is `libssl3`), so purls, report keys and library CVE matches are right.
+- Running out of quota during the `?search=` fallback no longer discards the
+  batch results: the report is written, the unsearched assets are listed in
+  `errors`, and the run exits `4` at the end with the upgrade link from Radar.
+- `errors` is keyed by asset (`name@version`), like every other map, instead
+  of by search term.
+- SARIF validates against the 2.1.0 schema: `fixes` (which lacked
+  `artifactChanges`) is gone, remediation is in `properties.remediation`, and
+  artifact URIs are percent-encoded.
+- Solaris/illumos: services are resolved from the processes `svcs -p` lists
+  (binary and PID) instead of the start method, so SMF method scripts under
+  `/lib/svc/method` are never probed and paths with escaped spaces resolve.
+- Version probes run only `--version` and `-V`; `-v` and a bare `version`
+  started some daemons.
+- BSD and SysV/OpenRC services get a PID from `pgrep`, and Solaris/illumos
+  from `svcs -p`, so their listeners and exposure are reported.
+- `--sbom --severity` keeps every exploited finding below the floor, not just
+  KEV ones, as host scans do.
+- Windows app names lose `(R)`, `(TM)`, `®` and `™`, and only trailing
+  parenthesised groups: "Intel(R) Management Engine" is no longer "Intel".
+- SBOM findings without a remediation entry get an asset, so every SARIF result
+  has a location, and an absolute `--sbom` path inside the current directory is
+  made relative.
+- OpenBSD binaries resolve to their package: `pkg_info -E` prints
+  "path: package", and the parser took the path for the package.
+- A CVE confirmed for an asset is no longer repeated under `unconfirmed`.
+- `byCve.*.epss` is the highest EPSS across the assets.
+- The plan readout skips the monthly row when Radar sends no monthly limit.
+- A `413 Payload too large` (the server's body limit) is reported as such, not
+  as a plan cap; batches still halve on it.
+- The `/scan` body limit is 16 MiB, as on the server (was 10 MB).
+
+### Changed
+- Truncation is split by cause. `truncated` lists only plan-capped assets (with
+  the upgrade hint). Assets the server's candidate cap cut short are re-queried
+  once in a smaller batch; any still capped are listed in the new `incomplete`
+  and fail a `--fail-on` run with exit `1`, as lookup errors do. `--sbom` reads
+  Radar's `truncated` (`candidate-cap` → `incomplete`) the same way. Report
+  `schemaVersion` is 4.
+- At most 25 `?search=` fallback lookups per run; the rest are listed in
+  `rejected` as not searched (their hits would be unconfirmed, so they never
+  fail `--fail-on`).
+- Running out of quota mid-run keeps everything already matched: the report is
+  written with the rest under `errors`, registration is skipped, and the run
+  exits `4`.
+- API keys must match Radar's format (`tr_` and 64 hex characters): a malformed
+  `OFFSEQ_API_KEY` or saved key exits `2` before any request, and the setup
+  prompt rejects one.
+- `--json` and `--output` conflict.
+- Registration uses Radar's `monitoringAvailable` to say whether alerts are on,
+  and notes when the server could not evaluate every asset.
+- The plan readout shows when the hourly and daily windows reset.
+
+### Removed
+- Unused `homebrew_version`, `atom_version`, `MatchHit::epss_percentile`,
+  `InstalledPkg` and `Collector::name`. `list_installed` returns
+  `(name, version)` pairs.
+
+### CI and release
 - Linux release binaries link against glibc 2.28 instead of the build runner's
   2.39, so they run on Debian 10+, Ubuntu 20.04+ and RHEL 8+.
+- Dependencies updated to their latest compatible patch releases.
 
 ## [0.4.1]
 
@@ -114,7 +175,7 @@ Brings the client in line with the current Radar API.
   Windows and is shared on Unix).
 - Version probing resolves symlinks and refuses binaries others can replace,
   cannot hang on a forked child holding the pipe, and kills the probe's process
-  group (including anything it daemonized).
+  group (a child that starts its own session escapes it).
 - Findings exploited per EUVD, Mirage or the in-the-wild flag survive
   `--severity`, like KEV ones.
 - The logger no longer panics when its directory is not writable.
@@ -404,45 +465,6 @@ Brings the client in line with the current Radar API.
 ### Removed
 - Dead `ServiceEntry` / `SystemInfo` API types left over from the match migration.
 
-## [Unreleased]
-
-### Changed
-- **Migrated to Radar exact-coordinate matching** (`POST /match/batch`). Each
-  asset becomes a Package-URL with its full version + `?distro=` and the whole
-  inventory is matched server-side with ecosystem-native version rules, in one
-  request per tier-sized chunk (replacing per-service free-text search). Removed
-  the client-side version-constraint engine and the hard-coded nginx blocklist.
-  Backported-and-fixed builds are no longer false-flagged.
-- Findings now split into `confirmed` (reported) and `unconfirmed` (triage,
-  excluded from the count / `byCve` / `--fail-on`); added `--strict`. `?search=`
-  is retained only as a fallback for assets with no buildable coordinate.
-
-### Added
-- Split into a reusable library crate (`find_threats`) + thin binary, with a
-  generic `Asset`/`Collector` abstraction (running-services is now a collector).
-- `--scope all`: a full installed-OS-package inventory collector
-  (dpkg/rpm/pacman/apk/brew/pkg/pkg_info), expanding matched coverage ~10–50×.
-  Assets are deduplicated and merged so a package backing a running, exposed
-  process keeps its runtime exposure. Defaults to `--scope running` (quota-safe),
-  with a warning when the inventory exceeds the free-tier budget.
-
-### Added (prior)
-- Reachability classification (loopback / private / public) for listeners, and
-  UDP listener coverage in addition to TCP.
-- Cross-service CVE grouping (`byCve`) — one fix mapped to every affected service.
-- SARIF 2.1.0 output (`--sarif`) and `--include`/`--exclude` service globs.
-- Output `meta` envelope with `schemaVersion`.
-
-### Fixed
-- **Critical:** `lsof`-based exposure correlation returned nothing on
-  macOS/BSD/Solaris (the `(LISTEN)` suffix defeated the parser), silently
-  disabling the headline feature off-Linux. Now uses `lsof -Fn` field output,
-  with a non-vacuous regression test.
-
-### Changed
-- `ThreatError` now implements `std::error::Error`; single canonical
-  `severity_rank`; pure per-OS parse functions extracted and unit-tested.
-
 ## [0.1.0-prev]
 
 ### Added
@@ -470,4 +492,38 @@ Brings the client in line with the current Radar API.
   API-key storage.
 
 ## [0.1.0]
+
+### Changed
+- **Migrated to Radar exact-coordinate matching** (`POST /match/batch`). Each
+  asset becomes a Package-URL with its full version + `?distro=` and the whole
+  inventory is matched server-side with ecosystem-native version rules, in one
+  request per tier-sized chunk (replacing per-service free-text search). Removed
+  the client-side version-constraint engine and the hard-coded nginx blocklist.
+  Backported-and-fixed builds are no longer false-flagged.
+- Findings now split into `confirmed` (reported) and `unconfirmed` (triage,
+  excluded from the count / `byCve` / `--fail-on`); added `--strict`. `?search=`
+  is retained only as a fallback for assets with no buildable coordinate.
+- `ThreatError` now implements `std::error::Error`; single canonical
+  `severity_rank`; pure per-OS parse functions extracted and unit-tested.
+
+### Added
+- Split into a reusable library crate (`find_threats`) + thin binary, with a
+  generic `Asset`/`Collector` abstraction (running-services is now a collector).
+- `--scope all`: a full installed-OS-package inventory collector
+  (dpkg/rpm/pacman/apk/brew/pkg/pkg_info), expanding matched coverage ~10–50×.
+  Assets are deduplicated and merged so a package backing a running, exposed
+  process keeps its runtime exposure. Defaults to `--scope running` (quota-safe),
+  with a warning when the inventory exceeds the free-tier budget.
+- Reachability classification (loopback / private / public) for listeners, and
+  UDP listener coverage in addition to TCP.
+- Cross-service CVE grouping (`byCve`) — one fix mapped to every affected service.
+- SARIF 2.1.0 output (`--sarif`) and `--include`/`--exclude` service globs.
+- Output `meta` envelope with `schemaVersion`.
+
+### Fixed
+- **Critical:** `lsof`-based exposure correlation returned nothing on
+  macOS/BSD/Solaris (the `(LISTEN)` suffix defeated the parser), silently
+  disabling the headline feature off-Linux. Now uses `lsof -Fn` field output,
+  with a non-vacuous regression test.
+
 - Initial release.
