@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "threat-finder"
+abstract: "Runtime vulnerability scanner: finds CVEs in the services actually running on a host and ranks them by network exposure."
+authors:
+  - name: "OffSeq (SEQ SIA)"
+    city: Riga
+    country: LV
+    website: "https://offseq.com"
+    email: support@offseq.com
+repository-code: "https://github.com/offseq/threat-finder"
+url: "https://offseq.com/en/research/threat-finder/"
+license:
+  - MIT
+  - Apache-2.0
+version: "0.4.1"
+keywords:
+  - vulnerability-scanner
+  - cve
+  - sbom
+  - sarif
+  - rust
