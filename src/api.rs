@@ -264,6 +264,9 @@ pub struct ThreatEntry {
     /// derived from `risk_score`, KEV, EPSS and exposure. `None` until scored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision:              Option<String>,
+    /// Why the decision overrides the score (an exploited finding with no fix coming).
+    #[serde(rename = "decisionReason", default, skip_serializing_if = "Option::is_none")]
+    pub decision_reason:       Option<String>,
     /// The Radar decision ledger's entry for this finding (`--respect-decisions`).
     #[serde(rename = "recordedDecision", default, skip_serializing_if = "Option::is_none")]
     pub recorded_decision:     Option<RecordedDecision>,
@@ -292,11 +295,22 @@ fn exploit_points(maturity: Option<&str>) -> i64 {
 
 /// Highest score reachable without KEV is 77, so act-now stays reachable without it.
 const ACT_NOW_SCORE: u32 = 74;
+/// `EOL_REASON` in server/utils/riskScore.js.
+pub const EOL_REASON: &str = "no fixes will come: replace or isolate";
+
+/// A finding's score, decision and, when end of life forced act-now, why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Risk {
+    pub score: u32,
+    pub decision: &'static str,
+    pub reason: Option<&'static str>,
+}
 
 /// Exposure-aware risk score (0..=100) and SSVC decision for a finding on an
-/// asset with this `exposure` (`public`|`private`|`loopback`|`none`). Mirrors
-/// `computeRiskScore` in server/utils/riskScore.js term for term.
-pub fn compute_risk(t: &ThreatEntry, exposure: &str) -> (u32, String) {
+/// asset with this `exposure` (`public`|`private`|`loopback`|`none`). `eol`: no
+/// fix will reach the asset's release. Mirrors `computeRiskScore` in
+/// server/utils/riskScore.js term for term.
+pub fn compute_risk(t: &ThreatEntry, exposure: &str, eol: bool) -> Risk {
     let cvss = t.cvss_num();
     let sev = match severity_rank(t.severity.as_deref()) {
         4 => 40,
@@ -325,7 +339,8 @@ pub fn compute_risk(t: &ThreatEntry, exposure: &str) -> (u32, String) {
     let score = raw.round().clamp(0.0, 100.0) as u32;
 
     let exposed = exposure == "public" || exposure == "private";
-    let decision = if (t.kev && exposed && t.confirmed) || score >= ACT_NOW_SCORE {
+    let eol_exploited = eol && (t.kev || t.exploited_outside_kev) && t.confirmed;
+    let decision = if eol_exploited || (t.kev && exposed && t.confirmed) || score >= ACT_NOW_SCORE {
         "act-now"
     } else if score >= 58 || (t.kev && t.confirmed) || (epss >= 0.5 && exposed) {
         "soon"
@@ -334,7 +349,7 @@ pub fn compute_risk(t: &ThreatEntry, exposure: &str) -> (u32, String) {
     } else {
         "track"
     };
-    (score, decision.to_string())
+    Risk { score, decision, reason: eol_exploited.then_some(EOL_REASON) }
 }
 
 impl ThreatEntry {
@@ -346,12 +361,13 @@ impl ThreatEntry {
         self.cvss_score.as_ref().and_then(|v| v.as_f64()).unwrap_or(0.0)
     }
 
-    /// Compute and store the exposure-aware `risk_score`/`decision` for this
-    /// finding given the owning asset's `exposure` (reachability string). Idempotent.
-    pub fn apply_risk(&mut self, exposure: &str) {
-        let (score, decision) = compute_risk(self, exposure);
-        self.risk_score = Some(score);
-        self.decision = Some(decision);
+    /// Compute and store `risk_score`/`decision` for this finding given the owning
+    /// asset's `exposure` and whether no fix reaches its release. Idempotent.
+    pub fn apply_risk(&mut self, exposure: &str, eol: bool) {
+        let risk = compute_risk(self, exposure, eol);
+        self.risk_score = Some(risk.score);
+        self.decision = Some(risk.decision.to_string());
+        self.decision_reason = risk.reason.map(str::to_string);
     }
 
     /// A recorded decision silences this finding.
@@ -1427,7 +1443,7 @@ impl ScanFinding {
             ..Default::default()
         };
         if e.risk_score.is_none() || e.decision.is_none() {
-            e.apply_risk("none");
+            e.apply_risk("none", false);
         }
         e
     }
@@ -1928,12 +1944,13 @@ mod tests {
         assert_eq!(v["cwes"], json!(["CWE-77"]));
     }
 
-    fn risk(sev: Option<&str>, cvss: f64, epss: Option<f64>, kev: bool, exposure: &str, confirmed: bool) -> (u32, String) {
+    fn risk(sev: Option<&str>, cvss: f64, epss: Option<f64>, kev: bool, exposure: &str, confirmed: bool) -> (u32, &'static str) {
         let t = ThreatEntry {
             severity: sev.map(str::to_string), cvss_score: Some(json!(cvss)), epss, kev, confirmed,
             ..Default::default()
         };
-        compute_risk(&t, exposure)
+        let r = compute_risk(&t, exposure, false);
+        (r.score, r.decision)
     }
 
     #[test]
@@ -1988,16 +2005,16 @@ mod tests {
         let base = ThreatEntry { severity: Some("high".into()), confirmed: true, ..Default::default() };
         // 30 + WEAPONIZED 10 = 40
         let t = ThreatEntry { exploit_maturity: Some("WEAPONIZED".into()), ..base.clone() };
-        assert_eq!(compute_risk(&t, "none").0, 40);
+        assert_eq!(compute_risk(&t, "none", false).score, 40);
         // 30 + PoC 3 = 33
         let t = ThreatEntry { exploit_maturity: Some("POC_LOW".into()), ..base.clone() };
-        assert_eq!(compute_risk(&t, "none").0, 33);
+        assert_eq!(compute_risk(&t, "none", false).score, 33);
         // EUVD/Mirage only: 30 + 15 = 45
         let t = ThreatEntry { exploited_outside_kev: true, ..base.clone() };
-        assert_eq!(compute_risk(&t, "none").0, 45);
+        assert_eq!(compute_risk(&t, "none", false).score, 45);
         // KEV + overdue: 30 + 20 + 5 = 55, and the outside-KEV bonus never stacks on KEV.
         let t = ThreatEntry { kev: true, kev_overdue: true, exploited_outside_kev: true, ..base };
-        assert_eq!(compute_risk(&t, "none").0, 55);
+        assert_eq!(compute_risk(&t, "none", false).score, 55);
     }
 
     #[test]
@@ -2099,7 +2116,7 @@ mod tests {
             "references": []
         })).unwrap();
         assert!(e.risk_score.is_none() && e.decision.is_none());
-        e.apply_risk("public");
+        e.apply_risk("public", false);
         assert_eq!(e.risk_score, Some(95));
         assert_eq!(e.decision.as_deref(), Some("act-now"));
         let v = serde_json::to_value(&e).unwrap();
@@ -2232,7 +2249,7 @@ mod tests {
         assert_eq!((e.risk_score, e.decision.as_deref()), (Some(61), Some("soon")), "server score kept");
         assert_eq!(e.radar_url.as_deref(), Some("https://radar.offseq.com/threat/x"));
         assert_eq!(e.fixed_versions, vec!["4.17.21".to_string()]);
-        assert_eq!(lodash[1].risk_score, Some(compute_risk(&lodash[1], "none").0), "local fallback");
+        assert_eq!(lodash[1].risk_score, Some(compute_risk(&lodash[1], "none", false).score), "local fallback");
 
         assert_eq!(r.unconfirmed["pkg:npm/qs@6.0.0"][0].cve_id.as_deref(), Some("CVE-2022-1"));
         assert_eq!(r.assets["pkg:npm/lodash@4.17.20"].upgrade_to.as_deref(), Some("4.17.21"));

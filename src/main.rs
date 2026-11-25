@@ -479,7 +479,7 @@ fn score_findings(results: &mut BatchResults) {
     for (key, entries) in results.services.iter_mut().chain(results.unconfirmed.iter_mut()) {
         let exposure = exposures.get(key).map(String::as_str).unwrap_or("none");
         for e in entries.iter_mut() {
-            e.apply_risk(exposure);
+            e.apply_risk(exposure, false);
         }
     }
 }
@@ -1410,7 +1410,7 @@ mod tests {
         };
         // low/no-kev (track), critical+kev (act-now), medium (track/schedule).
         let mut entries = vec![mk("CVE-LOW", "low", false), mk("CVE-CRIT", "critical", true), mk("CVE-MED", "medium", false)];
-        for e in &mut entries { e.apply_risk("public"); }
+        for e in &mut entries { e.apply_risk("public", false); }
         let mut services = std::collections::BTreeMap::new();
         services.insert("svc@1".to_string(), entries);
         let mut results = BatchResults {
