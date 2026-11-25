@@ -10,7 +10,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use tracing::{error, warn};
 
 use find_threats::{
-    auth, logging, sarif, scan,
+    auth, git, logging, sarif, scan,
     ScanScope,
     engine::*,
     ThreatClient,
@@ -26,6 +26,8 @@ use find_threats::{
     Asset,
     plan_info,
     scan_body,
+    files_body,
+    ScanFile,
     QuotaExceeded,
     FREE_BATCH,
     FREE_REQUESTS_PER_DAY,
@@ -58,6 +60,37 @@ enum FailOn {
     Exposed,
     /// Assets or the OS past their end of life (runs the --eol lookup)
     Eol,
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    New,
+    All,
+}
+
+impl Gate {
+    fn as_str(self) -> &'static str {
+        match self {
+            Gate::New => "new",
+            Gate::All => "all",
+        }
+    }
+}
+
+impl FailOn {
+    /// The `failOn` Radar's `/scan` gate understands, when it has this one.
+    fn server_value(self) -> Option<&'static str> {
+        match self {
+            FailOn::Critical => Some("critical"),
+            FailOn::High => Some("high"),
+            FailOn::Medium => Some("medium"),
+            FailOn::Low => Some("low"),
+            FailOn::Kev => Some("kev"),
+            FailOn::Exploited => Some("exploited"),
+            FailOn::ActNow => Some("act-now"),
+            FailOn::Any | FailOn::Exposed | FailOn::Eol => None,
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -144,8 +177,20 @@ struct Cli {
 
     /// Scan this SBOM or lockfile (CycloneDX, SPDX, purl list, npm/yarn/pnpm, Cargo,
     /// Poetry, uv, Go, Composer, Gemfile, requirements) instead of the host. One request.
+    /// Repeat it to scan several files in one request.
     #[arg(long, value_name = "FILE", conflicts_with_all = ["register", "unregister", "respect_decisions", "vex", "scope", "include", "exclude", "windows_missing_updates"])]
-    sbom: Option<PathBuf>,
+    sbom: Vec<PathBuf>,
+
+    /// Compare each --sbom file with its version at the merge base of REF and
+    /// HEAD, so the gate counts only findings the change introduces;
+    /// .github/radar.yml is read at REF
+    #[arg(long, value_name = "REF", requires = "sbom")]
+    base_ref: Option<String>,
+
+    /// Which --sbom findings the gate counts: new (introduced by the change; the
+    /// default with --base-ref) or all
+    #[arg(long, value_enum, value_name = "SCOPE", requires = "sbom")]
+    gate: Option<Gate>,
 
     /// Look up the end-of-life status of each asset and the OS release
     /// (endoflife.date via Radar; one extra request)
@@ -376,8 +421,15 @@ fn print_summary(results: &BatchResults, color: bool) {
         for t in threats.iter().take(5) {
             let cve = t.cve_id.as_deref().or(t.id.as_deref()).unwrap_or("(no id)");
             let mut kev = signal_badges(t, color);
-            if let Some(d) = t.recorded_decision.as_ref().filter(|d| d.suppressing) {
-                kev += &format!(" {}", paint(&format!("[DECIDED {}]", d.verdict.to_uppercase()), "32", color));
+            if t.is_new == Some(true) {
+                kev += &format!(" {}", paint("[NEW]", "1;33", color));
+            }
+            let verdict = t.recorded_decision.as_ref().filter(|d| d.suppressing).map(|d| d.verdict.as_str())
+                .or_else(|| t.suppression.as_ref().and_then(|s| s["verdict"].as_str()));
+            if let Some(v) = verdict {
+                kev += &format!(" {}", paint(&format!("[DECIDED {}]", v.to_uppercase()), "32", color));
+            } else if t.suppression.is_some() {
+                kev += &format!(" {}", paint("[IGNORED]", "32", color));
             }
             let title: String = t.title.as_deref().unwrap_or("").chars().take(72).collect();
             // Concrete fix versions turn "vulnerable" into "upgrade to X".
@@ -433,7 +485,8 @@ fn print_summary(results: &BatchResults, color: bool) {
     );
     let decided = rows.iter().flat_map(|r| r.2.iter()).filter(|t| t.suppressed()).count();
     if decided > 0 {
-        println!("{}", paint(&format!("{decided} of them decided in the Radar ledger (not counted by --fail-on)."), "2", color));
+        let by = if results.scan.is_some() { "suppressed by a Radar decision or radar.yml" } else { "decided in the Radar ledger" };
+        println!("{}", paint(&format!("{decided} of them {by} (not counted by --fail-on)."), "2", color));
     }
     let unconfirmed: usize = results.unconfirmed.values().map(|v| v.len()).sum();
     if unconfirmed > 0 {
@@ -478,8 +531,27 @@ fn print_eol(results: &BatchResults, color: bool) {
     }
 }
 
-/// Whether the configured --fail-on threshold is met by any finding.
-fn fail_triggered(results: &BatchResults, fail_on: FailOn, floor: Option<Severity>) -> bool {
+/// Per-file modes, what the change introduces and resolves, and Radar's gate.
+fn print_scan(scan: &find_threats::ScanOverview, color: bool) {
+    let resolved: usize = scan.resolved.values().map(Vec::len).sum();
+    if scan.files.iter().any(|f| f["mode"] != "full") {
+        println!("\n{}", paint(&format!("Change: {} new, {resolved} resolved, {} suppressed.", scan.new, scan.suppressed), "1", color));
+        for (purl, entries) in &scan.resolved {
+            for t in entries {
+                let id = t.cve_id.as_deref().or(t.id.as_deref()).unwrap_or("(no id)");
+                println!("  {} {id}  {purl}", paint("resolved", "32", color));
+            }
+        }
+    }
+    if let Some(g) = &scan.gate {
+        let (state, code) = if g.tripped { ("tripped", "1;31") } else if g.incomplete { ("incomplete", "1;33") } else { ("passed", "32") };
+        println!("Gate (failOn {}, {} findings): {} with {} counted.", g.fail_on, g.scope, paint(state, code, color), g.counted);
+    }
+}
+
+/// Whether the configured --fail-on threshold is met by any finding (`new_only`:
+/// only findings a --base-ref change introduces).
+fn fail_triggered(results: &BatchResults, fail_on: FailOn, floor: Option<Severity>, new_only: bool) -> bool {
     let floor = severity_floor(floor);
     let hit = |t: &ThreatEntry, exposed: bool| match fail_on {
         FailOn::Any      => sev_rank(t.severity.as_deref()) >= floor,
@@ -498,7 +570,7 @@ fn fail_triggered(results: &BatchResults, fail_on: FailOn, floor: Option<Severit
     }
     for (key, threats) in &results.services {
         let exposed = results.assets.get(key).map(|a| a.exposed).unwrap_or(false);
-        if threats.iter().any(|t| !t.suppressed() && hit(t, exposed)) {
+        if threats.iter().any(|t| !t.suppressed() && !(new_only && t.is_new == Some(false)) && hit(t, exposed)) {
             return true;
         }
     }
@@ -747,13 +819,13 @@ fn main() -> ExitCode {
     // Flushes the log on drop; must outlive the run.
     let _log_guard = logging::init(cli.verbose);
 
-    if cli.sbom.is_some() && cli.fail_on == Some(FailOn::Eol) {
+    if !cli.sbom.is_empty() && cli.fail_on == Some(FailOn::Eol) {
         use clap::CommandFactory;
         Cli::command().error(clap::error::ErrorKind::ArgumentConflict, "--fail-on eol needs a host scan, not --sbom").exit();
     }
 
     let os = detect_os();
-    if let (None, OsType::Unsupported(name)) = (&cli.sbom, &os) {
+    if let (true, OsType::Unsupported(name)) = (cli.sbom.is_empty(), &os) {
         error!(os = %name, "unsupported OS; nothing to scan");
         eprintln!("Unsupported OS: {name}. Nothing to scan.");
         return ExitCode::from(3);
@@ -821,23 +893,36 @@ fn main() -> ExitCode {
     let want_eol = cli.eol || cli.fail_on == Some(FailOn::Eol);
     let mut eol_failed = want_eol;
 
-    let (mut final_results, assets, system_info, quota) = if let Some(path) = &cli.sbom {
-        let content = match fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[!] Couldn't read '{}': {e}", path.display());
-                return ExitCode::from(1);
+    let (mut final_results, assets, system_info, quota) = if !cli.sbom.is_empty() {
+        let multi = cli.sbom.len() > 1 || cli.base_ref.is_some() || cli.gate.is_some();
+        let (body, label, shown) = if multi {
+            let n = cli.sbom.len();
+            match sbom_files_body(&cli) {
+                Ok(b) => (b, format!("{n} file(s)"), format!("{n} file(s)")),
+                Err(msg) => {
+                    eprintln!("[!] {msg}");
+                    return ExitCode::from(1);
+                }
+            }
+        } else {
+            let path = &cli.sbom[0];
+            let content = match fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[!] Couldn't read '{}': {e}", path.display());
+                    return ExitCode::from(1);
+                }
+            };
+            let filename = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            match scan_body(&content, &filename, cli.strict) {
+                Ok(b) => (b, filename, path.display().to_string()),
+                Err(msg) => {
+                    eprintln!("[!] {msg}");
+                    return ExitCode::from(1);
+                }
             }
         };
-        let filename = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-        let body = match scan_body(&content, &filename, cli.strict) {
-            Ok(b) => b,
-            Err(msg) => {
-                eprintln!("[!] {msg}");
-                return ExitCode::from(1);
-            }
-        };
-        let pb = spinner(&format!("Scanning {filename} against OffSeq Radar…"), cli.quiet);
+        let pb = spinner(&format!("Scanning {label} against OffSeq Radar…"), cli.quiet);
         let scanned = client.scan(body);
         if let Some(pb) = pb { pb.finish_and_clear(); }
         let report = match scanned {
@@ -845,13 +930,29 @@ fn main() -> ExitCode {
             Err(ThreatError::BatchTooLarge(cap)) => {
                 let cap = cap.map(|n| format!(" ({n})")).unwrap_or_default();
                 warn!("SBOM exceeds the plan's packages-per-scan cap{cap}");
-                eprintln!("{filename} has more packages than your plan checks per scan{cap}. Split the file, or upgrade: https://radar.offseq.com/pricing");
+                let what = if multi { "This change has" } else { &format!("{label} has") };
+                eprintln!("{what} more packages than your plan checks per scan{cap}. Split the file, or upgrade: https://radar.offseq.com/pricing");
                 return ExitCode::from(4);
             }
             Err(e) => return lookup_failed(e, "SBOM scan"),
         };
-        say!("\nScanned {} package(s) from {} ({}).\n", report.packages, path.display(), report.format);
-        (report.into_results(&sbom_location(path), sev_floor), Vec::new(), None, None)
+        say!("\nScanned {} package(s) from {shown} ({}).\n", report.packages, report.format);
+        let source = (!multi).then(|| sbom_location(&cli.sbom[0]));
+        let results = report.into_results(source.as_deref(), sev_floor);
+        if let Some(scan) = &results.scan {
+            for f in &scan.files {
+                if let Some(err) = f["baseError"].as_str() {
+                    eprintln!("[!] {}: {err} Every finding in it counts as new.", f["filename"].as_str().unwrap_or("file"));
+                }
+            }
+            if !scan.excluded.is_empty() {
+                say!("radar.yml paths.exclude skipped: {}", scan.excluded.join(", "));
+            }
+            if let Some(e) = scan.existing.as_ref().filter(|e| e["evaluated"] == false) {
+                eprintln!("[!] {} unchanged package(s) not evaluated: the change plus them exceed your plan's packages per scan.", e["packages"]);
+            }
+        }
+        (results, Vec::new(), None, None)
     } else {
         say!("\nDetected OS: {}\n", os_label(&os));
 
@@ -969,7 +1070,7 @@ fn main() -> ExitCode {
     let human_output = !to_stdout && !cli.quiet;
     let interactive_human = interactive && human_output;
     let prompt_mode = auth::monitoring_prompt_mode();
-    let mut action = register_action(cli.no_register || cli.sbom.is_some() || quota.is_some(), cli.register, &prompt_mode, interactive_human);
+    let mut action = register_action(cli.no_register || !cli.sbom.is_empty() || quota.is_some(), cli.register, &prompt_mode, interactive_human);
 
     // If we'd prompt, ask now and fold the answer back into the action.
     if action == RegisterAction::Prompt {
@@ -1114,6 +1215,9 @@ fn main() -> ExitCode {
     if !cli.quiet && !to_stdout {
         print_summary(&final_results, color);
         print_eol(&final_results, color);
+        if let Some(scan) = &final_results.scan {
+            print_scan(scan, color);
+        }
     }
 
     let total = final_results.total_vulns();
@@ -1179,13 +1283,22 @@ fn main() -> ExitCode {
         return quota_exhausted(q, "Lookup");
     }
 
-    if let Some(f) = cli.fail_on {
-        if fail_triggered(&final_results, f, cli.severity) {
-            tracing::info!(threshold = ?f, "run finished; --fail-on threshold met");
-            return ExitCode::from(5);
-        }
+    // Radar's /scan gate (from --fail-on or radar.yml) and the local one agree on scope.
+    let overview = final_results.scan.as_ref();
+    let gate = overview.and_then(|s| s.gate.as_ref());
+    let new_only = gate.map_or(cli.gate.map_or(cli.base_ref.is_some(), |g| g == Gate::New), |g| g.scope == "new");
+    if gate.is_some_and(|g| g.tripped) || cli.fail_on.is_some_and(|f| fail_triggered(&final_results, f, cli.severity, new_only)) {
+        tracing::info!(threshold = ?cli.fail_on, "run finished; --fail-on threshold met");
+        return ExitCode::from(5);
+    }
+    if cli.fail_on.is_some() || gate.is_some() {
+        let unevaluated = match gate {
+            Some(g) => g.incomplete,
+            None => !final_results.errors.is_empty() || !final_results.incomplete.is_empty()
+                || (!new_only && overview.and_then(|s| s.existing.as_ref()).is_some_and(|e| e["evaluated"] == false)),
+        };
         // A gate that could not see every asset must not pass.
-        if !final_results.errors.is_empty() || !final_results.incomplete.is_empty() || (f == FailOn::Eol && eol_failed) {
+        if unevaluated || (cli.fail_on == Some(FailOn::Eol) && eol_failed) {
             eprintln!("[!] --fail-on could not evaluate every asset; failing the run.");
             return ExitCode::from(1);
         }
@@ -1218,6 +1331,31 @@ fn quota_exhausted(q: QuotaExceeded, what: &str) -> ExitCode {
     warn!(message = %q.message, "rate limit exceeded: {what}");
     auth::prompt_upgrade(Some(&q.message), q.checkout.as_deref());
     ExitCode::from(4)
+}
+
+/// The multi-file `/scan` body; with --base-ref each file carries its base side
+/// and radar.yml comes from the base ref.
+fn sbom_files_body(cli: &Cli) -> Result<Vec<u8>, String> {
+    let base = cli.base_ref.as_deref().map(|r| git::BaseRef::open(Path::new("."), r)).transpose()?;
+    if let (Some(b), Some(r)) = (&base, &cli.base_ref) {
+        if b.no_merge_base {
+            eprintln!("[!] No merge base of {r} and HEAD (shallow clone?); comparing with {r} itself.");
+        }
+    }
+    let mut files = Vec::with_capacity(cli.sbom.len());
+    for path in &cli.sbom {
+        let content = fs::read_to_string(path).map_err(|e| format!("Couldn't read '{}': {e}", path.display()))?;
+        files.push(match &base {
+            Some(b) => {
+                let rel = b.repo_path(path)?;
+                let at_base = b.file(&rel)?;
+                ScanFile::new(rel, content, Some(at_base))
+            }
+            None => ScanFile::new(sbom_location(path), content, None),
+        });
+    }
+    let config = base.as_ref().map(git::BaseRef::config).transpose()?.flatten();
+    files_body(&files, config.as_deref(), cli.fail_on.and_then(FailOn::server_value), cli.gate.map(Gate::as_str), cli.strict)
 }
 
 /// Where SARIF locates SBOM findings: the path relative to the current directory
@@ -1532,12 +1670,12 @@ mod tests {
             services: std::collections::BTreeMap::from([("svc@1".to_string(), vec![decided])]),
             ..Default::default()
         };
-        assert!(!fail_triggered(&results, FailOn::Kev, None));
+        assert!(!fail_triggered(&results, FailOn::Kev, None, false));
         let v: serde_json::Value = serde_json::from_str(&sarif::to_sarif(&results)).unwrap();
         assert_eq!(v["runs"][0]["results"][0]["suppressions"][0]["justification"], "accept");
 
         results.services.get_mut("svc@1").unwrap()[0].recorded_decision.as_mut().unwrap().suppressing = false;
-        assert!(fail_triggered(&results, FailOn::Kev, None));
+        assert!(fail_triggered(&results, FailOn::Kev, None, false));
     }
 
     #[test]
@@ -1591,25 +1729,55 @@ mod tests {
             })]),
             ..Default::default()
         };
-        assert!(!fail_triggered(&results, FailOn::Eol, None), "near-eol never trips");
+        assert!(!fail_triggered(&results, FailOn::Eol, None, false), "near-eol never trips");
         score_findings(&mut results);
         assert_eq!(results.services["node@18.20.4"][0].decision.as_deref(), Some("soon"));
 
         results.assets.get_mut("node@18.20.4").unwrap().eol = Some(eol("eol"));
-        assert!(fail_triggered(&results, FailOn::Eol, None));
+        assert!(fail_triggered(&results, FailOn::Eol, None, false));
         score_findings(&mut results);
         let t = &results.services["node@18.20.4"][0];
         assert_eq!((t.decision.as_deref(), t.decision_reason.as_deref()), (Some("act-now"), Some(EOL_REASON)));
 
         results.assets.get_mut("node@18.20.4").unwrap().eol = None;
-        assert!(!fail_triggered(&results, FailOn::Eol, None));
+        assert!(!fail_triggered(&results, FailOn::Eol, None, false));
         results.os_eol = Some(eol("eol"));
-        assert!(fail_triggered(&results, FailOn::Eol, None), "the OS release counts");
+        assert!(fail_triggered(&results, FailOn::Eol, None, false), "the OS release counts");
 
         let v: serde_json::Value = serde_json::from_str(&sarif::to_sarif(&results)).unwrap();
         let eol_result = v["runs"][0]["results"].as_array().unwrap().iter().find(|r| r["ruleId"] == "EOL").unwrap();
         assert_eq!(eol_result["level"], "warning");
         assert_eq!(eol_result["message"]["text"], "os: Node.js 18: end of life since 2025-04-30");
         assert_eq!(eol_result["properties"]["eol"]["status"], "eol");
+    }
+
+    #[test]
+    fn sbom_flags_parse_and_gate_scope_counts_only_new() {
+        let cli = Cli::try_parse_from(["tf", "--sbom", "a.json", "--sbom", "b.lock", "--base-ref", "origin/main", "--gate", "all"]).unwrap();
+        assert_eq!((cli.sbom.len(), cli.base_ref.as_deref(), cli.gate), (2, Some("origin/main"), Some(Gate::All)));
+        assert!(Cli::try_parse_from(["tf", "--base-ref", "main"]).is_err(), "--base-ref needs --sbom");
+        assert!(Cli::try_parse_from(["tf", "--sbom", "a", "--eol"]).is_err());
+        assert_eq!(FailOn::ActNow.server_value(), Some("act-now"));
+        assert_eq!(FailOn::Eol.server_value(), None);
+
+        use find_threats::*;
+        let high = |new: bool| ThreatEntry {
+            cve_id: Some("CVE-1".into()), severity: Some("high".into()), confirmed: true, is_new: Some(new),
+            file: Some("app/package-lock.json".into()), line: Some(7), ..Default::default()
+        };
+        let mut results = BatchResults { services: BTreeMap::from([("pkg:npm/a@1".to_string(), vec![high(false)])]), ..Default::default() };
+        assert!(fail_triggered(&results, FailOn::High, None, false));
+        assert!(!fail_triggered(&results, FailOn::High, None, true), "an existing finding is out of the new-only gate");
+        results.services.get_mut("pkg:npm/a@1").unwrap().push(high(true));
+        assert!(fail_triggered(&results, FailOn::High, None, true));
+        results.services.get_mut("pkg:npm/a@1").unwrap()[1].suppression = Some(serde_json::json!({ "by": "ignore", "reason": "test only" }));
+        assert!(!fail_triggered(&results, FailOn::High, None, true), "radar.yml ignores never trip");
+
+        let v: serde_json::Value = serde_json::from_str(&sarif::to_sarif(&results)).unwrap();
+        let r = &v["runs"][0]["results"][1];
+        assert_eq!(r["locations"][0]["physicalLocation"]["artifactLocation"]["uri"], "app/package-lock.json");
+        assert_eq!(r["locations"][0]["physicalLocation"]["region"]["startLine"], 7);
+        assert_eq!(r["suppressions"][0]["justification"], "test only");
+        assert_eq!(r["properties"]["new"], true);
     }
 }

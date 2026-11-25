@@ -270,6 +270,27 @@ pub struct ThreatEntry {
     /// The Radar decision ledger's entry for this finding (`--respect-decisions`).
     #[serde(rename = "recordedDecision", default, skip_serializing_if = "Option::is_none")]
     pub recorded_decision:     Option<RecordedDecision>,
+    /// SBOM file the finding is in, with its line, dependency flags and the chain
+    /// of names leading to it (multi-file `--sbom` / `--base-ref`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file:                  Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line:                  Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct:                Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev:                   Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path:                  Vec<String>,
+    /// Introduced by the change (`--base-ref`).
+    #[serde(rename = "new", default, skip_serializing_if = "Option::is_none")]
+    pub is_new:                Option<bool>,
+    /// The radar.yml ignore rule or account decision silencing it (`{ by, reason, … }`).
+    #[serde(rename = "suppressed", default, skip_serializing_if = "Option::is_none")]
+    pub suppression:           Option<Value>,
+    /// Radar's version-independent fingerprint of package + vulnerability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint:           Option<String>,
 }
 
 /// Numeric rank for a decision band (higher = more urgent) — used to sort
@@ -372,7 +393,7 @@ impl ThreatEntry {
 
     /// A recorded decision silences this finding.
     pub fn suppressed(&self) -> bool {
-        self.recorded_decision.as_ref().is_some_and(|d| d.suppressing)
+        self.suppression.is_some() || self.recorded_decision.as_ref().is_some_and(|d| d.suppressing)
     }
 
     /// Highest-risk first. Once scored, decision band then risk score dominate
@@ -511,6 +532,9 @@ pub struct BatchResults {
     /// Lifecycle of the host OS release (`--eol`).
     #[serde(rename = "osEol", skip_serializing_if = "Option::is_none")]
     pub os_eol: Option<Eol>,
+    /// Multi-file and diff scans: per-file modes, the change's counts and Radar's gate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan: Option<ScanOverview>,
 }
 
 impl BatchResults {
@@ -1467,19 +1491,121 @@ struct ScanRequest<'a> {
 /// The `/scan` request body, or why the server would reject it.
 pub fn scan_body(content: &str, filename: &str, strict: bool) -> Result<Vec<u8>, String> {
     let body = serde_json::to_vec(&ScanRequest { content, filename, strict }).map_err(|e| e.to_string())?;
-    if body.len() > MAX_SCAN_BODY {
-        return Err(format!(
-            "{filename} is too large to scan: {:.1} MB to send, the server accepts up to {} MB.",
-            body.len() as f64 / 1_048_576.0, MAX_SCAN_BODY / 1_048_576
-        ));
-    }
+    body_problem(&body, filename).or_else(|| line_problem(content, filename)).map_or(Ok(body), Err)
+}
+
+fn body_problem(body: &[u8], what: &str) -> Option<String> {
+    (body.len() > MAX_SCAN_BODY).then(|| format!(
+        "{what} is too large to scan: {:.1} MB to send, the server accepts up to {} MB.",
+        body.len() as f64 / 1_048_576.0, MAX_SCAN_BODY / 1_048_576
+    ))
+}
+
+fn line_problem(content: &str, filename: &str) -> Option<String> {
     let json = content.trim_start().starts_with(['{', '['])
         && serde_json::from_str::<serde::de::IgnoredAny>(content).is_ok();
     // The server measures JavaScript string length, i.e. UTF-16 units.
-    if !json && content.split('\n').any(|l| l.encode_utf16().count() > MAX_SCAN_LINE) {
-        return Err(format!("{filename} has lines longer than {MAX_SCAN_LINE} characters, which the server rejects."));
+    (!json && content.split('\n').any(|l| l.encode_utf16().count() > MAX_SCAN_LINE))
+        .then(|| format!("{filename} has lines longer than {MAX_SCAN_LINE} characters, which the server rejects."))
+}
+
+/// `MAX_FILES` in server/api/v1/scan.js.
+pub const MAX_SCAN_FILES: usize = 50;
+
+#[derive(Serialize)]
+struct BaseContent {
+    content: String,
+}
+
+/// One entry of a multi-file `/scan` body.
+#[derive(Serialize)]
+pub struct ScanFile {
+    filename: String,
+    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base: Option<BaseContent>,
+    #[serde(rename = "isNew", skip_serializing_if = "std::ops::Not::not")]
+    is_new: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    unchanged: bool,
+}
+
+impl ScanFile {
+    /// `base`: `None` outside a diff, `Some(None)` when the file is absent at the
+    /// base, else its content there (identical content is `unchanged`).
+    pub fn new(filename: String, content: String, base: Option<Option<String>>) -> Self {
+        let (base, is_new, unchanged) = match base {
+            None => (None, false, false),
+            Some(None) => (None, true, false),
+            Some(Some(b)) if b == content => (None, false, true),
+            Some(Some(b)) => (Some(BaseContent { content: b }), false, false),
+        };
+        ScanFile { filename, content, base, is_new, unchanged }
     }
-    Ok(body)
+}
+
+#[derive(Serialize)]
+struct FilesRequest<'a> {
+    files: &'a [ScanFile],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config: Option<&'a str>,
+    #[serde(rename = "failOn", skip_serializing_if = "Option::is_none")]
+    fail_on: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gate: Option<&'a str>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    strict: bool,
+}
+
+/// A multi-file `/scan` body (`config`: radar.yml text), or why the server would reject it.
+pub fn files_body(files: &[ScanFile], config: Option<&str>, fail_on: Option<&str>, gate: Option<&str>, strict: bool) -> Result<Vec<u8>, String> {
+    if files.len() > MAX_SCAN_FILES {
+        return Err(format!("{} files given; Radar scans at most {MAX_SCAN_FILES} per request.", files.len()));
+    }
+    if let Some(problem) = files.iter().find_map(|f| line_problem(&f.content, &f.filename)) {
+        return Err(problem);
+    }
+    let body = serde_json::to_vec(&FilesRequest { files, config, fail_on, gate, strict }).map_err(|e| e.to_string())?;
+    body_problem(&body, "This set of files").map_or(Ok(body), Err)
+}
+
+/// `gate` of a `/scan` response: from version-confirmed, unsuppressed findings in scope.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ScanGate {
+    #[serde(rename = "failOn", default)]
+    pub fail_on: String,
+    #[serde(default)]
+    pub tripped: bool,
+    /// A package in scope was not fully evaluated.
+    #[serde(default)]
+    pub incomplete: bool,
+    /// `new` (introduced by the change) or `all`.
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub counted: u64,
+}
+
+/// What a multi-file or diff scan adds to the report.
+#[derive(Debug, Default, Serialize)]
+pub struct ScanOverview {
+    /// Per file: `filename`, `format`, `packages`, `mode` (`full` | `new` | `changed` | `unchanged`), `baseError`.
+    pub files: Vec<Value>,
+    /// Findings the change introduces.
+    pub new: u64,
+    /// Findings the change removes, by purl.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub resolved: BTreeMap<String, Vec<ThreatEntry>>,
+    /// Findings silenced by radar.yml or an account decision.
+    pub suppressed: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate: Option<ScanGate>,
+    /// Unchanged packages: `{ evaluated, packages }`; not evaluated past the plan's cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub existing: Option<Value>,
+    /// Files radar.yml `paths.exclude` skipped.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub excluded: Vec<String>,
 }
 
 /// Decoded `data` of `POST /scan` (server/utils/sbom/report.js).
@@ -1499,6 +1625,24 @@ pub struct ScanReport {
     not_checked: Vec<NotChecked>,
     #[serde(default)]
     truncated: Vec<NotChecked>,
+    #[serde(default)]
+    summary: ScanCounts,
+    #[serde(default)]
+    gate: Option<ScanGate>,
+    #[serde(default)]
+    files: Vec<Value>,
+    #[serde(default)]
+    resolved: Vec<ScanFinding>,
+    #[serde(default)]
+    existing: Option<Value>,
+    #[serde(default)]
+    excluded: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ScanCounts {
+    #[serde(default)] new: u64,
+    #[serde(default)] suppressed: u64,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1522,11 +1666,20 @@ struct ScanFinding {
     #[serde(rename = "matchedRange", default)] matched_range: Option<String>,
     #[serde(rename = "fixedVersions", default)] fixed_versions: Vec<String>,
     #[serde(default)] url: Option<String>,
+    #[serde(default)] file: Option<String>,
+    #[serde(default)] line: Option<u64>,
+    #[serde(default)] direct: Option<bool>,
+    #[serde(default)] dev: Option<bool>,
+    #[serde(default)] path: Vec<String>,
+    #[serde(rename = "new", default)] is_new: Option<bool>,
+    #[serde(default)] suppressed: Option<Value>,
+    #[serde(default)] fingerprint: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct ScanRemediation {
     #[serde(default)] purl: String,
+    #[serde(default)] file: Option<String>,
     #[serde(default)] version: Option<String>,
     #[serde(rename = "upgradeTo", default)] upgrade_to: Option<String>,
 }
@@ -1538,7 +1691,9 @@ struct NotChecked {
 }
 
 impl ScanFinding {
-    fn into_entry(self) -> ThreatEntry {
+    /// `located`: keep where the finding sits (multi-file scans; a single-file
+    /// report stays as it was).
+    fn into_entry(self, located: bool) -> ThreatEntry {
         let kev_due_date = self.kev_due_date.map(|d| d.split('T').next().unwrap_or_default().to_string());
         let mut e = ThreatEntry {
             id: self.id,
@@ -1563,6 +1718,16 @@ impl ScanFinding {
             decision: self.decision,
             ..Default::default()
         };
+        if located {
+            e.file = self.file;
+            e.line = self.line;
+            e.direct = self.direct;
+            e.dev = self.dev;
+            e.path = self.path;
+            e.is_new = self.is_new;
+            e.suppression = self.suppressed;
+            e.fingerprint = self.fingerprint;
+        }
         if e.risk_score.is_none() || e.decision.is_none() {
             e.apply_risk("none", false);
         }
@@ -1571,30 +1736,29 @@ impl ScanFinding {
 }
 
 impl ScanReport {
-    /// The report in host-scan shape, keyed by purl, with `source` as each asset's location.
-    pub fn into_results(self, source: &str, severity_floor: u8) -> BatchResults {
+    /// The report in host-scan shape, keyed by purl. `source` locates every asset
+    /// of a single-file scan; without it (multi-file) each finding keeps its file.
+    pub fn into_results(self, source: Option<&str>, severity_floor: u8) -> BatchResults {
+        let located = source.is_none();
         let mut services: BTreeMap<String, Vec<ThreatEntry>> = BTreeMap::new();
         let mut unconfirmed: BTreeMap<String, Vec<ThreatEntry>> = BTreeMap::new();
-        let asset = |purl: &str, version: Option<String>, upgrade_to: Option<String>| AssetInfo {
-            exe: source.to_string(),
+        let asset = |purl: &str, file: Option<String>, version: Option<String>, upgrade_to: Option<String>| AssetInfo {
+            exe: source.map(str::to_string).or(file).unwrap_or_default(),
             version: version.unwrap_or_else(|| purl_version(purl).to_string()),
             version_source: self.format.clone(),
-            exposed: false,
             reachability: "none".to_string(),
-            listeners: Vec::new(),
             upgrade_to,
-            restart_pending: false,
-            eol: None,
+            ..Default::default()
         };
         let mut assets: BTreeMap<String, AssetInfo> = self.remediation.into_iter()
-            .map(|r| (r.purl.clone(), asset(&r.purl, r.version, r.upgrade_to)))
+            .map(|r| (r.purl.clone(), asset(&r.purl, r.file, r.version, r.upgrade_to)))
             .collect();
         for f in self.findings {
             if !assets.contains_key(&f.purl) {
-                assets.insert(f.purl.clone(), asset(&f.purl, None, None));
+                assets.insert(f.purl.clone(), asset(&f.purl, f.file.clone(), None, None));
             }
             let key = f.purl.clone();
-            let e = f.into_entry();
+            let e = f.into_entry(located);
             // Exploited findings are never dropped by the severity floor, as in scan::run_scan.
             if !e.exploited && severity_rank(e.severity.as_deref()) < severity_floor {
                 continue;
@@ -1609,18 +1773,30 @@ impl ScanReport {
         let mut incomplete: Vec<String> = incomplete.into_iter().map(|t| t.purl).collect();
         incomplete.sort();
         incomplete.dedup();
+        let scan = located.then(|| {
+            let mut resolved: BTreeMap<String, Vec<ThreatEntry>> = BTreeMap::new();
+            for f in self.resolved {
+                resolved.entry(f.purl.clone()).or_default().push(f.into_entry(true));
+            }
+            ScanOverview {
+                files: self.files,
+                new: self.summary.new,
+                resolved,
+                suppressed: self.summary.suppressed,
+                gate: self.gate,
+                existing: self.existing,
+                excluded: self.excluded,
+            }
+        });
         BatchResults {
-            meta: Meta::default(),
             services,
-            by_cve: BTreeMap::new(),
             unconfirmed,
             assets,
-            errors: BTreeMap::new(),
             rejected: self.not_checked.into_iter().map(|n| (n.purl, n.reason)).collect(),
             truncated: truncated.into_iter().map(|t| t.purl).collect(),
             incomplete,
-            registration: None,
-            os_eol: None,
+            scan,
+            ..Default::default()
         }
     }
 }
@@ -2361,7 +2537,7 @@ mod tests {
         });
         let report: ScanReport = serde_json::from_value(data).unwrap();
         assert_eq!((report.format.as_str(), report.packages), ("package-lock", 3));
-        let r = report.into_results("deps/package-lock.json", 0);
+        let r = report.into_results(Some("deps/package-lock.json"), 0);
 
         let lodash = &r.services["pkg:npm/lodash@4.17.20"];
         assert_eq!(lodash.len(), 2);
@@ -2389,7 +2565,7 @@ mod tests {
             { "purl": "pkg:npm/b@1", "severity": "low", "kev": false, "confirmed": true },
             { "purl": "pkg:npm/c@1", "severity": "low", "exploited": true, "confirmed": true },
         ] })).unwrap();
-        let r = report.into_results("f", severity_rank(Some("high")));
+        let r = report.into_results(Some("f"), severity_rank(Some("high")));
         assert_eq!(r.services.keys().collect::<Vec<_>>(), ["pkg:npm/a@1", "pkg:npm/c@1"]);
     }
 
@@ -2399,6 +2575,7 @@ mod tests {
         assert_eq!(v, json!({ "content": "pkg:npm/a@1\n", "filename": "purls.txt", "strict": true }));
         let v: Value = serde_json::from_slice(&scan_body("x", "f", false).unwrap()).unwrap();
         assert!(v.get("strict").is_none());
+        assert_eq!(scan_body("x", "f", true).unwrap(), br#"{"content":"x","filename":"f","strict":true}"#);
 
         let long = "a".repeat(MAX_SCAN_LINE + 1);
         assert!(scan_body(&long, "yarn.lock", false).unwrap_err().contains("longer than 4096"));
@@ -2583,7 +2760,7 @@ mod tests {
             ],
             "gate": { "failOn": "high", "tripped": true, "incomplete": true }
         })).unwrap();
-        let r = report.into_results("bom.json", 0);
+        let r = report.into_results(Some("bom.json"), 0);
         assert_eq!(r.assets["pkg:npm/a@1.2.3?x=y"].version, "1.2.3");
         assert_eq!(r.assets["pkg:npm/a@1.2.3?x=y"].exe, "bom.json");
         let ids: Vec<_> = r.unconfirmed["pkg:npm/a@1.2.3?x=y"].iter().map(|e| e.cve_id.as_deref()).collect();
@@ -2592,7 +2769,7 @@ mod tests {
         assert_eq!(r.incomplete, ["pkg:npm/b@1"]);
 
         let bare: ScanReport = serde_json::from_value(json!({ "findings": [] })).unwrap();
-        let r = bare.into_results("f", 0);
+        let r = bare.into_results(Some("f"), 0);
         assert!(r.truncated.is_empty() && r.incomplete.is_empty());
     }
 
@@ -2678,5 +2855,90 @@ mod tests {
         e.apply_risk("none", false);
         assert_eq!(e.decision.as_deref(), Some("soon"));
         assert!(serde_json::to_value(&e).unwrap().get("decisionReason").is_none());
+    }
+
+    fn multi_file_data() -> Value {
+        json!({
+            "format": "multiple", "packages": 4,
+            "findings": [
+                { "purl": "pkg:npm/lodash@4.17.20", "id": "t1", "cveId": "CVE-2021-23337", "severity": "high", "kev": false,
+                  "riskScore": 40, "decision": "schedule", "confirmed": true, "matchBasis": "coordinate",
+                  "file": "app/package-lock.json", "line": 12, "direct": true, "dev": false, "path": ["lodash"],
+                  "fingerprint": "f1", "new": true },
+                { "purl": "pkg:npm/qs@6.0.0", "id": "t2", "cveId": "CVE-2022-24999", "severity": "high", "kev": false,
+                  "riskScore": 40, "decision": "schedule", "confirmed": true, "matchBasis": "coordinate",
+                  "file": "app/package-lock.json", "line": 30, "fingerprint": "f2", "new": false,
+                  "suppressed": { "by": "ignore", "reason": "not reachable" } }
+            ],
+            "remediation": [ { "purl": "pkg:npm/lodash@4.17.20", "version": "4.17.20", "file": "app/package-lock.json", "upgradeTo": "4.17.21" } ],
+            "notChecked": [], "truncated": [],
+            "summary": { "total": 2, "new": 1, "resolved": 1, "suppressed": 1, "files": 2 },
+            "gate": { "failOn": "high", "tripped": true, "incomplete": false, "scope": "new", "counted": 1 },
+            "files": [ { "filename": "app/package-lock.json", "format": "package-lock", "packages": 3, "mode": "changed" },
+                       { "filename": "Cargo.lock", "format": "cargo-lock", "packages": 1, "mode": "unchanged" } ],
+            "resolved": [ { "purl": "pkg:npm/minimist@1.2.5", "id": "t3", "cveId": "CVE-2021-44906", "severity": "critical",
+                            "confirmed": true, "file": "app/package-lock.json", "fingerprint": "f3" } ],
+            "existing": { "evaluated": true, "packages": 1 }
+        })
+    }
+
+    #[test]
+    fn single_file_report_ignores_multi_file_fields() {
+        let report: ScanReport = serde_json::from_value(multi_file_data()).unwrap();
+        let v = serde_json::to_value(report.into_results(Some("deps/package-lock.json"), 0)).unwrap();
+        let lodash = &v["services"]["pkg:npm/lodash@4.17.20"][0];
+        for key in ["file", "line", "direct", "dev", "path", "new", "suppressed", "fingerprint"] {
+            assert!(lodash.get(key).is_none(), "{key} leaked into a single-file report");
+        }
+        assert!(v["services"]["pkg:npm/qs@6.0.0"][0].get("suppressed").is_none());
+        assert!(v.get("scan").is_none());
+        assert_eq!(v["assets"]["pkg:npm/lodash@4.17.20"]["exe"], "deps/package-lock.json");
+    }
+
+    #[test]
+    fn multi_file_report_keeps_locations_diff_and_gate() {
+        let report: ScanReport = serde_json::from_value(multi_file_data()).unwrap();
+        let r = report.into_results(None, 0);
+        let lodash = &r.services["pkg:npm/lodash@4.17.20"][0];
+        assert_eq!((lodash.file.as_deref(), lodash.line, lodash.direct), (Some("app/package-lock.json"), Some(12), Some(true)));
+        assert_eq!((lodash.is_new, lodash.fingerprint.as_deref()), (Some(true), Some("f1")));
+        assert!(!lodash.suppressed());
+        let qs = &r.services["pkg:npm/qs@6.0.0"][0];
+        assert!(qs.suppressed() && qs.is_new == Some(false));
+        assert_eq!(r.assets["pkg:npm/qs@6.0.0"].exe, "app/package-lock.json");
+        let scan = r.scan.as_ref().unwrap();
+        assert_eq!((scan.new, scan.suppressed, scan.files.len()), (1, 1, 2));
+        assert_eq!(scan.resolved["pkg:npm/minimist@1.2.5"][0].cve_id.as_deref(), Some("CVE-2021-44906"));
+        let gate = scan.gate.as_ref().unwrap();
+        assert!(gate.tripped && gate.scope == "new" && gate.counted == 1);
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["services"]["pkg:npm/qs@6.0.0"][0]["suppressed"]["by"], "ignore");
+        assert_eq!(v["scan"]["gate"]["failOn"], "high");
+        assert_eq!(v["scan"]["existing"]["evaluated"], true);
+    }
+
+    #[test]
+    fn files_body_classifies_and_carries_options() {
+        let files = vec![
+            ScanFile::new("a/package-lock.json".into(), "{\"v\":2}".into(), Some(Some("{\"v\":1}".into()))),
+            ScanFile::new("Cargo.lock".into(), "x".into(), Some(Some("x".into()))),
+            ScanFile::new("new/yarn.lock".into(), "y".into(), Some(None)),
+            ScanFile::new("bom.json".into(), "{}".into(), None),
+        ];
+        let body = files_body(&files, Some("failOn: high\n"), Some("act-now"), Some("new"), true).unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["files"][0], json!({ "filename": "a/package-lock.json", "content": "{\"v\":2}", "base": { "content": "{\"v\":1}" } }));
+        assert_eq!(v["files"][1], json!({ "filename": "Cargo.lock", "content": "x", "unchanged": true }));
+        assert_eq!(v["files"][2], json!({ "filename": "new/yarn.lock", "content": "y", "isNew": true }));
+        assert_eq!(v["files"][3], json!({ "filename": "bom.json", "content": "{}" }));
+        assert_eq!((&v["config"], &v["failOn"], &v["gate"], &v["strict"]), (&json!("failOn: high\n"), &json!("act-now"), &json!("new"), &json!(true)));
+
+        let bare: Value = serde_json::from_slice(&files_body(&files[3..], None, None, None, false).unwrap()).unwrap();
+        assert_eq!(bare, json!({ "files": [{ "filename": "bom.json", "content": "{}" }] }));
+
+        let many: Vec<ScanFile> = (0..=MAX_SCAN_FILES).map(|i| ScanFile::new(format!("{i}.txt"), String::new(), None)).collect();
+        assert!(files_body(&many, None, None, None, false).unwrap_err().contains("at most 50"));
+        let long = [ScanFile::new("requirements.txt".into(), "a".repeat(MAX_SCAN_LINE + 1), None)];
+        assert!(files_body(&long, None, None, None, false).unwrap_err().contains("requirements.txt has lines longer"));
     }
 }

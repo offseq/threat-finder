@@ -9,6 +9,7 @@ pub mod api;
 pub mod auth;
 pub mod cpe;
 pub mod engine;
+pub mod git;
 pub mod sarif;
 pub mod logging;
 pub mod scan;

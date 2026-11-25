@@ -107,11 +107,14 @@ fn push_entry(rules: &mut BTreeMap<String, Value>, results: &mut Vec<Value>, ass
     }
 
     let mut location = json!({ "logicalLocations": [{ "fullyQualifiedName": asset, "kind": "module" }] });
-    if let Some(exe) = exe {
+    if let Some(exe) = t.file.as_deref().or(exe) {
         location["physicalLocation"] = json!({
             "artifactLocation": { "uri": artifact_uri(exe) },
-            "region": { "startLine": 1 },
+            "region": { "startLine": t.line.unwrap_or(1) },
         });
+    }
+    if t.is_new == Some(true) {
+        props["new"] = json!(true);
     }
     let mut result = json!({
         "ruleId": id,
@@ -120,8 +123,13 @@ fn push_entry(rules: &mut BTreeMap<String, Value>, results: &mut Vec<Value>, ass
         "locations": [location],
         "properties": props,
     });
-    if let Some(d) = t.recorded_decision.as_ref().filter(|d| d.suppressing) {
-        result["suppressions"] = json!([{ "kind": "external", "status": "accepted", "justification": d.verdict }]);
+    let justification = t.recorded_decision.as_ref().filter(|d| d.suppressing).map(|d| d.verdict.as_str())
+        .or_else(|| t.suppression.as_ref().map(|s| s["reason"].as_str().unwrap_or("radar.yml ignore")));
+    if let Some(j) = justification {
+        result["suppressions"] = json!([{ "kind": "external", "status": "accepted", "justification": j }]);
+    }
+    if let Some(fp) = &t.fingerprint {
+        result["partialFingerprints"] = json!({ "radarFinding/v2": fp });
     }
     results.push(result);
 }
