@@ -962,6 +962,14 @@ pub struct InventoryOs {
     pub distro: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// os-release `ID`, `ID_LIKE` and `UBUNTU_CODENAME`: Radar maps Oracle, Amazon
+    /// and Ubuntu-derived distros to their lifecycle by these.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "idLike", skip_serializing_if = "Option::is_none")]
+    pub id_like: Option<String>,
+    #[serde(rename = "ubuntuCodename", skip_serializing_if = "Option::is_none")]
+    pub ubuntu_codename: Option<String>,
 }
 
 /// One asset in a registration payload. Built only from assets with a real purl,
@@ -2161,7 +2169,10 @@ mod tests {
         let body = RegisterRequest {
             host_id: "h1",
             hostname: Some("web-01"),
-            os: Some(InventoryOs { os_type: Some("linux".into()), distro: Some("ubuntu".into()), version: None }),
+            os: Some(InventoryOs {
+                os_type: Some("linux".into()), distro: Some("ubuntu".into()), version: None,
+                id: Some("linuxmint".into()), id_like: Some("ubuntu debian".into()), ubuntu_codename: Some("jammy".into()),
+            }),
             agent_version: "0.1.4",
             monitor: true,
             assets: &[InventoryAsset {
@@ -2178,6 +2189,9 @@ mod tests {
         // os.version is None → omitted; os.type kept under the wire key "type".
         assert_eq!(v["os"]["type"], json!("linux"));
         assert!(v["os"].get("version").is_none());
+        assert_eq!(v["os"]["id"], json!("linuxmint"));
+        assert_eq!(v["os"]["idLike"], json!("ubuntu debian"));
+        assert_eq!(v["os"]["ubuntuCodename"], json!("jammy"));
         assert_eq!(v["assets"][0]["purl"], json!("pkg:deb/ubuntu/openssl@1.1.1f"));
         assert_eq!(v["assets"][0]["exposure"], json!("public"));
         assert_eq!(v["assets"][0]["runtime"], json!(true));

@@ -591,10 +591,14 @@ fn inventory_os(os: &OsType, sys: Option<&SystemFacts>) -> Option<InventoryOs> {
         }
         _ => Some(sys.kernel_name.clone()),
     };
+    let release = |key| matches!(os, OsType::Linux(_)).then(|| os_release_field(key)).flatten();
     Some(InventoryOs {
         os_type,
         distro: Some(sys.distro_name.clone()).filter(|s| !s.is_empty()),
         version: Some(sys.distro_version.clone()).filter(|s| !s.is_empty()),
+        id: release("ID"),
+        id_like: release("ID_LIKE"),
+        ubuntu_codename: release("UBUNTU_CODENAME"),
     })
 }
 
