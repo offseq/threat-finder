@@ -63,7 +63,7 @@ threat-finder [OPTIONS]
 | `--scope <SCOPE>` | `running` (default) or `all` (+ every installed OS package) |
 | `--severity <LEVEL>` | Only report findings at/above `critical\|high\|medium\|low` |
 | `--strict` | Drop coordinate-unconfirmed findings (report only confirmed) |
-| `--fail-on <WHAT>` | Exit `5` if matching findings exist: `any\|critical\|high\|medium\|low\|kev\|exploited\|act-now\|exposed` |
+| `--fail-on <WHAT>` | Exit `5` if matching findings exist: `any\|critical\|high\|medium\|low\|kev\|exploited\|act-now\|exposed\|eol` |
 | `--sarif <PATH>` | Also write a SARIF 2.1.0 report (for code-scanning UIs) |
 | `--include <GLOB>` / `--exclude <GLOB>` | Filter assets by name glob (repeatable) |
 | `-q, --quiet` | Suppress the banner, progress, and summary |
@@ -74,7 +74,10 @@ threat-finder [OPTIONS]
 | `--no-register` | Don't register or prompt for monitoring this run |
 | `--host-name <NAME>` | Friendly hostname to send with a registration |
 | `--unregister` | Remove this host's inventory from Radar and exit |
-| `--sbom <FILE>` | Scan an SBOM or lockfile instead of the host (one request; never registers) |
+| `--sbom <FILE>` | Scan an SBOM or lockfile instead of the host (repeatable, one request; never registers) |
+| `--base-ref <REF>` | With `--sbom`: gate only on findings the change since `REF` introduces (CI) |
+| `--gate <SCOPE>` | With `--sbom`: `new` (default with `--base-ref`) or `all` findings count for the gate |
+| `--eol` | Look up the end-of-life status of each asset and the OS release (one extra request per batch) |
 | `--respect-decisions` | Keep findings silenced by a recorded Radar decision out of `--fail-on` (needs registration; one extra request) |
 | `--vex <PATH>` | Write this host's decisions as a VEX document (needs registration and a paid plan; one extra request) |
 | `--vex-format <FORMAT>` | `openvex` (default) or `cyclonedx` |
@@ -92,8 +95,9 @@ OFFSEQ_API_KEY=… threat-finder --yes --quiet --fail-on act-now
 
 **Exit codes:** `0` ok · `1` lookup/IO error · `2` no or malformed API key · `3`
 unsupported OS · `4` rate limit/quota, or API access required (upgrade needed) ·
-`5` `--fail-on` threshold met. With `--fail-on`, a run where any lookup failed or
-an asset was left `incomplete` exits `1` rather than passing; packages Radar could
+`5` `--fail-on` threshold met (or the gate of a multi-file `--sbom` scan tripped).
+With `--fail-on`, a run where any lookup failed or an asset was left `incomplete`
+(or `--fail-on eol` without an end-of-life lookup) exits `1` rather than passing; packages Radar could
 not evaluate (listed under `rejected`) don't count as failed lookups. When the
 quota runs out mid-run, the report is still written with what was matched (the
 rest under `errors`), registration is skipped, and the run exits `4`.
@@ -126,7 +130,7 @@ there's no client-side version guessing. Findings are split by the API's
 version can't be confirmed are surfaced separately as **unconfirmed / triage**
 (excluded from the count, `byCve`, and `--fail-on`; drop them with `--strict`).
 Assets with no buildable coordinate fall back to a name search, at most 25 per
-run; the rest are listed under `errors`.
+run; the rest are listed under `rejected`.
 
 **Network-exposure correlation.** Manifest scanners (Trivy, Grype, osv-scanner)
 read package lists; external scanners (Nessus, OpenVAS) need a second host. This
@@ -149,6 +153,19 @@ public-facing, exploited issues float to the top of a noisy host. The formula is
 identical to Radar's server-side score, and appears in `--json` and SARIF
 (`properties`). Each asset also gets Radar's `upgradeTo`: the smallest version
 that fixes every finding on it.
+
+**End of life.** `--eol` asks Radar (`POST /eol/batch`, one request per batch; data from
+[endoflife.date](https://endoflife.date)) for the lifecycle of each asset and of
+the OS release: Oracle Linux, Amazon Linux and Ubuntu derivatives such as Mint or
+Pop!_OS resolve by their os-release identity, and distro packages share their
+release's lifecycle. Components past their end of life, or within your account's
+warning window (90 days by default), are listed in the summary (packages on the
+OS release's lifecycle counted under it), `assets.*.eol` and `osEol` carry the status in JSON, and
+SARIF has an `EOL` result for each. As on the server, an exploited (KEV, EUVD or
+Mirage), confirmed finding on an end-of-life release no fix reaches becomes
+`act-now` with `decisionReason` "no fixes will come: replace or isolate".
+`--fail-on eol` trips on a component past its end of life; an `unknown` or
+near-end-of-life status never does.
 
 ## Continuous monitoring
 
@@ -199,6 +216,30 @@ relative to the current directory (or its name when it is elsewhere). The file
 must stay under 16 MiB once JSON-encoded, and non-JSON files can't have lines over 4,096 characters (checked
 locally before sending). Packages per scan are capped by plan (the same as the
 batch size); a larger file exits `4` with the cap named.
+
+### Several files and pull requests
+
+Repeat `--sbom` to send up to 50 files in one request; findings then carry
+`file`, `line`, `direct`, `dev`, `path` and `fingerprint`, SARIF points at the
+line, and Radar applies your account's recorded decisions (`suppressed`).
+
+With `--base-ref <REF>` each file is compared with its version at the merge base
+of `REF` and `HEAD`, read with `git show`: a file missing there counts as new, an
+identical one as unchanged. `.github/radar.yml` (`failOn`, `gate`, `ignore`,
+`paths.exclude`) is read at `REF` itself, so a change cannot loosen its own gate.
+Findings gain `new`, and the report gains `scan` (each file's `mode`, the `new`,
+`resolved` and `suppressed` counts, Radar's `gate`, and whether unchanged packages
+were `existing.evaluated`). `--gate new` (the default with `--base-ref`) or `all`
+picks which findings the gate counts; `--fail-on` values Radar knows (severities,
+`kev`, `exploited`, `act-now`) are evaluated by Radar, and a radar.yml `failOn`
+gates the run even without `--fail-on`. A gate that tripped exits `5`; one that
+could not evaluate every package in scope exits `1`.
+
+```sh
+# GitHub Actions, on pull_request (fetch-depth: 0, so the base is in the clone)
+threat-finder --yes --sbom package-lock.json --sbom api/Cargo.lock \
+  --base-ref "origin/$GITHUB_BASE_REF" --fail-on act-now --sarif deps.sarif
+```
 
 ## Decisions and VEX
 
@@ -274,10 +315,11 @@ JSON, with deterministic (sorted) keys and no timestamp, so reports diff cleanly
   `cvssScore`, `cvssVector`, `epss`, `kev`, `kevDueDate`, `kevOverdue`, `ransomware`,
   `exploited`, `exploitedOutsideKev`, `exploitMaturity`, `riskScore`, `decision`,
   `confirmed`, `matchedRange`, `matchBasis`, `fixedVersions`, `patchLinks`,
-  `remediation`, `cwes`, `references`, `radarUrl`, and with `--respect-decisions`
-  `recordedDecision`), highest-risk first.
+  `remediation`, `cwes`, `references`, `radarUrl`, `decisionReason`, with
+  `--respect-decisions` `recordedDecision`, and in multi-file scans `file`, `line`,
+  `direct`, `dev`, `path`, `new`, `suppressed`, `fingerprint`), highest-risk first.
 - **`unconfirmed`** — coordinate matches whose version couldn't be confirmed (triage).
-- **`assets`** — `pkg@version` → `{ exe, version, versionSource, exposed, reachability, listeners, upgradeTo, restartPending }`
+- **`assets`** — `pkg@version` → `{ exe, version, versionSource, exposed, reachability, listeners, upgradeTo, restartPending, eol }`
   (`versionSource` = `package-db` | `probe`; `reachability` covers TCP **and** UDP).
 - **`byCve`** — each CVE rolled up across every affected asset ("patch once, fix many").
 - **`errors`** — per-asset lookup failures (including assets left unmatched when
@@ -289,10 +331,16 @@ JSON, with deterministic (sorted) keys and no timestamp, so reports diff cleanly
   they fail `--fail-on` like lookup errors.
 - **`registration`** — present when the run registered the host: `hostId`,
   `monitoring`, `assetCount`, `drift`, `summary`, `newSinceLastCount`, `resolvedCount`.
+- **`osEol`** / **`assets.*.eol`** — with `--eol`: `product`, `label`, `cycle`,
+  `status` (`supported` | `near-eol` | `eol`), `eol` (date), `daysLeft`, `latest`,
+  `lts`, `via`, `link`.
+- **`scan`** — multi-file and `--base-ref` scans: `files`, `new`, `resolved`,
+  `suppressed`, `gate`, `existing`, `excluded`.
 - **`meta`** — `{ tool, version, schemaVersion }` (`schemaVersion` 4).
 
 A SARIF 2.1.0 report (`--sarif`) is also available for code-scanning UIs; each
-result's `properties` carry the risk fields and Radar's `remediation`.
+result's `properties` carry the risk fields and Radar's `remediation`, and
+end-of-life components are `EOL` results.
 
 ## The OffSeq ecosystem
 

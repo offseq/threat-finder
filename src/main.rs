@@ -193,7 +193,7 @@ struct Cli {
     gate: Option<Gate>,
 
     /// Look up the end-of-life status of each asset and the OS release
-    /// (endoflife.date via Radar; one extra request)
+    /// (endoflife.date via Radar; one extra request per batch)
     #[arg(long, conflicts_with = "sbom")]
     eol: bool,
 
@@ -510,24 +510,24 @@ fn eol_badge(e: &Eol, color: bool) -> String {
     }
 }
 
-/// The OS and assets at or near end of life, past ones first.
+/// The OS and assets at or near end of life, past ones first; distro packages
+/// on the OS release's lifecycle are counted under it.
 fn print_eol(results: &BatchResults, color: bool) {
-    let mut rows: Vec<(&str, &Eol)> = results.assets.iter()
-        .filter_map(|(k, a)| Some((k.as_str(), a.eol.as_ref().filter(|e| e.flagged())?)))
-        .collect();
-    rows.sort_by_key(|(k, e)| (!e.is_eol(), e.days_left, *k));
+    let groups = results.eol_groups();
     let os = results.os_eol.as_ref().filter(|e| e.flagged());
-    if os.is_none() && rows.is_empty() {
+    if os.is_none() && groups.is_empty() {
         return;
     }
+    let code = |e: &Eol| if e.is_eol() { "1;31" } else { "1;33" };
     println!("\n{}", paint("End of life (endoflife.date):", "1", color));
     if let Some(e) = os {
-        let code = if e.is_eol() { "1;31" } else { "1;33" };
-        println!("  {}  {}", paint("OS", code, color), e.describe());
+        let on = results.assets.values().filter_map(|a| a.eol.as_ref()).filter(|a| (&a.product, &a.cycle) == (&e.product, &e.cycle)).count();
+        let pkgs = if on > 0 { format!("  ({on} package(s) on it)") } else { String::new() };
+        println!("  {}  {}{pkgs}", paint("OS", code(e), color), e.describe());
     }
-    for (key, e) in rows {
-        let code = if e.is_eol() { "1;31" } else { "1;33" };
-        println!("  {}  {}", paint(key, code, color), e.describe());
+    for (keys, e) in groups {
+        let more = if keys.len() > 1 { format!(" and {} more", keys.len() - 1) } else { String::new() };
+        println!("  {}{more}  {}", paint(keys[0], code(e), color), e.describe());
     }
 }
 
@@ -1749,6 +1749,17 @@ mod tests {
         assert_eq!(eol_result["level"], "warning");
         assert_eq!(eol_result["message"]["text"], "os: Node.js 18: end of life since 2025-04-30");
         assert_eq!(eol_result["properties"]["eol"]["status"], "eol");
+
+        results.os_eol = None;
+        let ubuntu = Eol { product: Some("ubuntu".into()), cycle: Some("20.04".into()), status: "eol".into(), via: Some("distro".into()), ..Default::default() };
+        for k in ["openssl@1", "bash@5", "curl@7"] {
+            results.assets.insert(k.into(), AssetInfo { eol: Some(ubuntu.clone()), ..Default::default() });
+        }
+        let groups = results.eol_groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, vec!["bash@5", "curl@7", "openssl@1"]);
+        results.os_eol = Some(ubuntu);
+        assert!(results.eol_groups().is_empty(), "packages on the OS lifecycle fold into it");
     }
 
     #[test]

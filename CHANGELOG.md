@@ -4,6 +4,51 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0]
+
+### Added
+- `--eol`: the end-of-life status of each asset and of the OS release from
+  Radar's `POST /eol/batch` (endoflife.date data; one extra request per batch). Distro
+  packages share their release's lifecycle, as in Radar's host view, and the OS
+  resolves by its os-release identity (Oracle Linux, Amazon Linux, Ubuntu
+  derivatives by `UBUNTU_CODENAME`) or, on macOS, its version. Shown in the
+  summary (`[EOL]`, `[EOL IN 45D]` and an "End of life" section, packages on the
+  OS release's lifecycle counted under it), in JSON as `assets.*.eol` and
+  `osEol`, and in SARIF as one `EOL` result per product and cycle.
+- `--fail-on eol` trips on an asset or OS release past its end of life; `unknown`
+  and `near-eol` never trip, and a run whose lookup did not complete exits `1`.
+- `--sbom` repeats: up to 50 files go in one `/scan` request. Findings keep
+  `file`, `line`, `direct`, `dev`, `path` and `fingerprint`, SARIF points at the
+  line (with Radar's `radarFinding/v2` fingerprint), and Radar applies the
+  account's recorded decisions (`suppressed`, tagged `[DECIDED …]`/`[IGNORED]`
+  and kept out of `--fail-on`).
+- `--base-ref <REF>`: each `--sbom` file is compared with its version at the
+  merge base of `REF` and `HEAD` (absent there: new; identical: unchanged), and
+  `.github/radar.yml` is read at `REF`, as Radar's GitHub App does. Findings gain
+  `new`; the report gains `scan` (`files`, `new`, `resolved`, `suppressed`,
+  `gate`, `existing`, `excluded`).
+- `--gate new|all` picks which `--sbom` findings the gate counts (`new` by
+  default with `--base-ref`). Radar's gate, from `--fail-on` or a radar.yml
+  `failOn`, sets the exit code: `5` when tripped, `1` when it could not
+  evaluate every package in scope.
+- Registration sends os-release `ID`, `ID_LIKE` and `UBUNTU_CODENAME`
+  (`os.id`, `os.idLike`, `os.ubuntuCodename`), so Radar maps Oracle Linux,
+  Amazon Linux, Linux Mint, Pop!_OS and other derivatives to their lifecycle.
+
+### Changed
+- The risk score mirrors Radar's end-of-life rule: a confirmed finding exploited
+  per KEV, EUVD or Mirage on an end-of-life release that no fixed version
+  reaches is `act-now`, with `decisionReason` "no fixes will come: replace or
+  isolate". Only with `--eol`; a parity test runs `compute_risk` over vectors
+  scored by the server's `riskScore.js`.
+- A single `--sbom` sends the same request and writes the same report as 0.4.2.
+  Every new report field is absent without the new flags, so `schemaVersion`
+  stays 4.
+
+### CI and release
+- Dependencies updated to their latest compatible releases (MSRV 1.89 kept).
+- `CITATION.cff` carries the release version again (it still said 0.4.1).
+
 ## [0.4.2]
 
 ### Fixed

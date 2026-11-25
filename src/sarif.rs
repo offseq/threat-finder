@@ -174,10 +174,10 @@ pub fn to_sarif(results: &BatchResults) -> String {
     if let Some(e) = results.os_eol.as_ref().filter(|e| e.flagged()) {
         push_eol(&mut rules, &mut out, "os", None, e);
     }
-    for (asset, info) in &results.assets {
-        if let Some(e) = info.eol.as_ref().filter(|e| e.flagged()) {
-            push_eol(&mut rules, &mut out, asset, Some(info.exe.as_str()).filter(|x| !x.is_empty()), e);
-        }
+    for (keys, e) in results.eol_groups() {
+        let exe = results.assets.get(keys[0]).map(|a| a.exe.as_str()).filter(|x| !x.is_empty());
+        let name = if keys.len() > 1 { format!("{} and {} more", keys[0], keys.len() - 1) } else { keys[0].to_string() };
+        push_eol(&mut rules, &mut out, &name, exe, e);
     }
 
     let doc = json!({

@@ -14,7 +14,7 @@ url: "https://offseq.com/en/research/threat-finder/"
 license:
   - MIT
   - Apache-2.0
-version: "0.4.1"
+version: "0.5.0"
 keywords:
   - vulnerability-scanner
   - cve

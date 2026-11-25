@@ -538,6 +538,24 @@ pub struct BatchResults {
 }
 
 impl BatchResults {
+    /// Assets at or near end of life, one group per product and cycle (riskiest
+    /// first), leaving out those sharing the OS release's lifecycle.
+    pub fn eol_groups(&self) -> Vec<(Vec<&str>, &Eol)> {
+        let os = self.os_eol.as_ref().map(|e| (&e.product, &e.cycle));
+        let mut groups: Vec<(Vec<&str>, &Eol)> = Vec::new();
+        for (key, e) in self.assets.iter().filter_map(|(k, a)| Some((k.as_str(), a.eol.as_ref().filter(|e| e.flagged())?))) {
+            if os == Some((&e.product, &e.cycle)) {
+                continue;
+            }
+            match groups.iter_mut().find(|(_, g)| (&g.product, &g.cycle) == (&e.product, &e.cycle)) {
+                Some((keys, _)) => keys.push(key),
+                None => groups.push((vec![key], e)),
+            }
+        }
+        groups.sort_by_key(|(keys, e)| (!e.is_eol(), e.days_left, keys[0]));
+        groups
+    }
+
     pub fn total_vulns(&self) -> usize {
         self.services.values().map(|v| v.len()).sum()
     }
@@ -1241,7 +1259,11 @@ impl Eol {
         if matches!(self.via.as_deref(), Some("distro" | "os")) {
             return false;
         }
-        let Some(cycle) = self.cycle.as_deref().map(str::to_ascii_lowercase) else { return false };
+        let Some(mut cycle) = self.cycle.as_deref().map(str::to_ascii_lowercase) else { return false };
+        // A variant ("4.9-lts") is a candidate of its base cycle's versions.
+        if let Some((base, _)) = cycle.split_once('-').filter(|(_, v)| !v.starts_with(|c: char| c.is_ascii_digit())) {
+            cycle = base.to_string();
+        }
         !fixed_versions.iter().any(|v| {
             let v = plain_version(v);
             v.strip_prefix(cycle.as_str()).is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_digit()))
@@ -2841,6 +2863,7 @@ mod tests {
         assert!(!eol("eol", "18", "purl").no_fix(&fixes(&["v18.20.5"])));
         assert!(!eol("eol", "20.04", "distro").no_fix(&fixes(&["1:9.1"])), "a distro fix is scoped to the release");
         assert!(eol("eol", "20.04", "os").no_fix(&[]));
+        assert!(!eol("eol", "4.9-lts", "purl").no_fix(&fixes(&["4.9.5"])), "variant cycles count their base's fixes");
     }
 
     #[test]
