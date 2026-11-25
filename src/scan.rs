@@ -350,6 +350,53 @@ pub fn build_purl(a: &Asset, os: &OsType) -> Option<String> {
     }
 }
 
+/// os-release IDs (and threat-finder distro names) Radar's EOL lookup maps to a
+/// product: the keys of `OS_PRODUCTS` in server/utils/eol/match.js.
+const EOL_OS_VENDORS: &[&str] = &[
+    "debian", "ubuntu", "alpine", "redhat", "rhel", "red hat", "rocky", "almalinux", "alma", "fedora", "amzn",
+    "amazon", "ol", "oracle", "opensuse", "opensuse-leap", "suse", "sles", "linuxmint", "centos",
+];
+
+/// The coordinate Radar's `/eol` resolves to this Linux release, from os-release
+/// fields and the detected distro name, as `osTarget` reads a registered OS:
+/// Ubuntu derivatives follow their Ubuntu base.
+pub fn linux_eol_coordinate(field: impl Fn(&str) -> Option<String>, distro: &str) -> Option<String> {
+    let id = field("ID").unwrap_or_default().to_ascii_lowercase();
+    let like = field("ID_LIKE").unwrap_or_default().to_ascii_lowercase();
+    let (vendor, release) = if id != "ubuntu" && (distro == "ubuntu" || like.split([' ', ',']).any(|l| l == "ubuntu")) {
+        let ubuntu_release = |v: &String| {
+            let (yy, rest) = v.split_once('.').unwrap_or((v, ""));
+            let mm = rest.split('.').next().unwrap_or_default();
+            yy.len() == 2 && yy.bytes().all(|b| b.is_ascii_digit()) && (mm == "04" || mm == "10")
+        };
+        ("ubuntu".to_string(), field("UBUNTU_CODENAME").or_else(|| field("VERSION_ID").filter(ubuntu_release))?)
+    } else {
+        let vendor = [id.as_str(), distro].into_iter().find(|v| EOL_OS_VENDORS.contains(v))?;
+        (vendor.to_string(), field("VERSION_ID")?)
+    };
+    let kind = match vendor.as_str() {
+        "debian" | "ubuntu" => "deb",
+        "alpine" => "apk",
+        _ => "rpm",
+    };
+    Some(format!("pkg:{kind}/{}/os?distro={}", pct(&vendor), pct(&release)))
+}
+
+/// The coordinate of the host OS release for Radar's `/eol`: Linux from
+/// os-release, macOS by its NVD CPE. Windows registers its OS as an asset CPE.
+pub fn os_eol_coordinate(os: &OsType, version: &str) -> Option<String> {
+    match os {
+        OsType::Linux(d) => linux_eol_coordinate(os_release_field, &crate::engine::parse_linux_distro_version(d).0),
+        OsType::MacOs if !version.is_empty() => Some(format!("cpe:2.3:o:apple:mac_os_x:{}:*:*:*:*:*:*:*", escape_cpe(version))),
+        _ => None,
+    }
+}
+
+/// A distro package lives as long as its OS release.
+pub fn is_distro_package(eco: Ecosystem) -> bool {
+    matches!(eco, Ecosystem::Deb | Ecosystem::Rpm | Ecosystem::Alpine | Ecosystem::Arch)
+}
+
 /// Drop the epoch and the packaging revision from a native version, leaving the
 /// upstream release NVD ranges are written against.
 pub fn upstream_version(eco: Ecosystem, version: &str) -> String {
@@ -555,6 +602,31 @@ pub fn run_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_eol_coordinate_maps_like_radar_os_target() {
+        let coord = |release: &str, distro: &str| {
+            let f = crate::engine::parse_os_release(release);
+            linux_eol_coordinate(|k| f.get(k).filter(|v| !v.is_empty()).cloned(), distro)
+        };
+        assert_eq!(coord("ID=ol\nID_LIKE=fedora\nVERSION_ID=9.4", "rhel").as_deref(), Some("pkg:rpm/ol/os?distro=9.4"));
+        assert_eq!(coord("ID=amzn\nVERSION_ID=2023", "rhel").as_deref(), Some("pkg:rpm/amzn/os?distro=2023"));
+        assert_eq!(
+            coord("ID=linuxmint\nID_LIKE=\"ubuntu debian\"\nVERSION_ID=21.3\nUBUNTU_CODENAME=jammy", "ubuntu").as_deref(),
+            Some("pkg:deb/ubuntu/os?distro=jammy")
+        );
+        assert_eq!(coord("ID=pop\nID_LIKE=\"ubuntu debian\"\nVERSION_ID=22.04", "ubuntu").as_deref(), Some("pkg:deb/ubuntu/os?distro=22.04"));
+        assert_eq!(coord("ID=zorin\nID_LIKE=ubuntu\nVERSION_ID=17", "ubuntu"), None, "no Ubuntu base known");
+        assert_eq!(coord("ID=ubuntu\nVERSION_ID=24.04", "ubuntu").as_deref(), Some("pkg:deb/ubuntu/os?distro=24.04"));
+        assert_eq!(coord("ID=alpine\nVERSION_ID=3.20.1", "alpine").as_deref(), Some("pkg:apk/alpine/os?distro=3.20.1"));
+        assert_eq!(coord("ID=eurolinux\nVERSION_ID=9.2", "rhel").as_deref(), Some("pkg:rpm/rhel/os?distro=9.2"));
+        assert_eq!(coord("ID=arch", "arch"), None, "rolling");
+        assert_eq!(coord("ID=debian", "debian"), None, "no release");
+        assert_eq!(
+            os_eol_coordinate(&OsType::MacOs, "14.5").as_deref(),
+            Some("cpe:2.3:o:apple:mac_os_x:14.5:*:*:*:*:*:*:*")
+        );
+    }
 
     fn pkg_asset(name: &str, ver: &str) -> Asset {
         Asset { ecosystem: Ecosystem::Deb, name: name.into(), pkg_name: None, version: ver.into(),

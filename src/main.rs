@@ -1,6 +1,7 @@
 use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 use std::time::Duration;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -16,6 +17,7 @@ use find_threats::{
     ThreatError,
     BatchResults,
     ThreatEntry,
+    Eol,
     InventoryAsset,
     InventoryOs,
     RegisterResponse,
@@ -54,6 +56,8 @@ enum FailOn {
     ActNow,
     /// Only findings on a network-exposed service
     Exposed,
+    /// Assets or the OS past their end of life (runs the --eol lookup)
+    Eol,
 }
 
 #[derive(Parser, Debug)]
@@ -142,6 +146,11 @@ struct Cli {
     /// Poetry, uv, Go, Composer, Gemfile, requirements) instead of the host. One request.
     #[arg(long, value_name = "FILE", conflicts_with_all = ["register", "unregister", "respect_decisions", "vex", "scope", "include", "exclude", "windows_missing_updates"])]
     sbom: Option<PathBuf>,
+
+    /// Look up the end-of-life status of each asset and the OS release
+    /// (endoflife.date via Radar; one extra request)
+    #[arg(long, conflicts_with = "sbom")]
+    eol: bool,
 
     /// Exclude findings silenced by a decision recorded in Radar from --fail-on
     /// (needs registration; one extra request)
@@ -362,7 +371,8 @@ fn print_summary(results: &BatchResults, color: bool) {
         let upgrade = results.assets.get(*key).and_then(|a| a.upgrade_to.as_deref())
             .map(|v| format!("  {}", paint(&format!("→ upgrade to {v} fixes all"), "32", color)))
             .unwrap_or_default();
-        println!("\n  {} — {} finding(s){badge}{upgrade}", paint(key, "1;36", color), threats.len());
+        let eol = results.assets.get(*key).and_then(|a| a.eol.as_ref()).map(|e| eol_badge(e, color)).unwrap_or_default();
+        println!("\n  {} — {} finding(s){badge}{eol}{upgrade}", paint(key, "1;36", color), threats.len());
         for t in threats.iter().take(5) {
             let cve = t.cve_id.as_deref().or(t.id.as_deref()).unwrap_or("(no id)");
             let mut kev = signal_badges(t, color);
@@ -380,6 +390,9 @@ fn print_summary(results: &BatchResults, color: bool) {
             println!("      {band}{}  {cve}{kev}  {title}{fix}", sev_label(t.severity.as_deref(), color));
             if let Some(url) = &t.radar_url {
                 println!("            {}", paint(url, "4;34", color));
+            }
+            if let Some(reason) = &t.decision_reason {
+                println!("            {}", paint(reason, "1;31", color));
             }
             if let Some(rem) = &t.remediation {
                 let hint: String = rem.chars().take(96).collect();
@@ -435,6 +448,36 @@ fn print_summary(results: &BatchResults, color: bool) {
     }
 }
 
+/// `  [EOL]` / `  [EOL IN 45D]` for an asset at or near its end of life.
+fn eol_badge(e: &Eol, color: bool) -> String {
+    match (e.status.as_str(), e.days_left) {
+        ("eol", _) => format!("  {}", paint("[EOL]", "1;31", color)),
+        ("near-eol", Some(d)) => format!("  {}", paint(&format!("[EOL IN {d}D]"), "1;33", color)),
+        _ => String::new(),
+    }
+}
+
+/// The OS and assets at or near end of life, past ones first.
+fn print_eol(results: &BatchResults, color: bool) {
+    let mut rows: Vec<(&str, &Eol)> = results.assets.iter()
+        .filter_map(|(k, a)| Some((k.as_str(), a.eol.as_ref().filter(|e| e.flagged())?)))
+        .collect();
+    rows.sort_by_key(|(k, e)| (!e.is_eol(), e.days_left, *k));
+    let os = results.os_eol.as_ref().filter(|e| e.flagged());
+    if os.is_none() && rows.is_empty() {
+        return;
+    }
+    println!("\n{}", paint("End of life (endoflife.date):", "1", color));
+    if let Some(e) = os {
+        let code = if e.is_eol() { "1;31" } else { "1;33" };
+        println!("  {}  {}", paint("OS", code, color), e.describe());
+    }
+    for (key, e) in rows {
+        let code = if e.is_eol() { "1;31" } else { "1;33" };
+        println!("  {}  {}", paint(key, code, color), e.describe());
+    }
+}
+
 /// Whether the configured --fail-on threshold is met by any finding.
 fn fail_triggered(results: &BatchResults, fail_on: FailOn, floor: Option<Severity>) -> bool {
     let floor = severity_floor(floor);
@@ -448,7 +491,11 @@ fn fail_triggered(results: &BatchResults, fail_on: FailOn, floor: Option<Severit
         FailOn::Exploited => t.exploited,
         FailOn::ActNow   => t.decision.as_deref() == Some("act-now"),
         FailOn::Exposed  => exposed && sev_rank(t.severity.as_deref()) >= floor,
+        FailOn::Eol      => false,
     };
+    if fail_on == FailOn::Eol {
+        return results.os_eol.iter().chain(results.assets.values().filter_map(|a| a.eol.as_ref())).any(Eol::is_eol);
+    }
     for (key, threats) in &results.services {
         let exposed = results.assets.get(key).map(|a| a.exposed).unwrap_or(false);
         if threats.iter().any(|t| !t.suppressed() && hit(t, exposed)) {
@@ -458,30 +505,50 @@ fn fail_triggered(results: &BatchResults, fail_on: FailOn, floor: Option<Severit
     false
 }
 
-/// Score every finding (confirmed + unconfirmed) with the exposure of its owning
-/// asset, so each entry gains `riskScore`/`decision`. Exposure defaults to "none"
-/// for an asset with no recorded reachability.
+/// Score every finding (confirmed + unconfirmed) with its owning asset's
+/// exposure ("none" when unknown) and whether a fix reaches the asset's release.
 fn score_findings(results: &mut BatchResults) {
-    let exposure_of = |key: &str| -> String {
-        results
-            .assets
-            .get(key)
-            .map(|a| a.reachability.clone())
-            .unwrap_or_else(|| "none".to_string())
-    };
-    // Snapshot exposures first to avoid borrowing `results.assets` mutably+immutably.
-    let exposures: std::collections::BTreeMap<String, String> = results
-        .services
-        .keys()
-        .chain(results.unconfirmed.keys())
-        .map(|k| (k.clone(), exposure_of(k)))
-        .collect();
+    let assets = &results.assets;
     for (key, entries) in results.services.iter_mut().chain(results.unconfirmed.iter_mut()) {
-        let exposure = exposures.get(key).map(String::as_str).unwrap_or("none");
+        let asset = assets.get(key);
+        let exposure = asset.map_or("none", |a| a.reachability.as_str());
         for e in entries.iter_mut() {
-            e.apply_risk(exposure, false);
+            let eol = asset.and_then(|a| a.eol.as_ref()).is_some_and(|l| l.no_fix(&e.fixed_versions));
+            e.apply_risk(exposure, eol);
         }
     }
+}
+
+/// The OS release's and each asset's lifecycle, by report key, in one batch.
+/// Distro packages take the OS release's, as Radar's host view does; statuses
+/// Radar cannot tell are dropped.
+fn lookup_eol(client: &ThreatClient, assets: &[Asset], os: &OsType, sys: Option<&SystemFacts>) -> Result<(Option<Eol>, BTreeMap<String, Eol>), ThreatError> {
+    let os_coord = scan::os_eol_coordinate(os, sys.map_or("", |s| s.distro_version.as_str()));
+    let mut coords: Vec<String> = os_coord.iter().cloned().collect();
+    let mut by_key: Vec<(String, String)> = Vec::new();
+    for a in assets {
+        let coord = match &os_coord {
+            Some(c) if scan::is_distro_package(a.ecosystem) => c.clone(),
+            _ => match scan::build_purl(a, os).or_else(|| a.cpe.clone()) {
+                Some(c) => c,
+                None => continue,
+            },
+        };
+        if !coords.contains(&coord) {
+            coords.push(coord.clone());
+        }
+        by_key.push((a.report_key(), coord));
+    }
+    if coords.is_empty() {
+        return Ok((None, BTreeMap::new()));
+    }
+    let results = client.eol_batch(&coords)?;
+    let known: BTreeMap<String, Eol> = coords.into_iter()
+        .zip(results)
+        .filter(|(_, e)| e.status != "unknown")
+        .collect();
+    let os_eol = os_coord.and_then(|c| known.get(&c).cloned());
+    Ok((os_eol, by_key.into_iter().filter_map(|(k, c)| Some((k, known.get(&c)?.clone()))).collect()))
 }
 
 /// The user's answer to the monitoring prompt (only meaningful when we actually
@@ -680,6 +747,11 @@ fn main() -> ExitCode {
     // Flushes the log on drop; must outlive the run.
     let _log_guard = logging::init(cli.verbose);
 
+    if cli.sbom.is_some() && cli.fail_on == Some(FailOn::Eol) {
+        use clap::CommandFactory;
+        Cli::command().error(clap::error::ErrorKind::ArgumentConflict, "--fail-on eol needs a host scan, not --sbom").exit();
+    }
+
     let os = detect_os();
     if let (None, OsType::Unsupported(name)) = (&cli.sbom, &os) {
         error!(os = %name, "unsupported OS; nothing to scan");
@@ -746,6 +818,8 @@ fn main() -> ExitCode {
 
     let client = ThreatClient::new(&api_key);
     let sev_floor = severity_floor(cli.severity);
+    let want_eol = cli.eol || cli.fail_on == Some(FailOn::Eol);
+    let mut eol_failed = want_eol;
 
     let (mut final_results, assets, system_info, quota) = if let Some(path) = &cli.sbom {
         let content = match fs::read_to_string(path) {
@@ -843,21 +917,40 @@ fn main() -> ExitCode {
                 listeners: rt.map(|r| r.listeners.clone()).unwrap_or_default(),
                 upgrade_to: outcome.upgrades.get(&a.report_key()).cloned(),
                 restart_pending: rt.is_some_and(|r| r.restart_pending),
+                eol: None,
             })
         }).collect();
 
         let mut results = BatchResults {
-            meta: find_threats::Meta::default(),
             services: outcome.results,
-            by_cve: std::collections::BTreeMap::new(),
             unconfirmed: outcome.unconfirmed,
             assets: asset_map,
             errors:   outcome.errors,
             rejected: outcome.rejected,
             truncated: outcome.truncated,
             incomplete: outcome.incomplete,
-            registration: None,
+            ..Default::default()
         };
+        if want_eol && outcome.quota.is_none() {
+            let pb = spinner("Looking up end-of-life status…", cli.quiet);
+            let looked_up = lookup_eol(&client, &assets, &os, system_info.as_ref());
+            if let Some(pb) = pb { pb.finish_and_clear(); }
+            match looked_up {
+                Ok((os_eol, by_key)) => {
+                    results.os_eol = os_eol;
+                    for (key, eol) in by_key {
+                        if let Some(a) = results.assets.get_mut(&key) {
+                            a.eol = Some(eol);
+                        }
+                    }
+                    eol_failed = false;
+                }
+                Err(e) => {
+                    warn!(error = %e, "EOL lookup skipped");
+                    eprintln!("[!] End-of-life lookup skipped: {e}");
+                }
+            }
+        }
         // Exposure-aware risk score + SSVC decision per finding, computed from the
         // OWNING asset's reachability so local scores agree with the server's.
         score_findings(&mut results);
@@ -1020,6 +1113,7 @@ fn main() -> ExitCode {
     let color = !cli.no_color && std::env::var_os("NO_COLOR").is_none() && io::stdout().is_terminal();
     if !cli.quiet && !to_stdout {
         print_summary(&final_results, color);
+        print_eol(&final_results, color);
     }
 
     let total = final_results.total_vulns();
@@ -1091,7 +1185,7 @@ fn main() -> ExitCode {
             return ExitCode::from(5);
         }
         // A gate that could not see every asset must not pass.
-        if !final_results.errors.is_empty() || !final_results.incomplete.is_empty() {
+        if !final_results.errors.is_empty() || !final_results.incomplete.is_empty() || (f == FailOn::Eol && eol_failed) {
             eprintln!("[!] --fail-on could not evaluate every asset; failing the run.");
             return ExitCode::from(1);
         }
@@ -1401,7 +1495,7 @@ mod tests {
 
     #[test]
     fn findings_sort_by_decision_then_score() {
-        use find_threats::{BatchResults, Meta, ThreatEntry};
+        use find_threats::{BatchResults, ThreatEntry};
         let mk = |cve: &str, sev: &str, kev: bool| -> ThreatEntry {
             serde_json::from_value(serde_json::json!({
                 "cveId": cve, "severity": sev, "kev": kev,
@@ -1413,13 +1507,7 @@ mod tests {
         for e in &mut entries { e.apply_risk("public", false); }
         let mut services = std::collections::BTreeMap::new();
         services.insert("svc@1".to_string(), entries);
-        let mut results = BatchResults {
-            meta: Meta::default(), services, by_cve: std::collections::BTreeMap::new(),
-            unconfirmed: std::collections::BTreeMap::new(),
-            assets: std::collections::BTreeMap::new(),
-            errors: std::collections::BTreeMap::new(), rejected: std::collections::BTreeMap::new(),
-            truncated: vec![], incomplete: vec![], registration: None,
-        };
+        let mut results = BatchResults { services, ..Default::default() };
         results.sort_findings();
         let v = &results.services["svc@1"];
         // Highest decision/score first.
@@ -1434,18 +1522,15 @@ mod tests {
 
     #[test]
     fn suppressed_findings_skip_fail_on_and_sarif_marks_them() {
-        use find_threats::{BatchResults, Meta, RecordedDecision, ThreatEntry};
+        use find_threats::{BatchResults, RecordedDecision, ThreatEntry};
         let decided = ThreatEntry {
             cve_id: Some("CVE-2024-1".into()), severity: Some("critical".into()), kev: true, confirmed: true,
             recorded_decision: Some(RecordedDecision { verdict: "accept".into(), status: "active".into(), suppressing: true, ..Default::default() }),
             ..Default::default()
         };
         let mut results = BatchResults {
-            meta: Meta::default(),
             services: std::collections::BTreeMap::from([("svc@1".to_string(), vec![decided])]),
-            by_cve: std::collections::BTreeMap::new(), unconfirmed: std::collections::BTreeMap::new(),
-            assets: std::collections::BTreeMap::new(), errors: std::collections::BTreeMap::new(),
-            rejected: std::collections::BTreeMap::new(), truncated: vec![], incomplete: vec![], registration: None,
+            ..Default::default()
         };
         assert!(!fail_triggered(&results, FailOn::Kev, None));
         let v: serde_json::Value = serde_json::from_str(&sarif::to_sarif(&results)).unwrap();
@@ -1467,21 +1552,16 @@ mod tests {
             ("zlib@1.2.11".to_string(), vec![entry]),
         ]);
         let asset = |exe: &str| AssetInfo {
-            exe: exe.into(), version: "1".into(), version_source: "probe".into(), exposed: false,
-            reachability: "none".into(), listeners: vec![], upgrade_to: None, restart_pending: false,
+            exe: exe.into(), version: "1".into(), version_source: "probe".into(), reachability: "none".into(),
+            ..Default::default()
         };
         let results = BatchResults {
-            meta: Meta::default(), services, by_cve: std::collections::BTreeMap::new(),
-            unconfirmed: std::collections::BTreeMap::new(),
+            services,
             assets: std::collections::BTreeMap::from([
                 ("nginx@1.24.0".to_string(), asset("/usr/sbin/nginx")),
                 ("zlib@1.2.11".to_string(), asset("")),
             ]),
-            errors: std::collections::BTreeMap::new(),
-            rejected: std::collections::BTreeMap::new(),
-            truncated: vec![],
-            incomplete: vec![],
-            registration: None,
+            ..Default::default()
         };
         let s = sarif::to_sarif(&results);
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
@@ -1494,5 +1574,42 @@ mod tests {
         let loc = &v["runs"][0]["results"][1]["locations"][0];
         assert!(loc.get("physicalLocation").is_none());
         assert_eq!(loc["logicalLocations"][0]["fullyQualifiedName"], "zlib@1.2.11");
+    }
+
+    #[test]
+    fn eol_gates_scores_and_reports() {
+        use find_threats::*;
+        let eol = |status: &str| Eol {
+            product: Some("nodejs".into()), label: Some("Node.js".into()), cycle: Some("18".into()), status: status.into(),
+            eol: serde_json::json!("2025-04-30"), days_left: Some(-209), via: Some("purl".into()), ..Default::default()
+        };
+        let kev = ThreatEntry { cve_id: Some("CVE-2025-1".into()), severity: Some("low".into()), kev: true, confirmed: true, ..Default::default() };
+        let mut results = BatchResults {
+            services: BTreeMap::from([("node@18.20.4".to_string(), vec![kev])]),
+            assets: BTreeMap::from([("node@18.20.4".to_string(), AssetInfo {
+                exe: "/usr/bin/node".into(), reachability: "loopback".into(), eol: Some(eol("near-eol")), ..Default::default()
+            })]),
+            ..Default::default()
+        };
+        assert!(!fail_triggered(&results, FailOn::Eol, None), "near-eol never trips");
+        score_findings(&mut results);
+        assert_eq!(results.services["node@18.20.4"][0].decision.as_deref(), Some("soon"));
+
+        results.assets.get_mut("node@18.20.4").unwrap().eol = Some(eol("eol"));
+        assert!(fail_triggered(&results, FailOn::Eol, None));
+        score_findings(&mut results);
+        let t = &results.services["node@18.20.4"][0];
+        assert_eq!((t.decision.as_deref(), t.decision_reason.as_deref()), (Some("act-now"), Some(EOL_REASON)));
+
+        results.assets.get_mut("node@18.20.4").unwrap().eol = None;
+        assert!(!fail_triggered(&results, FailOn::Eol, None));
+        results.os_eol = Some(eol("eol"));
+        assert!(fail_triggered(&results, FailOn::Eol, None), "the OS release counts");
+
+        let v: serde_json::Value = serde_json::from_str(&sarif::to_sarif(&results)).unwrap();
+        let eol_result = v["runs"][0]["results"].as_array().unwrap().iter().find(|r| r["ruleId"] == "EOL").unwrap();
+        assert_eq!(eol_result["level"], "warning");
+        assert_eq!(eol_result["message"]["text"], "os: Node.js 18: end of life since 2025-04-30");
+        assert_eq!(eol_result["properties"]["eol"]["status"], "eol");
     }
 }

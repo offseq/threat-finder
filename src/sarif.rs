@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-use crate::api::{severity_rank, BatchResults, ThreatEntry};
+use crate::api::{severity_rank, BatchResults, Eol, ThreatEntry};
 
 fn level(sev: Option<&str>) -> &'static str {
     match severity_rank(sev) {
@@ -84,6 +84,9 @@ fn push_entry(rules: &mut BTreeMap<String, Value>, results: &mut Vec<Value>, ass
     if let Some(decision) = &t.decision {
         props["decision"] = json!(decision);
     }
+    if let Some(reason) = &t.decision_reason {
+        props["decisionReason"] = json!(reason);
+    }
     if let Some(score) = t.risk_score {
         props["riskScore"] = json!(score);
     }
@@ -123,6 +126,32 @@ fn push_entry(rules: &mut BTreeMap<String, Value>, results: &mut Vec<Value>, ass
     results.push(result);
 }
 
+const EOL_RULE: &str = "EOL";
+
+/// A result for an asset (or the OS, with no `exe`) at or near its end of life.
+fn push_eol(rules: &mut BTreeMap<String, Value>, results: &mut Vec<Value>, asset: &str, exe: Option<&str>, e: &Eol) {
+    rules.entry(EOL_RULE.to_string()).or_insert_with(|| json!({
+        "id": EOL_RULE,
+        "name": "EndOfLife",
+        "shortDescription": { "text": "Component at or near its end of life" },
+        "helpUri": "https://endoflife.date",
+    }));
+    let mut location = json!({ "logicalLocations": [{ "fullyQualifiedName": asset, "kind": "module" }] });
+    if let Some(exe) = exe {
+        location["physicalLocation"] = json!({
+            "artifactLocation": { "uri": artifact_uri(exe) },
+            "region": { "startLine": 1 },
+        });
+    }
+    results.push(json!({
+        "ruleId": EOL_RULE,
+        "level": if e.is_eol() { "warning" } else { "note" },
+        "message": { "text": format!("{asset}: {}", e.describe()) },
+        "locations": [location],
+        "properties": { "eol": e },
+    }));
+}
+
 /// Render a full SARIF 2.1.0 document for the report.
 pub fn to_sarif(results: &BatchResults) -> String {
     let mut rules: BTreeMap<String, Value> = BTreeMap::new();
@@ -132,6 +161,14 @@ pub fn to_sarif(results: &BatchResults) -> String {
         let exe = results.assets.get(asset).map(|a| a.exe.as_str()).filter(|e| !e.is_empty());
         for t in entries {
             push_entry(&mut rules, &mut out, asset, exe, t);
+        }
+    }
+    if let Some(e) = results.os_eol.as_ref().filter(|e| e.flagged()) {
+        push_eol(&mut rules, &mut out, "os", None, e);
+    }
+    for (asset, info) in &results.assets {
+        if let Some(e) = info.eol.as_ref().filter(|e| e.flagged()) {
+            push_eol(&mut rules, &mut out, asset, Some(info.exe.as_str()).filter(|x| !x.is_empty()), e);
         }
     }
 

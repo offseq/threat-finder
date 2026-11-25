@@ -394,7 +394,7 @@ impl ThreatEntry {
 
 /// Per-asset metadata: where the version came from, and the network exposure of
 /// the running process (its listeners and whether any is reachable off-host).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct AssetInfo {
     pub exe: String,
     pub version: String,
@@ -411,6 +411,9 @@ pub struct AssetInfo {
     /// The running binary was replaced on disk; the reported version is the new one.
     #[serde(rename = "restartPending", skip_serializing_if = "std::ops::Not::not")]
     pub restart_pending: bool,
+    /// Lifecycle of the asset's release (`--eol`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eol: Option<Eol>,
 }
 
 /// Report envelope metadata (stable across runs — no timestamp, so reports diff).
@@ -474,7 +477,7 @@ impl From<&RegisterResponse> for RegistrationReport {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct BatchResults {
     pub meta: Meta,
     pub services: BTreeMap<String, Vec<ThreatEntry>>,
@@ -505,6 +508,9 @@ pub struct BatchResults {
     /// registered the host for monitoring (drift + new-since-last summary).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub registration: Option<RegistrationReport>,
+    /// Lifecycle of the host OS release (`--eol`).
+    #[serde(rename = "osEol", skip_serializing_if = "Option::is_none")]
+    pub os_eol: Option<Eol>,
 }
 
 impl BatchResults {
@@ -785,51 +791,67 @@ impl ThreatClient {
         queries: &[MatchQuery],
         strict: bool,
     ) -> Result<(Vec<MatchResult>, Option<QuotaExceeded>), ThreatError> {
-        let mut out: Vec<MatchResult> = Vec::with_capacity(queries.len());
-        let mut cursor = 0usize;
-        // The working cap can only shrink within a run (a 413 tells us the real
-        // server limit); we never grow it back past what the server accepted.
-        let mut cap_ceiling = usize::MAX;
-        while cursor < queries.len() {
-            // Recompute every iteration: the first chunk uses the smallest plan cap
-            // until a response's rate-limit headers reveal the real tier.
-            let cap = tier_batch_cap(self.last_rate_limit().limit_hourly).min(cap_ceiling);
-            let end = (cursor + cap).min(queries.len());
-            let chunk = &queries[cursor..end];
+        self.batched(queries, "match/batch", |chunk| {
+            let json = self.post_json("/match/batch", &MatchBatchRequest { queries: chunk, strict })?;
+            let parsed: MatchBatchResponse = serde_json::from_value(json)
+                .map_err(|e| ThreatError::Other(format!("match/batch decode error: {e}")))?;
+            Ok(parsed.data.results)
+        })
+    }
 
-            let body = MatchBatchRequest { queries: chunk, strict };
-            match self.post_json("/match/batch", &body) {
-                Ok(json) => {
-                    let parsed: MatchBatchResponse = serde_json::from_value(json)
-                        .map_err(|e| ThreatError::Other(format!("match/batch decode error: {e}")))?;
-                    if parsed.data.results.len() != chunk.len() {
+    /// Lifecycle of each purl or CPE (`POST /eol/batch`), aligned to `coordinates`.
+    pub fn eol_batch(&self, coordinates: &[String]) -> Result<Vec<Eol>, ThreatError> {
+        let (results, quota) = self.batched(coordinates, "eol/batch", |chunk| {
+            let json = self.post_json("/eol/batch", &serde_json::json!({ "queries": chunk }))?;
+            serde_json::from_value(json.pointer("/data/results").cloned().unwrap_or(Value::Null))
+                .map_err(|e| ThreatError::Other(format!("eol/batch decode error: {e}")))
+        })?;
+        match quota {
+            Some(q) => Err(ThreatError::RateLimitExceeded(q)),
+            None => Ok(results),
+        }
+    }
+
+    /// POST `items` in tier-sized chunks, shrinking on a 413, and check each
+    /// response is aligned to its chunk. A quota stop after the first chunk keeps
+    /// the results so far and returns why it stopped.
+    fn batched<Q, R>(
+        &self,
+        items: &[Q],
+        what: &str,
+        call: impl Fn(&[Q]) -> Result<Vec<R>, ThreatError>,
+    ) -> Result<(Vec<R>, Option<QuotaExceeded>), ThreatError> {
+        let mut out: Vec<R> = Vec::with_capacity(items.len());
+        let mut cursor = 0usize;
+        // A 413 reveals the real server limit; the cap never grows back past it.
+        let mut cap_ceiling = usize::MAX;
+        while cursor < items.len() {
+            // Recomputed every chunk: the first uses the smallest plan cap until
+            // a response's rate-limit headers reveal the real tier.
+            let cap = tier_batch_cap(self.last_rate_limit().limit_hourly).min(cap_ceiling);
+            let end = (cursor + cap).min(items.len());
+            let chunk = &items[cursor..end];
+            match call(chunk) {
+                Ok(results) => {
+                    if results.len() != chunk.len() {
                         return Err(ThreatError::Other(format!(
-                            "match/batch alignment error: sent {} queries, got {} results",
-                            chunk.len(), parsed.data.results.len()
+                            "{what} alignment error: sent {} queries, got {} results",
+                            chunk.len(), results.len()
                         )));
                     }
-                    out.extend(parsed.data.results);
+                    out.extend(results);
                     cursor = end;
                 }
                 Err(e @ (ThreatError::BatchTooLarge(_) | ThreatError::PayloadTooLarge)) => {
-                    // A single item can't be split further; a 413 on it is a hard
-                    // error rather than something we can retry-shrink out of.
                     if chunk.len() <= 1 {
                         return Err(e);
                     }
-                    let max_batch = match e {
-                        ThreatError::BatchTooLarge(n) => n,
-                        _ => None,
-                    };
-                    // Server rejected this chunk as too large. Shrink the working
-                    // cap to the advertised max (or halve it) and retry the SAME
-                    // slice — do not advance the cursor or abort the run. Always
-                    // make strict progress (< chunk.len()) to avoid an infinite loop.
-                    let new_cap = match max_batch {
-                        Some(n) if n >= 1 && n < chunk.len() => n,
+                    // Retry the same slice at the advertised max, or half; always smaller.
+                    cap_ceiling = match e {
+                        ThreatError::BatchTooLarge(Some(n)) if n >= 1 && n < chunk.len() => n,
                         _ => chunk.len() / 2,
-                    };
-                    cap_ceiling = new_cap.max(1);
+                    }
+                    .max(1);
                 }
                 Err(ThreatError::RateLimitExceeded(q)) if !out.is_empty() => return Ok((out, Some(q))),
                 Err(e) => return Err(e),
@@ -1114,6 +1136,105 @@ impl RecordedDecision {
         matches!(self.verdict.as_str(), "accept" | "not_affected" | "mitigated" | "defer")
             && matches!(self.status.as_str(), "active" | "review_due")
             && self.until.as_deref().and_then(iso_secs).is_none_or(|until| until > now)
+    }
+}
+
+/// One component's lifecycle from endoflife.date, as Radar's `/eol` returns it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct Eol {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle: Option<String>,
+    /// `supported` | `near-eol` | `eol` | `unknown`.
+    #[serde(default)]
+    pub status: String,
+    /// End-of-life date, or `true`/`false` when the source gives no date.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub eol: Value,
+    /// Days until the end of life; negative once past it.
+    #[serde(rename = "daysLeft", default, skip_serializing_if = "Option::is_none")]
+    pub days_left: Option<i64>,
+    #[serde(rename = "supportEnds", default, skip_serializing_if = "Option::is_none")]
+    pub support_ends: Option<String>,
+    #[serde(rename = "extendedSupport", default, skip_serializing_if = "Option::is_none")]
+    pub extended_support: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lts: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<String>,
+    /// `purl` | `cpe` | `distro` | `os`: how the component was resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
+    /// Why the status is `unknown`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl Eol {
+    pub fn is_eol(&self) -> bool {
+        self.status == "eol"
+    }
+
+    /// At or near its end of life.
+    pub fn flagged(&self) -> bool {
+        self.status == "eol" || self.status == "near-eol"
+    }
+
+    /// The end-of-life date, when the source has one.
+    pub fn date(&self) -> Option<&str> {
+        self.eol.as_str()
+    }
+
+    /// "Node.js 18: end of life since 2025-04-30 (latest 18.20.8)".
+    pub fn describe(&self) -> String {
+        let name = [self.label.as_deref().or(self.product.as_deref()), self.cycle.as_deref()]
+            .into_iter().flatten().collect::<Vec<_>>().join(" ");
+        let when = match (self.status.as_str(), self.date(), self.days_left) {
+            ("eol", Some(d), _) => format!("end of life since {d}"),
+            ("eol", None, _) => "end of life".to_string(),
+            (_, Some(d), Some(n)) => format!("end of life in {n} day(s), {d}"),
+            _ => "nearing end of life".to_string(),
+        };
+        let latest = self.latest.as_deref().map(|l| format!(" (latest {l})")).unwrap_or_default();
+        format!("{name}: {when}{latest}")
+    }
+
+    /// No fix will reach this release: `fixReachesCycle` in server/utils/eol/match.js.
+    /// Upstream fixes count when one is in the same cycle (the cycle, or it followed
+    /// by a non-digit); without the catalog a longer sibling cycle is not seen.
+    pub fn no_fix(&self, fixed_versions: &[String]) -> bool {
+        if !self.is_eol() {
+            return false;
+        }
+        if fixed_versions.is_empty() {
+            return true;
+        }
+        if matches!(self.via.as_deref(), Some("distro" | "os")) {
+            return false;
+        }
+        let Some(cycle) = self.cycle.as_deref().map(str::to_ascii_lowercase) else { return false };
+        !fixed_versions.iter().any(|v| {
+            let v = plain_version(v);
+            v.strip_prefix(cycle.as_str()).is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_digit()))
+        })
+    }
+}
+
+/// `plainVersion` in server/utils/eol/match.js: no epoch, no leading `v`.
+fn plain_version(version: &str) -> String {
+    let v = version.trim().to_ascii_lowercase();
+    let v = match v.split_once(':') {
+        Some((epoch, rest)) if !epoch.is_empty() && epoch.chars().all(|c| c.is_ascii_digit()) => rest.to_string(),
+        _ => v,
+    };
+    match v.strip_prefix('v') {
+        Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => rest.to_string(),
+        _ => v,
     }
 }
 
@@ -1463,6 +1584,7 @@ impl ScanReport {
             listeners: Vec::new(),
             upgrade_to,
             restart_pending: false,
+            eol: None,
         };
         let mut assets: BTreeMap<String, AssetInfo> = self.remediation.into_iter()
             .map(|r| (r.purl.clone(), asset(&r.purl, r.version, r.upgrade_to)))
@@ -1498,6 +1620,7 @@ impl ScanReport {
             truncated: truncated.into_iter().map(|t| t.purl).collect(),
             incomplete,
             registration: None,
+            os_eol: None,
         }
     }
 }
@@ -2317,13 +2440,11 @@ mod tests {
     fn decisions_attach_by_cve_and_coordinate() {
         let entry = |cve: &str| ThreatEntry { cve_id: Some(cve.into()), confirmed: true, ..Default::default() };
         let mut results = BatchResults {
-            meta: Meta::default(),
             services: BTreeMap::from([
                 ("nginx@1.24.0".to_string(), vec![entry("CVE-2024-1"), entry("CVE-2024-2")]),
                 ("openssl@3.0.2".to_string(), vec![entry("CVE-2024-1")]),
             ]),
-            by_cve: BTreeMap::new(), assets: BTreeMap::new(), unconfirmed: BTreeMap::new(),
-            errors: BTreeMap::new(), rejected: BTreeMap::new(), truncated: vec![], incomplete: vec![], registration: None,
+            ..Default::default()
         };
         let coords = BTreeMap::from([
             ("nginx@1.24.0".to_string(), "pkg:deb/ubuntu/nginx@1.24.0".to_string()),
@@ -2490,16 +2611,72 @@ mod tests {
     fn cve_groups_take_the_highest_epss() {
         let e = |epss: Option<f64>| ThreatEntry { cve_id: Some("CVE-1".into()), epss, confirmed: true, ..Default::default() };
         let mut r = BatchResults {
-            meta: Meta::default(),
             services: BTreeMap::from([
                 ("a@1".to_string(), vec![e(None)]),
                 ("b@1".to_string(), vec![e(Some(0.7))]),
                 ("c@1".to_string(), vec![e(Some(0.2))]),
             ]),
-            by_cve: BTreeMap::new(), assets: BTreeMap::new(), unconfirmed: BTreeMap::new(),
-            errors: BTreeMap::new(), rejected: BTreeMap::new(), truncated: vec![], incomplete: vec![], registration: None,
+            ..Default::default()
         };
         r.compute_cve_groups();
         assert_eq!(r.by_cve["CVE-1"].epss, Some(0.7));
+    }
+
+    #[test]
+    fn eol_batch_decodes_aligned_results_and_splits_on_413() {
+        let results = json!({ "success": true, "data": { "results": [
+            { "query": { "purl": "pkg:npm/vue@2.7.16" }, "product": "vue", "label": "Vue", "cycle": "2", "status": "eol",
+              "eol": "2023-12-31", "daysLeft": -695, "supportEnds": null, "extendedSupport": null, "lts": false,
+              "latest": "2.7.16", "ambiguous": false, "via": "purl", "link": "https://endoflife.date/vue", "source": "endoflife.date" },
+            { "query": { "cpe": "cpe:2.3:a:x:y:1" }, "product": null, "label": null, "cycle": null, "status": "unknown",
+              "eol": null, "daysLeft": null, "lts": false, "via": "cpe", "source": "endoflife.date", "reason": "unknown-product" }
+        ] } });
+        let too_large = json!({ "success": false, "error": "Batch too large", "data": { "maxBatch": 1 } });
+        let one = |i: usize| json!({ "data": { "results": [results["data"]["results"][i].clone()] } }).to_string();
+        let (client, server) = serve(vec![http(413, &too_large.to_string()), http(200, &one(0)), http(200, &one(1))]);
+        let coords = vec!["pkg:npm/vue@2.7.16".to_string(), "cpe:2.3:a:x:y:1".to_string()];
+        let eol = client.eol_batch(&coords).unwrap();
+        assert_eq!(eol.len(), 2);
+        assert!(eol[0].is_eol() && eol[0].flagged());
+        assert_eq!((eol[0].date(), eol[0].days_left), (Some("2023-12-31"), Some(-695)));
+        assert_eq!(eol[0].describe(), "Vue 2: end of life since 2023-12-31 (latest 2.7.16)");
+        assert_eq!(eol[1].status, "unknown");
+        assert_eq!(eol[1].reason.as_deref(), Some("unknown-product"));
+        let reqs = server.join().unwrap();
+        assert!(reqs[0].starts_with("POST /eol/batch "), "{}", reqs[0]);
+        assert!(reqs[1].ends_with(r#"{"queries":["pkg:npm/vue@2.7.16"]}"#), "{}", reqs[1]);
+
+        let (client, _server) = serve(vec![http(200, &one(0))]);
+        assert!(matches!(client.eol_batch(&coords), Err(ThreatError::Other(m)) if m.contains("alignment")));
+    }
+
+    #[test]
+    fn eol_no_fix_mirrors_fix_reaches_cycle() {
+        let eol = |status: &str, cycle: &str, via: &str| Eol {
+            status: status.into(), cycle: Some(cycle.into()), via: Some(via.into()), ..Default::default()
+        };
+        let fixes = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(eol("eol", "2.12", "purl").no_fix(&[]));
+        assert!(!eol("near-eol", "2.12", "purl").no_fix(&[]));
+        assert!(!eol("eol", "2.12", "purl").no_fix(&fixes(&["2.12.4", "2.17.1"])));
+        assert!(eol("eol", "2.12", "purl").no_fix(&fixes(&["2.17.1", "2.120.0"])));
+        assert!(!eol("eol", "1.1.1", "cpe").no_fix(&fixes(&["1.1.1w"])));
+        assert!(!eol("eol", "18", "purl").no_fix(&fixes(&["v18.20.5"])));
+        assert!(!eol("eol", "20.04", "distro").no_fix(&fixes(&["1:9.1"])), "a distro fix is scoped to the release");
+        assert!(eol("eol", "20.04", "os").no_fix(&[]));
+    }
+
+    #[test]
+    fn eol_escalates_exploited_findings_with_no_fix() {
+        let t = ThreatEntry { severity: Some("low".into()), kev: true, confirmed: true, ..Default::default() };
+        let mut e = t.clone();
+        e.apply_risk("none", true);
+        assert_eq!(e.decision.as_deref(), Some("act-now"));
+        assert_eq!(e.decision_reason.as_deref(), Some(EOL_REASON));
+        assert_eq!(serde_json::to_value(&e).unwrap()["decisionReason"], json!(EOL_REASON));
+        let mut e = t;
+        e.apply_risk("none", false);
+        assert_eq!(e.decision.as_deref(), Some("soon"));
+        assert!(serde_json::to_value(&e).unwrap().get("decisionReason").is_none());
     }
 }
